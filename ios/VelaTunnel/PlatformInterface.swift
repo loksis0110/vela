@@ -78,8 +78,8 @@ final class PlatformInterface: NSObject, LibboxPlatformInterfaceProtocol, Libbox
 
     // MARK: - Network monitoring
 
-    func usePlatformAutoDetectInterfaceControl() -> Bool { false }
-    func autoDetectInterfaceControl(_: Int32) throws {}
+    func usePlatformAutoDetectControl() -> Bool { false }
+    func autoDetectControl(_: Int32) throws {}
 
     func startDefaultInterfaceMonitor(_ listener: LibboxInterfaceUpdateListenerProtocol?) throws {
         guard let listener else { return }

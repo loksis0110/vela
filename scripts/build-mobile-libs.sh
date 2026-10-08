@@ -20,8 +20,8 @@ export PATH="$PATH:$(go env GOPATH)/bin"
 case "${1:-}" in
   android)
     mkdir -p android/app/libs
-    gomobile bind -v -trimpath \
-      -target android/arm64,android/arm,android/amd64 \
+    gomobile bind -trimpath \
+      -target android/arm64,android/arm \
       -androidapi 24 -javapkg=app.vela -libname=box \
       -tags "$TAGS" -ldflags "$LDFLAGS" \
       -o android/app/libs/libvela.aar \
@@ -31,12 +31,12 @@ case "${1:-}" in
   ios)
     mkdir -p ios/Frameworks
     # Network Extension: the core (memory-limited build)
-    gomobile bind -v -trimpath -target ios,iossimulator -iosversion=16.0 -libname=box \
+    gomobile bind -trimpath -target ios,iossimulator -iosversion=16.0 -libname=box \
       -tags "$TAGS,with_low_memory" -ldflags "$LDFLAGS" \
       -o ios/Frameworks/Libbox.xcframework \
       github.com/sagernet/sing-box/experimental/libbox
     # App: link parsing and config generation only (small)
-    gomobile bind -v -trimpath -target ios,iossimulator -iosversion=16.0 -libname=velacore \
+    gomobile bind -trimpath -target ios,iossimulator -iosversion=16.0 -libname=velacore \
       -tags "$TAGS" -ldflags "$LDFLAGS" \
       -o ios/Frameworks/Velacore.xcframework \
       github.com/velaapp/vela/mobile
