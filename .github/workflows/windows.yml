@@ -7,6 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -31,3 +34,10 @@ jobs:
           name: Vela-windows
           path: dist/Vela.exe
 
+      - name: Publish to the "latest" release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create latest --title "Vela (последняя сборка)" --notes "Готовые сборки Vela. Android: файл .apk. iPhone: Vela-unsigned.ipa, подпишите своим сертификатом." --prerelease 2>/dev/null || true
+          gh release upload latest dist/Vela.exe --clobber
