@@ -1,0 +1,17 @@
+diff --git a/common/tls/std_client.go b/common/tls/std_client.go
+index 80fa6cb..e2619bc 100644
+--- a/common/tls/std_client.go
++++ b/common/tls/std_client.go
+@@ -286,8 +286,11 @@ func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
+ 		return E.Cause(err, "failed to marshal public key")
+ 	}
+ 	hashValue := sha256.Sum256(pubKeyBytes)
++	// Vela: also accept the SHA-256 of the whole leaf certificate, which is
++	// what Xray share links pin with the `pcs` parameter.
++	certHashValue := sha256.Sum256(rawCerts[0])
+ 	for _, value := range knownHashValues {
+-		if bytes.Equal(value, hashValue[:]) {
++		if bytes.Equal(value, hashValue[:]) || bytes.Equal(value, certHashValue[:]) {
+ 			return nil
+ 		}
+ 	}

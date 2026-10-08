@@ -1,0 +1,9 @@
+dist/
+*.exe
+android/app/libs/*.aar
+android/app/libs/*.jar
+ios/Frameworks/
+ios/*.xcodeproj/
+go.sum.bak
+.DS_Store
+third_party/

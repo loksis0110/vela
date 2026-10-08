@@ -1,0 +1,232 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing-box/experimental/deprecated"
+	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	sjson "github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/service"
+)
+
+// TestURL is fetched through each server to measure real latency.
+var TestURL = func() string {
+	if u := os.Getenv("VELA_TEST_URL"); u != "" {
+		return u
+	}
+	return "https://www.gstatic.com/generate_204"
+}()
+
+// ProbeResult is the outcome of a real connection test through one server.
+type ProbeResult struct {
+	ID    string `json:"id"`
+	Delay int    `json:"delay"` // ms, 0 when failed
+	Error string `json:"error,omitempty"`
+	// Human readable reason in Russian.
+	Reason string `json:"reason,omitempty"`
+}
+
+// StartBox creates and starts a sing-box instance from a JSON config.
+func StartBox(config string, logPath string) (*box.Box, context.CancelFunc, error) {
+	ctx := include.Context(service.ContextWith(context.Background(), deprecated.NewStderrManager(log.StdLogger())))
+	opts, err := sjson.UnmarshalExtendedContext[option.Options](ctx, []byte(config))
+	if err != nil {
+		return nil, nil, err
+	}
+	if logPath != "" {
+		if opts.Log == nil {
+			opts.Log = &option.LogOptions{}
+		}
+		opts.Log.Output = logPath
+		opts.Log.DisableColor = true
+	}
+	ctx, cancel := context.WithCancel(service.ExtendContext(ctx))
+	instance, err := box.New(box.Options{Context: ctx, Options: opts})
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	if err = instance.Start(); err != nil {
+		instance.Close()
+		cancel()
+		return nil, nil, err
+	}
+	return instance, cancel, nil
+}
+
+// ProbeNodes makes a real request through every node and reports each result
+// through onResult as soon as it is known. When instance is nil, a temporary
+// core without any inbounds is started, so this works while disconnected.
+func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout time.Duration, parallel int, onResult func(ProbeResult)) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+	if instance == nil {
+		var outbounds []any
+		for _, n := range nodes {
+			if fresh, err := ParseLink(n.Link); err == nil && n.Link != "" {
+				n.Outbound = fresh.Outbound
+			}
+			if n.Outbound == nil {
+				continue
+			}
+			ob := map[string]any{}
+			for k, v := range n.Outbound {
+				ob[k] = v
+			}
+			ob["tag"] = NodeTag(n)
+			outbounds = append(outbounds, ob)
+		}
+		outbounds = append(outbounds, map[string]any{"type": "direct", "tag": TagDirect})
+		cfg, _ := json.Marshal(map[string]any{
+			"log":       map[string]any{"disabled": true},
+			"dns":       map[string]any{"servers": []any{probeDNS()}},
+			"outbounds": outbounds,
+			"route":     map[string]any{"final": TagDirect, "default_domain_resolver": "local"},
+		})
+		probe, cancel, err := StartBox(string(cfg), "")
+		if err != nil {
+			return err
+		}
+		defer func() {
+			probe.Close()
+			cancel()
+		}()
+		instance = probe
+	}
+	if parallel <= 0 {
+		parallel = 8
+	}
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+	for _, n := range nodes {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(n Node) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res := ProbeResult{ID: n.ID}
+			outbound, ok := instance.Outbound().Outbound(NodeTag(n))
+			if !ok {
+				res.Error = "outbound not found"
+				res.Reason = "сервер не удалось разобрать"
+				onResult(res)
+				return
+			}
+			tctx, cancel := context.WithTimeout(ctx, timeout)
+			delay, err := urltest.URLTest(tctx, TestURL, outbound)
+			timedOut := errors.Is(tctx.Err(), context.DeadlineExceeded)
+			cancel()
+			if err == nil && delay == 0 {
+				delay = 1
+			}
+			if err != nil {
+				if timedOut {
+					err = fmt.Errorf("timeout after %s: %w", timeout, err)
+				}
+				res.Error = err.Error()
+				res.Reason = ExplainError(res.Error)
+			} else {
+				res.Delay = int(delay)
+			}
+			onResult(res)
+		}(n)
+	}
+	wg.Wait()
+	return nil
+}
+
+// probeDNS resolves server domain names for the temporary core. Mobile apps
+// can't rely on the system resolver from Go, so a public resolver is used.
+func probeDNS() map[string]any {
+	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+		return map[string]any{"type": "udp", "tag": "local", "server": "77.88.8.8"}
+	}
+	return map[string]any{"type": "local", "tag": "local"}
+}
+
+// ExplainError turns a core error into a short Russian explanation.
+func ExplainError(e string) string {
+	s := strings.ToLower(e)
+	switch {
+	case strings.Contains(s, "unrecognized remote public key"):
+		return "отпечаток сертификата сервера не совпал со ссылкой"
+	case strings.Contains(s, "reality verification failed"), strings.Contains(s, "reality"):
+		return "Reality: сервер не принял ключ (pbk/sid) или SNI"
+	case strings.Contains(s, "x509"), strings.Contains(s, "certificate"):
+		return "сертификат сервера не прошёл проверку"
+	case strings.Contains(s, "connection refused"):
+		return "порт сервера закрыт"
+	case strings.Contains(s, "no route to host"), strings.Contains(s, "network is unreachable"):
+		return "сервер недоступен из этой сети"
+	case strings.Contains(s, "authentication"), strings.Contains(s, "auth"), strings.Contains(s, "invalid user"):
+		return "сервер отклонил ключ доступа (UUID/пароль)"
+	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline exceeded"):
+		return "сервер не ответил вовремя"
+	case strings.Contains(s, "eof"), strings.Contains(s, "reset by peer"), strings.Contains(s, "closed pipe"), strings.Contains(s, "forcibly closed"):
+		return "сервер разорвал соединение"
+	case strings.Contains(s, "no such host"):
+		return "не удалось найти адрес сервера"
+	}
+	return "ошибка соединения"
+}
+
+// WriteReport saves a plain-text diagnostics report.
+func WriteReport(path string, nodes []Node, results map[string]ProbeResult) error {
+	var b strings.Builder
+	ok := 0
+	for _, n := range nodes {
+		if r, found := results[n.ID]; found && r.Delay > 0 {
+			ok++
+		}
+	}
+	fmt.Fprintf(&b, "Vela: проверка серверов %s\nработают: %d из %d\n\n", time.Now().Format("2006-01-02 15:04:05"), ok, len(nodes))
+	for _, n := range nodes {
+		r, found := results[n.ID]
+		status := "не проверен"
+		if found {
+			if r.Delay > 0 {
+				status = fmt.Sprintf("OK %d мс", r.Delay)
+			} else {
+				status = "ОШИБКА: " + r.Reason + " | " + r.Error
+			}
+		}
+		fmt.Fprintf(&b, "%-48s %-10s %-8s %-6s %s\n", n.Name, n.Protocol, n.Security, n.Network, status)
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// ProbeTag makes one real request through an outbound of a running core.
+func ProbeTag(ctx context.Context, instance *box.Box, tag string, timeout time.Duration) (int, error) {
+	outbound, ok := instance.Outbound().Outbound(tag)
+	if !ok {
+		return 0, fmt.Errorf("outbound %s not found", tag)
+	}
+	tctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	delay, err := urltest.URLTest(tctx, TestURL, outbound)
+	if err != nil {
+		return 0, err
+	}
+	if delay == 0 {
+		delay = 1
+	}
+	return int(delay), nil
+}

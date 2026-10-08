@@ -1,0 +1,67 @@
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: make test
+
+  ios:
+    runs-on: macos-15
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build core frameworks
+        run: ./scripts/build-mobile-libs.sh ios
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen
+
+      - name: Build app (unsigned)
+        working-directory: ios
+        run: |
+          xcodebuild -project Vela.xcodeproj -scheme Vela -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      # The IPA is ad-hoc signed with its entitlements embedded, so any
+      # re-signing tool (Sideloadly, ESign, Feather, Xcode) knows that the app
+      # needs the Network Extension (VPN) capability.
+      - name: Package IPA
+        working-directory: ios
+        run: |
+          APP=build/Build/Products/Release-iphoneos/Vela.app
+          APPEX="$APP/PlugIns/VelaTunnel.appex"
+          python3 -c "import plistlib; plistlib.dump({'com.apple.developer.networking.networkextension': ['packet-tunnel-provider'], 'com.apple.security.application-groups': ['group.app.vela.client']}, open('ent-tunnel.plist', 'wb'))"
+          cp ent-tunnel.plist ent-app.plist
+          codesign -f -s - --entitlements ent-tunnel.plist "$APPEX"
+          codesign -f -s - --entitlements ent-app.plist "$APP"
+          codesign -d --entitlements - "$APPEX"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Vela-unsigned.ipa Payload
+          ls -la Vela-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vela-iOS-unsigned-ipa
+          path: ios/Vela-unsigned.ipa

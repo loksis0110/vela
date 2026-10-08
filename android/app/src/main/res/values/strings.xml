@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vela</string>
+    <string name="notif_channel">Состояние VPN</string>
+    <string name="notif_connected">Подключено</string>
+    <string name="notif_connecting">Подключение…</string>
+    <string name="notif_disconnect">Отключить</string>
+</resources>
