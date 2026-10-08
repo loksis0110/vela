@@ -390,7 +390,7 @@ func DecodeBackup(text string) (b Backup, ok bool, err error) {
 
 var (
 	logPrefix = regexp.MustCompile(`^[+-]\d{4} \d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2}) `)
-	logConnID = regexp.MustCompile(`^(\w+) \[\d+ [\d.]+m?s\] `)
+	logConnID = regexp.MustCompile(`^(\w+) \[\d+ [\d.hmsµ]+\] `)
 	logANSI   = regexp.MustCompile("\x1b\\[[0-9;]*m")
 )
 

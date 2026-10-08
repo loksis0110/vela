@@ -11,4 +11,7 @@
     <string name="widget_connecting">Подключение…</string>
     <string name="widget_connect">Подключить</string>
     <string name="widget_disconnect">Отключить</string>
+    <string name="widget_channel">Виджет</string>
+    <string name="widget_need_app">Откройте Vela, чтобы подключиться</string>
+    <string name="widget_need_app_text">Android должен один раз разрешить Vela включать VPN</string>
 </resources>

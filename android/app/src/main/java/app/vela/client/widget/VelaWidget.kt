@@ -7,7 +7,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
-import android.os.Build
 import android.widget.RemoteViews
 import app.vela.client.R
 import app.vela.client.data.Store
@@ -56,11 +55,11 @@ class VelaWidget : AppWidgetProvider() {
                     Intent(context, MainActivity::class.java).setAction(MainActivity.ACTION_CONNECT).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                     flags,
                 )
-                else -> {
-                    val start = Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_START)
-                    if (Build.VERSION.SDK_INT >= 26) PendingIntent.getForegroundService(context, 23, start, flags)
-                    else PendingIntent.getService(context, 23, start, flags)
-                }
+                else -> PendingIntent.getBroadcast(
+                    context, 23,
+                    Intent(context, WidgetActionReceiver::class.java).setAction(WidgetActionReceiver.ACTION_CONNECT),
+                    flags,
+                )
             }
             val views = RemoteViews(context.packageName, R.layout.widget_vela).apply {
                 setTextViewText(

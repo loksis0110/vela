@@ -6,6 +6,7 @@ import android.net.VpnService
 import androidx.core.content.ContextCompat
 import app.vela.client.data.Store
 import app.vela.velacore.Velacore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -77,6 +78,11 @@ object VpnManager {
         ContextCompat.startForegroundService(context, intent)
     }
 
+    /** Rebuilds the config in the running service (settings, server list). */
+    fun restart(context: Context) {
+        context.startService(Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_RESTART))
+    }
+
     fun stop(context: Context) {
         context.startService(Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_STOP))
     }
@@ -143,29 +149,51 @@ object VpnManager {
 
     /** Asks a website which IP and country it sees (through the VPN when on). */
     suspend fun refreshIp() {
-        if (ipBusy.value) return
+        if (ipBusy.value) {
+            // a check that started before (dis)connecting would show the old address
+            ipAgain = true
+            return
+        }
         ipBusy.value = true
         ipError.value = null
         try {
-            withContext(Dispatchers.IO) {
+            val info = withContext(Dispatchers.IO) {
                 val o = JSONObject(Velacore.myIP())
-                ip.value = IpInfo(
+                IpInfo(
                     ip = o.optString("ip"), country = o.optString("country"), city = o.optString("city"),
                     isp = o.optString("isp"), flag = o.optString("flag"),
                 )
             }
+            ip.value = info
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             ip.value = null
             ipError.value = e.message ?: "не удалось узнать IP"
         } finally {
             ipBusy.value = false
         }
+        if (ipAgain) {
+            ipAgain = false
+            refreshIp()
+        }
     }
+
+    @Volatile private var ipAgain = false
 
     /** Measures ping, download and upload through the current connection. */
     suspend fun runSpeedTest() {
         if (speed.value.running) return
         speed.value = SpeedState(running = true, phase = "ping")
+        try {
+            measureSpeed()
+        } finally {
+            // cancelled (screen rotated, app closed): never stay "running"
+            if (speed.value.running) speed.update { it.copy(running = false) }
+        }
+    }
+
+    private suspend fun measureSpeed() {
         val json = withContext(Dispatchers.IO) {
             Velacore.speedTest(8) { phase, value ->
                 speed.update {

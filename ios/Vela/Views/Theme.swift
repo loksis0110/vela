@@ -94,7 +94,9 @@ enum Fmt {
 
     static func badge(_ name: String) -> String {
         let s = splitFlag(name)
-        return s.flag ?? s.rest.first.map { String($0).uppercased() } ?? "✦"
+        if let flag = s.flag { return flag }
+        // first letter or digit: names often start with emoji like 🎮⚡
+        return s.rest.first { $0.isLetter || $0.isNumber }.map { String($0).uppercased() } ?? "✦"
     }
 
     static func ping(_ ms: Int?) -> (String, Color)? {

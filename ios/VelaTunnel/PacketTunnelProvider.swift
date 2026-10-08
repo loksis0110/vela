@@ -109,17 +109,33 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// The app sends a new config here to reload without dropping the tunnel.
     override func handleAppMessage(_ messageData: Data) async -> Data? {
         guard let config = String(data: messageData, encoding: .utf8), !config.isEmpty else { return nil }
-        if config == "vela:logs" { return tailLog() }
+        if config == "vela:logs" {
+            trimLog()
+            return tailLog()
+        }
+        trimLog()
+        let previous = configContent
         configContent = config
-        try? config.write(to: dataURL.appendingPathComponent("tunnel-config.json"), atomically: true, encoding: .utf8)
         reasserting = true
         defer { reasserting = false }
         do {
             try startService()
+            try? config.write(to: dataURL.appendingPathComponent("tunnel-config.json"), atomically: true, encoding: .utf8)
             return nil
         } catch {
+            // the new config failed: bring the last working one back, so the
+            // tunnel doesn't stay "on" with nothing behind it
+            configContent = previous
+            try? startService()
             return error.localizedDescription.data(using: .utf8)
         }
+    }
+
+    /// Keeps the log of a long session from growing without limit.
+    private func trimLog() {
+        let url = dataURL.appendingPathComponent("core.log")
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        if size > 2 * 1024 * 1024 { try? Data().write(to: url) }
     }
 
     /// Last lines of the core log for the app's log viewer.

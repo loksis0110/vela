@@ -41,6 +41,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
@@ -58,7 +59,6 @@ import app.vela.client.vpn.ConnState
 import app.vela.client.vpn.SpeedState
 import app.vela.client.vpn.VpnManager
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -74,7 +74,10 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(Vela.Ink.toArgb()),
         )
         super.onCreate(savedInstanceState)
-        handleIntent(intent)
+        // only a fresh launch: rotation or a theme change must not repeat a shared
+        // link or a widget's «connect»
+        val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+        if (savedInstanceState == null && !fromHistory) handleIntent(intent)
         lifecycleScope.launch { Store.refreshDue() }
         setContent {
             val st by Store.state.collectAsState()
@@ -136,9 +139,9 @@ private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStat
         activity?.enableEdgeToEdge(statusBarStyle = bar, navigationBarStyle = bar)
     }
 
-    var screen by remember { mutableStateOf(Screen.Home) }
-    var addOpen by remember { mutableStateOf(false) }
-    var addText by remember { mutableStateOf("") }
+    var screen by rememberSaveable { mutableStateOf(Screen.Home) }
+    var addOpen by rememberSaveable { mutableStateOf(false) }
+    var addText by rememberSaveable { mutableStateOf("") }
     var privacyOpen by remember { mutableStateOf(false) }
     var refreshing by remember { mutableStateOf(false) }
 
@@ -161,13 +164,8 @@ private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStat
     }
 
     fun reconnectIfNeeded() {
-        if (VpnManager.status.value.state == ConnState.Connected) {
-            VpnManager.stop(context)
-            scope.launch {
-                VpnManager.status.first { it.state == ConnState.Disconnected }
-                connect()
-            }
-        }
+        // the running service rebuilds its config in place
+        if (VpnManager.status.value.state == ConnState.Connected) VpnManager.restart(context)
     }
 
     LaunchedEffect(wantConnect) {
@@ -360,7 +358,7 @@ private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStat
 private fun AddDialog(initial: String, onDismiss: () -> Unit, onSubmit: (String, (String?) -> Unit) -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
-    var text by remember { mutableStateOf(initial) }
+    var text by rememberSaveable { mutableStateOf(initial) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
 

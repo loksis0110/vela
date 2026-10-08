@@ -41,14 +41,16 @@ function connectEvents() {
     if (msg.type === "state") {
       snap = msg.data;
       status = snap.status;
-      pings = Object.assign({}, snap.pings || {}, pings);
-      reasons = Object.assign({}, snap.reasons || {}, reasons);
+      // the backend has the latest check results
+      pings = Object.assign({}, snap.pings || {});
+      reasons = Object.assign({}, snap.reasons || {});
       favorites = new Set(snap.favorites || []);
       if (!traffic.length && snap.history) traffic = snap.history.slice();
       applyTheme(snap.theme);
       renderAll();
     } else if (msg.type === "status") {
       const was = status.state;
+      const wasActive = status.activeNode;
       status = msg.data;
       if (status.state === "connected") {
         traffic.push({ t: Date.now() / 1000, up: status.up || 0, down: status.down || 0 });
@@ -62,7 +64,9 @@ function connectEvents() {
       renderGraph();
       renderStatus();
       renderCurrent();
-      if (!$("#servers").hidden) renderNodes();
+      // the list is rebuilt only when something in it changes, not every second:
+      // rebuilding under the cursor swallows clicks and is slow with 500+ servers
+      if (!$("#servers").hidden && (was !== status.state || wasActive !== status.activeNode)) renderNodes();
     } else if (msg.type === "ping") {
       const d = msg.data;
       pings[d.id] = d.ms;
@@ -74,9 +78,13 @@ function connectEvents() {
     } else if (msg.type === "probe") {
       const d = msg.data;
       probe = d.done < d.total ? d : null;
-      if (d.error) toast("Проверка не удалась: " + d.error, true);
+      if (d.error) {
+        toast("Проверка не удалась: " + d.error, true);
+        for (const id of Object.keys(pings)) if (pings[id] === 0) delete pings[id];
+        renderPings();
+      }
       renderProbe();
-      if (!probe && d.total) {
+      if (!probe && d.total && !d.error) {
         const p = snap && snap.profiles.find((x) => x.id === viewProfile);
         if (p) {
           const ok = p.nodes.filter((n) => pings[n.id] > 0).length;
@@ -103,8 +111,9 @@ function splitFlag(name) {
 function flagHTML(name) {
   const { flag, name: rest } = splitFlag(name);
   if (flag) return esc(flag);
-  const letter = (rest.trim()[0] || "✦").toUpperCase();
-  return esc(letter);
+  // first letter or digit: names often start with emoji like 🎮⚡
+  const m = /[\p{L}\p{N}]/u.exec(rest);
+  return esc(m ? m[0].toUpperCase() : "✦");
 }
 
 function fmtBytes(n) {
@@ -485,8 +494,10 @@ function renderGraph() {
 window.addEventListener("resize", renderGraph);
 
 // ------------------------------------------------------------------ my ip & speed
+let ipAgain = false;
 async function refreshIP() {
-  if (ipBusy) return;
+  // a check that started before (dis)connecting would show the old address
+  if (ipBusy) { ipAgain = true; return; }
   ipBusy = true;
   $("#ipValue").textContent = "Проверяем…";
   try {
@@ -499,6 +510,7 @@ async function refreshIP() {
     $("#ipMeta").textContent = e.message;
   } finally {
     ipBusy = false;
+    if (ipAgain) { ipAgain = false; refreshIP(); }
   }
 }
 
@@ -836,7 +848,11 @@ $("#addForm").addEventListener("submit", submitAdd);
 $("#addCancel").addEventListener("click", () => $("#addDialog").close());
 $("#pasteBtn").addEventListener("click", pasteFromClipboard);
 
-$("#settingsForm").addEventListener("input", saveSettings);
+// switches and selects apply at once; text fields when you leave them, so
+// typing a DNS address doesn't reconnect the VPN on every letter
+$("#settingsForm").addEventListener("input", (e) => {
+  if (!e.target.matches("textarea, input[type=text], input[type=number], input:not([type])")) saveSettings();
+});
 $("#settingsForm").addEventListener("change", saveSettings);
 $("#settingsForm").addEventListener("submit", (e) => e.preventDefault());
 $$("[data-open]").forEach((b) => b.addEventListener("click", () => {
@@ -886,9 +902,13 @@ $("#rulesList").addEventListener("input", (e) => {
   if (!li) return;
   editRules[+li.dataset.i][e.target.dataset.k] = e.target.value;
   e.stopPropagation();
+});
+$("#rulesList").addEventListener("change", (e) => {
+  const li = e.target.closest("li");
+  if (li) editRules[+li.dataset.i][e.target.dataset.k] = e.target.value;
+  e.stopPropagation();
   saveSettings();
 });
-$("#rulesList").addEventListener("change", (e) => e.stopPropagation());
 $("#rulesList").addEventListener("click", (e) => {
   const b = e.target.closest("[data-rm]");
   if (!b) return;

@@ -218,9 +218,11 @@ func probeDNS() map[string]any {
 func ExplainError(e string) string {
 	s := strings.ToLower(e)
 	switch {
+	case strings.Contains(s, "no such host"):
+		return "не удалось найти адрес сервера"
 	case strings.Contains(s, "unrecognized remote public key"):
 		return "отпечаток сертификата сервера не совпал со ссылкой"
-	case strings.Contains(s, "reality verification failed"), strings.Contains(s, "reality"):
+	case strings.Contains(s, "reality verification failed"), strings.Contains(s, "reality: "):
 		return "Reality: сервер не принял ключ (pbk/sid) или SNI"
 	case strings.Contains(s, "x509"), strings.Contains(s, "certificate"):
 		return "сертификат сервера не прошёл проверку"
@@ -228,14 +230,12 @@ func ExplainError(e string) string {
 		return "порт сервера закрыт"
 	case strings.Contains(s, "no route to host"), strings.Contains(s, "network is unreachable"):
 		return "сервер недоступен из этой сети"
-	case strings.Contains(s, "authentication"), strings.Contains(s, "auth"), strings.Contains(s, "invalid user"):
+	case strings.Contains(s, "authentication failed"), strings.Contains(s, "invalid user"), strings.Contains(s, "unauthorized"):
 		return "сервер отклонил ключ доступа (UUID/пароль)"
 	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline exceeded"):
 		return "сервер не ответил вовремя"
 	case strings.Contains(s, "eof"), strings.Contains(s, "reset by peer"), strings.Contains(s, "closed pipe"), strings.Contains(s, "forcibly closed"):
 		return "сервер разорвал соединение"
-	case strings.Contains(s, "no such host"):
-		return "не удалось найти адрес сервера"
 	}
 	return "ошибка соединения"
 }

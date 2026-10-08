@@ -54,9 +54,14 @@ struct ToggleVPNIntent: SetValueIntent {
 
     func perform() async throws -> some IntentResult {
         try await VPN.set(value)
-        // the tunnel needs a moment to change state before widgets redraw
-        try? await Task.sleep(nanoseconds: 700_000_000)
+        // wait (up to ~10 s) until the tunnel settles, then redraw
+        for _ in 0 ..< 20 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            let s = await VPN.status()
+            if s == .connected || s == .disconnected || s == .invalid { break }
+        }
         WidgetCenter.shared.reloadAllTimelines()
+        ControlCenter.shared.reloadAllControls()
         return .result()
     }
 }
@@ -102,7 +107,9 @@ struct VPNProvider: TimelineProvider {
     func getTimeline(in _: Context, completion: @escaping (Timeline<VPNEntry>) -> Void) {
         Task {
             let entry = VPNEntry(date: .now, status: await VPN.status())
-            completion(Timeline(entries: [entry], policy: .after(.now.addingTimeInterval(15 * 60))))
+            // while connecting, look again soon
+            let next: TimeInterval = entry.busy ? 5 : 15 * 60
+            completion(Timeline(entries: [entry], policy: .after(.now.addingTimeInterval(next))))
         }
     }
 }

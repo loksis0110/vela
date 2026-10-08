@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
@@ -98,7 +99,7 @@ func TestPortableDataDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(cfg, "__VELA_DATA__/rules/geoip-ru.srs") || !strings.Contains(cfg, "__VELA_DATA__/cache.db") {
+	if !strings.Contains(cfg, "__VELA_DATA__/rules/geoip-ru.srs") {
 		t.Fatal("placeholder paths missing")
 	}
 	dir := t.TempDir()
@@ -173,8 +174,54 @@ func TestAutoCandidates(t *testing.T) {
 	if got[0] != "node-n050" || len(got) != MaxAutoCandidates {
 		t.Fatalf("ranked %v", got[:3])
 	}
+	// one favorite: it goes first, the rest fills in so failover still works
 	got = autoCandidates(BuildRequest{Favorites: []string{"n099", "zzz"}, Ranked: ids}, all)
-	if len(got) != 1 || got[0] != "node-n099" {
-		t.Fatalf("fav %v", got)
+	if len(got) != MaxAutoCandidates || got[0] != "node-n099" {
+		t.Fatalf("fav %v", got[:3])
+	}
+	// two working favorites: only them
+	got = autoCandidates(BuildRequest{Favorites: []string{"n099", "n098"}, Ranked: ids}, all)
+	if len(got) != 2 {
+		t.Fatalf("favs %v", got)
+	}
+	// dead favorites are skipped
+	got = autoCandidates(BuildRequest{Favorites: []string{"n099", "n098", "n097"}, Failed: []string{"n098", "n097"}, Ranked: ids}, all)
+	for _, g := range got {
+		if g == "node-n098" || g == "node-n097" {
+			t.Fatalf("failed favorite kept: %v", got)
+		}
+	}
+	if got[0] != "node-n099" {
+		t.Fatalf("fav first %v", got[:3])
+	}
+}
+
+func TestDuplicatesAndOddLinks(t *testing.T) {
+	link := sampleLinks[0]
+	res := ParseText(link + "\n" + link)
+	if len(res.Nodes) != 1 {
+		t.Fatalf("duplicates kept: %d", len(res.Nodes))
+	}
+	// duplicates saved by older versions must not break the config
+	nodes := append(res.Nodes, res.Nodes[0])
+	cfg, err := BuildConfig(BuildRequest{Platform: PlatformWindows, Nodes: nodes, Selected: "auto", Settings: DefaultSettings(), DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkConfig(t, cfg)
+	// percent-encoded base64 in ss://
+	if r := ParseText("ss://YWVzLTI1Ni1nY206cGFzczE%3D@1.2.3.4:8388#x"); len(r.Nodes) != 1 {
+		t.Fatalf("ss %v", r.Errors)
+	}
+	// BOM inside a base64 body
+	body := base64.StdEncoding.EncodeToString([]byte("\ufeff" + link + "\n"))
+	if r := ParseText(body); len(r.Nodes) != 1 {
+		t.Fatalf("bom %v", r.Errors)
+	}
+	if got := ExplainError("lookup auth.example.com: no such host"); got != "не удалось найти адрес сервера" {
+		t.Fatal(got)
+	}
+	if !strings.Contains(processRegex([]string{"discord.exe"})[0], "(?i)") {
+		t.Fatal("regex")
 	}
 }

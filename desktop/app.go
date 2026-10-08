@@ -106,6 +106,12 @@ type App struct {
 
 	history  []TrafficPoint // last minutes of traffic, guarded by mu
 	speeding atomic.Bool
+
+	// lifecycle serializes Connect, Disconnect and Reconnect; connGen
+	// (guarded by mu) changes on every Disconnect so a connect that is still
+	// starting knows it was cancelled.
+	lifecycle sync.Mutex
+	connGen   uint64
 }
 
 func NewApp(dataDir string) *App {
@@ -176,9 +182,12 @@ func (a *App) Snapshot() Snapshot {
 		reasons[k] = v
 	}
 	a.pingsMu.Unlock()
-	profiles := a.state.Profiles
-	if profiles == nil {
-		profiles = []*Profile{}
+	// copies: the snapshot is encoded after the lock is released
+	profiles := make([]*Profile, len(a.state.Profiles))
+	for i, p := range a.state.Profiles {
+		cp := *p
+		cp.Nodes = append([]core.Node(nil), p.Nodes...)
+		profiles[i] = &cp
 	}
 	return Snapshot{
 		Version: Version, Profiles: profiles, ActiveProfile: a.state.ActiveProfile,
@@ -577,19 +586,25 @@ func (a *App) DeleteNode(profileID, nodeID string) error {
 		a.mu.Unlock()
 		return errors.New("удалять можно только серверы, добавленные вручную")
 	}
-	out := p.Nodes[:0]
+	out := make([]core.Node, 0, len(p.Nodes))
 	for _, n := range p.Nodes {
 		if n.ID != nodeID {
 			out = append(out, n)
 		}
 	}
 	p.Nodes = out
+	inUse := a.status.State == "connected" && a.state.ActiveProfile == profileID &&
+		(a.state.SelectedNode == nodeID || a.status.ActiveNode == nodeID)
 	if a.state.SelectedNode == nodeID {
 		a.state.SelectedNode = "auto"
 	}
 	a.saveLocked()
 	a.mu.Unlock()
 	a.pushState()
+	if inUse {
+		// the running core still has the deleted server
+		go a.Reconnect()
+	}
 	return nil
 }
 
@@ -620,8 +635,12 @@ func (a *App) Select(profileID, nodeID string) error {
 				target = "node-" + nodeID
 			}
 			if err := a.controller("PUT", "/proxies/"+core.TagSelector, map[string]string{"name": target}, nil); err == nil {
+				active := a.resolveActive()
 				a.mu.Lock()
-				a.status.Error, a.status.ErrorCode = "", ""
+				a.status.Error, a.status.ErrorCode, a.status.Notice = "", "", ""
+				if active != "" {
+					a.status.ActiveNode = active
+				}
 				a.mu.Unlock()
 				a.pushStatus()
 				go a.selfCheck(nodeID)
@@ -695,6 +714,9 @@ func (a *App) setStatus(state, errMsg, code string) {
 	if state == "connected" {
 		a.status.Since = time.Now().Unix()
 	}
+	if state != "connected" {
+		a.status.Notice = ""
+	}
 	if state == "disconnected" {
 		a.status.Since = 0
 		a.status.Up, a.status.Down, a.status.UpTotal, a.status.DownTotal = 0, 0, 0, 0
@@ -704,7 +726,14 @@ func (a *App) setStatus(state, errMsg, code string) {
 	a.pushStatus()
 }
 
+// Connect starts the VPN. Safe to call from several goroutines.
 func (a *App) Connect() error {
+	a.lifecycle.Lock()
+	defer a.lifecycle.Unlock()
+	return a.connect()
+}
+
+func (a *App) connect() error {
 	a.mu.Lock()
 	if a.status.State == "connected" || a.status.State == "connecting" {
 		a.mu.Unlock()
@@ -728,6 +757,7 @@ func (a *App) Connect() error {
 	}
 	nodes := append([]core.Node(nil), p.Nodes...)
 	selected := a.state.SelectedNode
+	gen := a.connGen
 	a.status.State = "connecting"
 	a.status.Error, a.status.ErrorCode, a.status.Notice = "", "", ""
 	a.history = nil
@@ -762,6 +792,14 @@ func (a *App) Connect() error {
 		return errors.New(msg)
 	}
 	a.mu.Lock()
+	if a.connGen != gen {
+		// «Отмена» was pressed while the core was starting
+		a.mu.Unlock()
+		instance.Close()
+		cancel()
+		a.setStatus("disconnected", "", "")
+		return nil
+	}
 	a.instance, a.cancel = instance, cancel
 	a.ctrlPort, a.ctrlSecret = port, secret
 	a.state.WasConnected = true
@@ -776,7 +814,23 @@ func (a *App) Connect() error {
 	return nil
 }
 
+// Disconnect stops the VPN, also cancelling a connect in progress.
 func (a *App) Disconnect() {
+	a.mu.Lock()
+	a.connGen++
+	if a.status.State == "connecting" {
+		a.status.State = "disconnecting"
+		a.mu.Unlock()
+		a.pushStatus()
+	} else {
+		a.mu.Unlock()
+	}
+	a.lifecycle.Lock()
+	defer a.lifecycle.Unlock()
+	a.disconnect()
+}
+
+func (a *App) disconnect() {
 	a.mu.Lock()
 	instance, cancel := a.instance, a.cancel
 	a.instance, a.cancel = nil, nil
@@ -807,9 +861,12 @@ func (a *App) Disconnect() {
 	a.setStatus("disconnected", "", "")
 }
 
+// Reconnect applies new settings or another server list.
 func (a *App) Reconnect() {
-	a.Disconnect()
-	a.Connect()
+	a.lifecycle.Lock()
+	defer a.lifecycle.Unlock()
+	a.disconnect()
+	a.connect()
 }
 
 func startBox(cfg string, logPath string) (*box.Box, context.CancelFunc, error) {
@@ -1018,7 +1075,16 @@ func (a *App) Ping(profileID string) {
 		}
 	})
 	if err != nil {
+		// servers that were not checked must not stay "measuring"
+		a.pingsMu.Lock()
+		for _, n := range nodes {
+			if a.pings[n.ID] == 0 {
+				delete(a.pings, n.ID)
+			}
+		}
+		a.pingsMu.Unlock()
 		a.broadcast("probe", map[string]any{"done": total, "total": total, "error": humanizeError(err)})
+		a.pushState()
 		return
 	}
 	core.WriteReport(filepath.Join(a.dataDir, "diagnostics.txt"), nodes, results)

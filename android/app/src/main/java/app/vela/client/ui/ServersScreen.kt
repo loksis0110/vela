@@ -44,6 +44,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -97,6 +98,8 @@ fun ServersScreen(
     var proto by rememberSaveable { mutableStateOf("") }
     var country by rememberSaveable { mutableStateOf("") }
     var protoMenu by remember { mutableStateOf(false) }
+    // another subscription may have no such country or protocol
+    LaunchedEffect(viewId) { proto = ""; country = "" }
     var countryMenu by remember { mutableStateOf(false) }
 
     fun matches(n: Node): Boolean {
@@ -192,7 +195,7 @@ fun ServersScreen(
             ChipRow {
                 Chip("★ Избранные", onlyFav) { onlyFav = !onlyFav }
                 Chip("Рабочие", onlyOk) { onlyOk = !onlyOk }
-                if (protocols.size > 1) {
+                if (protocols.size > 1 || proto.isNotEmpty()) {
                     Box {
                         Chip(proto.ifEmpty { "Все протоколы" } + " ▾", proto.isNotEmpty()) { protoMenu = true }
                         DropdownMenu(protoMenu, { protoMenu = false }, containerColor = Vela.Deep) {
@@ -201,7 +204,7 @@ fun ServersScreen(
                         }
                     }
                 }
-                if (flags.size > 1) {
+                if (flags.size > 1 || country.isNotEmpty()) {
                     Box {
                         Chip(if (country.isEmpty()) "Все страны ▾" else "$country ${countryName(country)} ▾", country.isNotEmpty()) { countryMenu = true }
                         DropdownMenu(countryMenu, { countryMenu = false }, containerColor = Vela.Deep) {

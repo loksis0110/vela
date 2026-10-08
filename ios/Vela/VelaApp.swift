@@ -11,9 +11,20 @@ struct VelaApp: App {
             RootView()
                 .environmentObject(store)
                 .environmentObject(tunnel)
-                .preferredColorScheme(ColorScheme.from(store.state.theme))
                 .tint(Palette.star)
+                .onAppear { applyTheme(store.state.theme) }
+                .onChange(of: store.state.theme) { applyTheme($0) }
         }
+    }
+}
+
+/// Applies the theme to the whole window. Unlike preferredColorScheme(nil),
+/// "system" reliably goes back to following iOS.
+@MainActor
+func applyTheme(_ theme: String) {
+    let style: UIUserInterfaceStyle = theme == "light" ? .light : (theme == "dark" ? .dark : .unspecified)
+    for scene in UIApplication.shared.connectedScenes {
+        (scene as? UIWindowScene)?.windows.forEach { $0.overrideUserInterfaceStyle = style }
     }
 }
 

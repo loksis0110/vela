@@ -44,6 +44,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.net.Inet6Address
@@ -56,6 +57,8 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     companion object {
         const val ACTION_START = "app.vela.client.START"
         const val ACTION_STOP = "app.vela.client.STOP"
+        /** Applies new settings or another server list without stopping the service. */
+        const val ACTION_RESTART = "app.vela.client.RESTART"
         private const val CHANNEL = "vpn"
         private const val NOTIFICATION_ID = 1
         private const val TAG = "VelaVpn"
@@ -73,6 +76,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> scope.launch { stopVpn() }
+            ACTION_RESTART -> scope.launch { restartVpn() }
             // ACTION_START, or null/"android.net.VpnService" when started by Always-on VPN
             else -> {
                 showNotification(getString(R.string.notif_connecting))
@@ -96,7 +100,11 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     private suspend fun startVpn() = lock.withLock {
         val current = VpnManager.status.value.state
-        if (current == ConnState.Connected) return@withLock
+        if (current == ConnState.Connected) {
+            // e.g. Always-on asked again: keep the right notification text
+            showNotification(getString(R.string.notif_connected))
+            return@withLock
+        }
         VpnManager.status.value = VpnStatus(state = ConnState.Connecting)
         try {
             val port = freePort()
@@ -120,6 +128,34 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         } catch (e: Exception) {
             Log.e(TAG, "start failed", e)
             cleanup()
+            VpnManager.status.value = VpnStatus(state = ConnState.Disconnected, error = humanize(e))
+            stopForegroundCompat()
+            stopSelf()
+        }
+    }
+
+    private suspend fun restartVpn() = lock.withLock {
+        val server = commandServer
+        if (server == null) {
+            // nothing is running (e.g. the process was restarted)
+            if (VpnManager.status.value.state == ConnState.Disconnected) stopSelf()
+            return@withLock
+        }
+        if (VpnManager.status.value.state != ConnState.Connected) return@withLock
+        try {
+            watchJob?.cancel()
+            val port = VpnManager.controllerPort.takeIf { it != 0 } ?: freePort()
+            val secret = VpnManager.controllerSecret.ifEmpty { Store.randomId(16) }
+            VpnManager.controllerPort = port
+            VpnManager.controllerSecret = secret
+            server.startOrReloadService(Store.buildConfig(port, secret), OverrideOptions())
+            VpnManager.status.value = VpnManager.status.value.copy(error = null, notice = null, activeNode = null)
+            showNotification(getString(R.string.notif_connected))
+            startWatchdog()
+        } catch (e: Exception) {
+            Log.e(TAG, "restart failed", e)
+            cleanup()
+            Store.setWasConnected(false)
             VpnManager.status.value = VpnStatus(state = ConnState.Disconnected, error = humanize(e))
             stopForegroundCompat()
             stopSelf()
@@ -155,8 +191,12 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             val power = getSystemService(PowerManager::class.java)
             while (isActive) {
                 delay(1000)
-                // don't wake the radio just for statistics while the screen is off
-                if (!power.isInteractive) continue
+                // don't wake the radio just for statistics while the screen is off;
+                // forget the last sample so the next one isn't a fake spike
+                if (!power.isInteractive) {
+                    last = null
+                    continue
+                }
                 val now = VpnManager.traffic() ?: continue
                 val active = if (tick++ % 3 == 0) VpnManager.activeNode() else null
                 val prev = last
@@ -195,6 +235,13 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                     continue
                 }
                 if (VpnManager.status.value.state != ConnState.Connected) return@launch
+                if (DefaultNetworkMonitor.defaultNetwork == null) {
+                    // no internet at all (lift, airplane mode): not the server's fault
+                    fails = 0
+                    first = false
+                    delay(30_000)
+                    continue
+                }
                 val ok = VpnManager.probeCurrent() != null
                 if (ok) {
                     fails = 0
@@ -226,6 +273,10 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             return
         }
         val name = profile.nodes.first { it.id == selected }.name
+        // remembered as failed, so automatic selection skips it next time
+        Store.pings.update { it + (selected to -1) }
+        Store.reasons.update { it + (selected to "перестал отвечать во время работы") }
+        Store.savePings()
         if (VpnManager.switchTo("auto")) {
             Store.select(profile.id, "auto")
             VpnManager.status.value = VpnManager.status.value.copy(
@@ -367,7 +418,10 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             while (r6.hasNext()) r6.next().let { builder.addRoute(it.address(), it.prefix()) }
         }
         val pfd = builder.establish() ?: throw IllegalStateException("android: VPN is not prepared or was revoked")
+        // after a reload the previous interface is replaced: release it
+        val old = tunFd
         tunFd = pfd
+        if (old != null) runCatching { old.close() }
         return pfd.fd
     }
 

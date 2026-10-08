@@ -91,6 +91,9 @@ func TestTidyLogLine(t *testing.T) {
 	if got != "22:27:49 INFO outbound/direct[direct]: outbound connection to 127.0.0.1:38999" {
 		t.Fatal(got)
 	}
+	if got := TidyLogLine("+0300 2026-10-08 22:27:49 INFO [12 2m5s] router: x"); got != "22:27:49 INFO router: x" {
+		t.Fatal(got)
+	}
 	if TidyLogLine("plain") != "plain" {
 		t.Fatal("plain")
 	}

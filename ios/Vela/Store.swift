@@ -183,7 +183,12 @@ final class Store: ObservableObject {
             .appendingPathComponent("Vela", isDirectory: true)
         try? FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
         fileURL = dataURL.appendingPathComponent("state.json")
-        if let data = try? Data(contentsOf: fileURL), let st = try? JSONDecoder().decode(AppState.self, from: data) {
+        if let data = try? Data(contentsOf: fileURL), var st = try? JSONDecoder().decode(AppState.self, from: data) {
+            // duplicates saved by older versions
+            for i in st.profiles.indices {
+                var seen = Set<String>()
+                st.profiles[i].nodes = st.profiles[i].nodes.filter { seen.insert($0.id).inserted }
+            }
             state = st
         }
         if let data = try? Data(contentsOf: dataURL.appendingPathComponent("pings.json")),
@@ -413,7 +418,11 @@ final class Store: ObservableObject {
         var lines = subs.compactMap { $0["url"] as? String }.filter { !$0.isEmpty }
         lines += b["links"] as? [String] ?? []
         var msg = ""
-        if !lines.isEmpty { msg = try await importText(lines.joined(separator: "\n")) }
+        var importError: String?
+        if !lines.isEmpty {
+            // settings are restored even when the subscriptions can't be downloaded now
+            do { msg = try await importText(lines.joined(separator: "\n")) } catch { importError = error.localizedDescription }
+        }
         for s in subs {
             guard let name = s["name"] as? String, !name.isEmpty, let url = s["url"] as? String,
                   let p = state.profiles.first(where: { $0.kind == "subscription" && $0.url == url }) else { continue }
@@ -428,6 +437,7 @@ final class Store: ObservableObject {
             }
             if let t = extra["theme"] as? String, ["system", "light", "dark"].contains(t) { st.theme = t }
         }
+        if let importError { return "Настройки восстановлены. Подписки не загрузились: " + importError }
         return msg.isEmpty ? "Настройки восстановлены" : "Восстановлено. " + msg
     }
 
@@ -503,7 +513,9 @@ final class Store: ObservableObject {
     }
 
     nonisolated static func nodes(_ value: Any?) -> [Node] {
-        (value as? [[String: Any]] ?? []).compactMap(Node.init(dict:))
+        // the same server twice would break lists (duplicate ids) and the config
+        var seen = Set<String>()
+        return (value as? [[String: Any]] ?? []).compactMap(Node.init(dict:)).filter { seen.insert($0.id).inserted }
     }
 
     nonisolated static func makeProfile(id: String, url: String, sub: [String: Any], nodes: [Node], customName: String?) -> Profile {

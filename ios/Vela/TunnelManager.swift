@@ -55,6 +55,10 @@ final class TunnelManager: ObservableObject {
     @Published var speed = SpeedState()
 
     private var watchTask: Task<Void, Never>?
+    /// Set when this app instance started the connection (not iOS on its own
+    /// or an earlier launch): only then a failed first check means the chosen
+    /// server is down right now.
+    private var startedHere = false
     nonisolated static let testURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
 
     private var manager: NETunnelProviderManager?
@@ -113,7 +117,8 @@ final class TunnelManager: ObservableObject {
             since = manager?.connection.connectedDate ?? Date()
             startStats()
             if !wasConnected {
-                startWatchdog()
+                startWatchdog(fresh: startedHere)
+                startedHere = false
                 Task {
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
                     await self.refreshIP()
@@ -124,9 +129,10 @@ final class TunnelManager: ObservableObject {
         case .disconnecting:
             state = .disconnecting
         default:
+            let was = state
             state = .disconnected
             since = nil
-            if state != .disconnected { ip = nil; ipError = nil }
+            if was != .disconnected { ip = nil; ipError = nil }
             up = 0; down = 0; total = 0; activeNode = nil
             history = []
             statsTask?.cancel()
@@ -164,6 +170,7 @@ final class TunnelManager: ObservableObject {
     func connect() async {
         error = nil
         notice = nil
+        startedHere = true
         do {
             let m = try await ensureManager()
             port = Int.random(in: 20000 ... 60000)
@@ -247,12 +254,12 @@ final class TunnelManager: ObservableObject {
     /// Checks the server in use right after connecting and then every 30
     /// seconds; when the chosen server stops answering, switches to
     /// automatic selection (unless turned off in Settings).
-    private func startWatchdog() {
+    private func startWatchdog(fresh: Bool) {
         watchTask?.cancel()
         watchTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 2_500_000_000)
             var fails = 0
-            var first = true
+            var first = fresh
             while !Task.isCancelled {
                 guard let self, self.state == .connected else { return }
                 let ok = await self.request("GET", "/proxies/proxy/delay?url=\(Self.testURL)&timeout=8000", timeout: 11) != nil
@@ -285,6 +292,10 @@ final class TunnelManager: ObservableObject {
             return
         }
         let name = profile.nodes.first { $0.id == st.selectedNode }?.name ?? "Сервер"
+        // remembered as failed, so automatic selection skips it next time
+        store.pings[st.selectedNode] = -1
+        store.reasons[st.selectedNode] = "перестал отвечать во время работы"
+        store.savePings()
         if await switchTo("auto") {
             store.select(profile: profile.id, node: "auto")
             error = nil

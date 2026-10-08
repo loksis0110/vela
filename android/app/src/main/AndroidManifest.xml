@@ -57,10 +57,6 @@
                 <data android:scheme="vela" />
             </intent-filter>
             <intent-filter>
-                <action android:name="app.vela.client.CONNECT" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-            <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="text/plain" />
@@ -100,6 +96,10 @@
             android:name="com.journeyapps.barcodescanner.CaptureActivity"
             android:screenOrientation="fullSensor"
             tools:replace="screenOrientation" />
+
+        <receiver
+            android:name=".widget.WidgetActionReceiver"
+            android:exported="false" />
 
         <receiver
             android:name=".widget.VelaWidget"

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -118,6 +119,12 @@ func (a *App) watchdog(stop chan struct{}) {
 		fails = 0
 		if selected != "auto" && selected != "" {
 			name := a.nodeName(selected)
+			// remembered as failed, so automatic selection skips it next time
+			a.pingsMu.Lock()
+			a.pings[selected] = -1
+			a.reasons[selected] = "перестал отвечать во время работы"
+			a.pingsMu.Unlock()
+			a.savePings()
 			if err := a.controller("PUT", "/proxies/"+core.TagSelector, map[string]string{"name": core.TagAuto}, nil); err == nil {
 				a.mu.Lock()
 				a.state.SelectedNode = "auto"
@@ -237,14 +244,17 @@ func (a *App) importBackup(ctx context.Context, b core.Backup) (string, error) {
 	}
 	lines = append(lines, b.Links...)
 	msg := ""
+	var importErr error
 	if len(lines) > 0 {
-		m, err := a.Import(ctx, strings.Join(lines, "\n"))
-		if err != nil {
-			return "", err
+		// settings are restored even when the subscriptions can't be downloaded now
+		if m, err := a.Import(ctx, strings.Join(lines, "\n")); err != nil {
+			importErr = err
+		} else {
+			msg = m
 		}
-		msg = m
 	}
 	a.mu.Lock()
+	oldSettings, _ := json.Marshal(a.state.Settings)
 	for _, s := range b.Subscriptions {
 		if s.Name != "" {
 			if p := a.findProfileByURL(s.URL); p != nil {
@@ -287,12 +297,20 @@ func (a *App) importBackup(ctx context.Context, b core.Backup) (string, error) {
 			}
 		}
 	}
+	newSettings, _ := json.Marshal(a.state.Settings)
+	connected := a.status.State == "connected"
 	a.saveLocked()
 	a.mu.Unlock()
 	a.pushState()
-	if msg == "" {
+	if connected && !bytes.Equal(oldSettings, newSettings) {
+		go a.Reconnect()
+	}
+	switch {
+	case importErr != nil:
+		msg = "Настройки восстановлены. Подписки не загрузились: " + importErr.Error()
+	case msg == "":
 		msg = "Настройки восстановлены"
-	} else {
+	default:
 		msg = "Восстановлено. " + msg
 	}
 	return msg, nil

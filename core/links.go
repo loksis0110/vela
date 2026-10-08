@@ -39,11 +39,12 @@ func ParseText(text string) ParseResult {
 	text = strings.TrimSpace(strings.TrimPrefix(text, "\ufeff"))
 	if !strings.Contains(text, "://") {
 		if decoded, ok := tryBase64(text); ok && strings.Contains(decoded, "://") {
-			text = decoded
+			text = strings.TrimPrefix(strings.TrimSpace(decoded), "\ufeff")
 		}
 	}
 	var res ParseResult
 	seen := map[string]int{}
+	seenLink := map[string]bool{}
 	for _, line := range strings.FieldsFunc(text, func(r rune) bool { return r == '\n' || r == '\r' || r == ' ' }) {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.Contains(line, "://") {
@@ -54,6 +55,11 @@ func ParseText(text string) ParseResult {
 			res.Errors = append(res.Errors, err.Error())
 			continue
 		}
+		// the same link twice would give two servers with one id
+		if seenLink[node.ID] {
+			continue
+		}
+		seenLink[node.ID] = true
 		// keep names unique, they are shown in UI lists
 		if n := seen[node.Name]; n > 0 {
 			seen[node.Name] = n + 1
@@ -427,10 +433,12 @@ func parseShadowsocks(link string) (Node, error) {
 		return Node{}, fmt.Errorf("неверная ss-ссылка")
 	}
 	userinfo, hostport := rest[:at], rest[at+1:]
+	// base64 is often percent-encoded too ("...%3D")
+	if unescaped, err := url.PathUnescape(userinfo); err == nil {
+		userinfo = unescaped
+	}
 	if decoded, ok := tryBase64(userinfo); ok && strings.Contains(decoded, ":") {
 		userinfo = decoded
-	} else if unescaped, err := url.PathUnescape(userinfo); err == nil {
-		userinfo = unescaped
 	}
 	method, password, ok := strings.Cut(userinfo, ":")
 	if !ok {

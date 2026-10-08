@@ -104,6 +104,8 @@ struct ServersView: View {
         }
         .tint(Palette.star)
         .onAppear { viewID = store.state.active?.id ?? "" }
+        // another subscription may have no such country or protocol
+        .onChange(of: viewID) { _ in proto = ""; country = "" }
     }
 
     private var tabs: some View {
@@ -185,7 +187,7 @@ struct ServersView: View {
             HStack(spacing: 6) {
                 Chip(text: "★ Избранные", on: onlyFav) { onlyFav.toggle() }
                 Chip(text: "Рабочие", on: onlyOK) { onlyOK.toggle() }
-                if protocols.count > 1 {
+                if protocols.count > 1 || !proto.isEmpty {
                     Menu {
                         Button("Все протоколы") { proto = "" }
                         ForEach(protocols, id: \.self) { v in Button(v) { proto = v } }
@@ -193,7 +195,7 @@ struct ServersView: View {
                         Chip(text: (proto.isEmpty ? "Все протоколы" : proto) + " ▾", on: !proto.isEmpty) {}.allowsHitTesting(false)
                     }
                 }
-                if flags.count > 1 {
+                if flags.count > 1 || !country.isEmpty {
                     Menu {
                         Button("Все страны") { country = "" }
                         ForEach(flags, id: \.self) { f in

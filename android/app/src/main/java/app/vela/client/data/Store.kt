@@ -89,7 +89,8 @@ data class Profile(
 
 private fun JSONArray?.toNodes(): List<Node> {
     if (this == null) return emptyList()
-    return (0 until length()).map { Node.from(getJSONObject(it)) }
+    // the same server twice breaks lists (duplicate keys) and the config
+    return (0 until length()).map { Node.from(getJSONObject(it)) }.distinctBy { it.id }
 }
 
 /** User routing rule: domain, *keyword* or IP/CIDR → direct, proxy or block. */
@@ -297,7 +298,7 @@ object Store {
                 update { st ->
                     val manual = st.profiles.firstOrNull { it.id == MANUAL_ID } ?: Profile(MANUAL_ID, "Мои серверы", "manual")
                     val known = manual.nodes.map { it.raw.optString("link") }.toSet()
-                    val fresh = nodes.filter { it.raw.optString("link") !in known }
+                    val fresh = nodes.filter { it.raw.optString("link") !in known && manual.nodes.none { m -> m.id == it.id } }
                     added = fresh.size
                     val updated = manual.copy(nodes = manual.nodes + fresh)
                     val profiles = if (st.profiles.any { it.id == MANUAL_ID }) {

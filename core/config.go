@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -198,6 +199,7 @@ func BuildConfig(req BuildRequest) (string, error) {
 	var outbounds []any
 	var nodeTags []string
 	selected := ""
+	seenTag := map[string]bool{}
 	for _, n := range req.Nodes {
 		// re-read the original link so fixes in the parser apply to servers
 		// saved by older app versions
@@ -215,6 +217,10 @@ func BuildConfig(req BuildRequest) (string, error) {
 		}
 		applyFragment(ob, s.TLSFragment)
 		tag := NodeTag(n)
+		if seenTag[tag] {
+			continue // duplicates saved by older versions
+		}
+		seenTag[tag] = true
 		ob["tag"] = tag
 		outbounds = append(outbounds, ob)
 		nodeTags = append(nodeTags, tag)
@@ -291,6 +297,18 @@ func BuildConfig(req BuildRequest) (string, error) {
 	if smart {
 		dnsRules = append(dnsRules, map[string]any{"rule_set": []string{"geosite-ru"}, "server": "dns-direct"})
 	}
+	dnsFinal := "dns-remote"
+	desktopApps := req.Platform != PlatformAndroid && req.Platform != PlatformIOS && len(s.Apps) > 0 && s.Mode == "tun"
+	if desktopApps {
+		switch s.AppMode {
+		case "exclude":
+			// programs that bypass the VPN also resolve names directly
+			dnsRules = append([]any{map[string]any{"process_path_regex": processRegex(s.Apps), "server": "dns-direct"}}, dnsRules...)
+		case "only":
+			dnsRules = append([]any{map[string]any{"process_path_regex": processRegex(s.Apps), "server": "dns-remote"}}, dnsRules...)
+			dnsFinal = "dns-direct"
+		}
+	}
 	strategy := "prefer_ipv4"
 	if !s.IPv6 {
 		strategy = "ipv4_only"
@@ -298,7 +316,7 @@ func BuildConfig(req BuildRequest) (string, error) {
 	dns := map[string]any{
 		"servers":  dnsServers,
 		"rules":    dnsRules,
-		"final":    "dns-remote",
+		"final":    dnsFinal,
 		"strategy": strategy,
 	}
 
@@ -365,10 +383,10 @@ func BuildConfig(req BuildRequest) (string, error) {
 	if !mobile && len(s.Apps) > 0 && s.Mode == "tun" {
 		switch s.AppMode {
 		case "exclude":
-			rules = append(rules, map[string]any{"process_name": s.Apps, "outbound": TagDirect})
+			rules = append(rules, map[string]any{"process_path_regex": processRegex(s.Apps), "outbound": TagDirect})
 			findProcess = true
 		case "only":
-			rules = append(rules, map[string]any{"process_name": s.Apps, "outbound": TagSelector})
+			rules = append(rules, map[string]any{"process_path_regex": processRegex(s.Apps), "outbound": TagSelector})
 			final = TagDirect
 			findProcess = true
 		}
@@ -402,13 +420,9 @@ func BuildConfig(req BuildRequest) (string, error) {
 	}
 
 	// --- experimental -----------------------------------------------------
-	experimental := map[string]any{
-		"cache_file": map[string]any{
-			"enabled":  true,
-			"path":     filepath.Join(req.DataDir, "cache.db"),
-			"cache_id": "vela",
-		},
-	}
+	// No cache_file: it would restore an old selector choice over the
+	// server the user picked for this connection.
+	experimental := map[string]any{}
 	if req.ControllerPort > 0 {
 		experimental["clash_api"] = map[string]any{
 			"external_controller": fmt.Sprintf("127.0.0.1:%d", req.ControllerPort),
@@ -429,6 +443,19 @@ func BuildConfig(req BuildRequest) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// processRegex matches programs by file name, ignoring case
+// ("discord.exe" also matches C:\...\Discord.exe).
+func processRegex(apps []string) []string {
+	out := make([]string, 0, len(apps))
+	for _, a := range apps {
+		a = strings.TrimSpace(a)
+		if a != "" {
+			out = append(out, `(?i)(^|[\\/])`+regexp.QuoteMeta(a)+`$`)
+		}
+	}
+	return out
 }
 
 func logOptions(level, path string) map[string]any {
@@ -462,10 +489,21 @@ func autoCandidates(req BuildRequest, all []string) []string {
 		}
 		return out
 	}
-	if fav := pick(req.Favorites); len(fav) > 0 {
+	failed := map[string]bool{}
+	for _, id := range req.Failed {
+		failed[id] = true
+	}
+	var favs []string
+	for _, id := range req.Favorites {
+		if !failed[id] {
+			favs = append(favs, id)
+		}
+	}
+	// two or more working favorites: automatic selection stays among them
+	if fav := pick(favs); len(fav) >= 2 {
 		return fav
 	}
-	out := pick(req.Ranked)
+	out := pick(append(append([]string{}, favs...), req.Ranked...))
 	if len(out) < MaxAutoCandidates {
 		seen := map[string]bool{}
 		for _, t := range out {

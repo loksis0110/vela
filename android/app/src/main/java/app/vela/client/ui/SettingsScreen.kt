@@ -35,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.mutableStateOf
@@ -70,6 +71,9 @@ fun SettingsScreen(
     var picking by remember { mutableStateOf(false) }
     var logs by remember { mutableStateOf(false) }
     var rules by remember { mutableStateOf(settings.rules) }
+    // text fields are saved only if the user edited them, so a backup restored
+    // from this screen isn't overwritten by the old values
+    var dirty by remember { mutableStateOf(false) }
     var advanced by rememberSaveable { mutableStateOf(false) }
     var direct by rememberSaveable { mutableStateOf(settings.directDomains.joinToString(", ")) }
     var proxy by rememberSaveable { mutableStateOf(settings.proxyDomains.joinToString(", ")) }
@@ -90,7 +94,17 @@ fun SettingsScreen(
         )
         if (next != latest) onChange(next)
     }
-    DisposableEffect(Unit) { onDispose { commit() } }
+    DisposableEffect(Unit) { onDispose { if (dirty) commit() } }
+    // settings changed elsewhere (restored backup): show them
+    LaunchedEffect(settings) {
+        if (!dirty) {
+            direct = settings.directDomains.joinToString(", ")
+            proxy = settings.proxyDomains.joinToString(", ")
+            remoteDns = settings.remoteDns
+            directDns = settings.directDns
+            rules = settings.rules
+        }
+    }
 
     Column(Modifier.fillMaxSize().background(Vela.Ink).safeDrawingPadding()) {
         Row(Modifier.fillMaxWidth().padding(start = 4.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -152,8 +166,8 @@ fun SettingsScreen(
                 Divider()
                 SwitchRow("IPv6", "Выключите, если сайты открываются медленно", settings.ipv6) { onChange(settings.copy(ipv6 = it)) }
                 Divider()
-                Field("Всегда напрямую", direct, "gosuslugi.ru, sberbank.ru") { direct = it }
-                Field("Всегда через VPN", proxy, "youtube.com, chatgpt.com") { proxy = it }
+                Field("Всегда напрямую", direct, "gosuslugi.ru, sberbank.ru") { direct = it; dirty = true }
+                Field("Всегда через VPN", proxy, "youtube.com, chatgpt.com") { proxy = it; dirty = true }
             }
             Group("Система") {
                 ActionRow("Постоянный VPN", "Включите «Постоянная VPN» и «Блокировать соединения без VPN» в настройках Android", onSystemVpnSettings)
@@ -162,8 +176,8 @@ fun SettingsScreen(
                 if (!advanced) {
                     TextButton(onClick = { advanced = true }) { Text("Показать", color = Vela.Muted) }
                 } else {
-                    Field("DNS через VPN", remoteDns, "https://1.1.1.1/dns-query") { remoteDns = it }
-                    Field("DNS для прямых сайтов", directDns, "77.88.8.8") { directDns = it }
+                    Field("DNS через VPN", remoteDns, "https://1.1.1.1/dns-query") { remoteDns = it; dirty = true }
+                    Field("DNS для прямых сайтов", directDns, "77.88.8.8") { directDns = it; dirty = true }
                     Text("Сетевой стек", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 10.dp))
                     listOf("mixed" to "Смешанный (рекомендуется)", "system" to "Системный (быстрее)", "gvisor" to "gVisor (совместимее)").forEach { (v, l) ->
                         Row(
@@ -198,11 +212,11 @@ fun SettingsScreen(
                     rules.forEachIndexed { i, r ->
                         RuleRow(
                             r,
-                            onChange = { nr -> rules = rules.toMutableList().also { it[i] = nr } },
-                            onDelete = { rules = rules.toMutableList().also { it.removeAt(i) } },
+                            onChange = { nr -> rules = rules.toMutableList().also { it[i] = nr }; dirty = true },
+                            onDelete = { rules = rules.toMutableList().also { it.removeAt(i) }; dirty = true },
                         )
                     }
-                    TextButton(onClick = { rules = rules + Rule("", "direct") }) { Text("+ Добавить правило", color = Vela.Star) }
+                    TextButton(onClick = { rules = rules + Rule("", "direct"); dirty = true }) { Text("+ Добавить правило", color = Vela.Star) }
                     Divider()
                     ActionRow("Журнал ядра", "Что происходит с подключением. Пригодится, если что-то не работает") { logs = true }
                 }
@@ -221,7 +235,11 @@ fun SettingsScreen(
     if (picking) {
         AppPickerDialog(
             selected = settings.apps,
-            onDismiss = { picking = false },
+            onDismiss = {
+                picking = false
+                // «only selected» with nothing selected would quietly tunnel everything
+                if (settings.apps.isEmpty() && settings.appMode.isNotEmpty()) onChange(settings.copy(appMode = ""))
+            },
             onDone = { list ->
                 picking = false
                 onChange(settings.copy(apps = list, appMode = if (list.isEmpty()) "" else settings.appMode.ifEmpty { "exclude" }))

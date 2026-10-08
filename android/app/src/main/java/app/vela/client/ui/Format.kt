@@ -42,7 +42,10 @@ fun splitFlag(name: String): Pair<String?, String> {
 
 fun badgeFor(name: String): String {
     val (flag, rest) = splitFlag(name)
-    return flag ?: rest.trim().firstOrNull()?.uppercase() ?: "✦"
+    if (flag != null) return flag
+    // first letter or digit: names often start with emoji like 🎮⚡
+    val cp = rest.codePoints().toArray().firstOrNull { Character.isLetterOrDigit(it) } ?: return "✦"
+    return String(Character.toChars(cp)).uppercase()
 }
 
 data class PingLabel(val text: String, val color: Color)
