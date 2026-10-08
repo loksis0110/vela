@@ -55,6 +55,7 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import app.vela.client.data.Store
 import app.vela.client.vpn.ConnState
+import app.vela.client.vpn.SpeedState
 import app.vela.client.vpn.VpnManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
@@ -189,7 +190,7 @@ private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStat
             }
             else -> {}
         }
-        if (!VpnManager.speed.value.running) VpnManager.speed.value = app.vela.client.vpn.SpeedState()
+        if (!VpnManager.speed.value.running) VpnManager.speed.value = SpeedState()
     }
 
     LaunchedEffect(pendingText) {
