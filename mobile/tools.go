@@ -2,6 +2,9 @@
 
 package velacore
 
-// Keeps the gomobile bind runtime in go.mod so `gomobile bind` works
-// after `go mod tidy`.
-import _ "github.com/sagernet/gomobile"
+// Keeps the gomobile runtime and the sing-box mobile library in go.mod/go.sum,
+// so `go mod tidy` records their dependencies before `gomobile bind`.
+import (
+	_ "github.com/sagernet/gomobile"
+	_ "github.com/sagernet/sing-box/experimental/libbox"
+)
