@@ -46,6 +46,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard configContent != nil else {
             throw TunnelError("Откройте Vela и подключитесь из приложения")
         }
+        // a fresh log for every connection
+        try? Data().write(to: base.appendingPathComponent("core.log"))
 
         let setup = LibboxSetupOptions()
         setup.basePath = base.path
@@ -107,6 +109,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// The app sends a new config here to reload without dropping the tunnel.
     override func handleAppMessage(_ messageData: Data) async -> Data? {
         guard let config = String(data: messageData, encoding: .utf8), !config.isEmpty else { return nil }
+        if config == "vela:logs" { return tailLog() }
         configContent = config
         try? config.write(to: dataURL.appendingPathComponent("tunnel-config.json"), atomically: true, encoding: .utf8)
         reasserting = true
@@ -117,6 +120,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         } catch {
             return error.localizedDescription.data(using: .utf8)
         }
+    }
+
+    /// Last lines of the core log for the app's log viewer.
+    private func tailLog() -> Data {
+        let url = dataURL.appendingPathComponent("core.log")
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return Data() }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let start = size > 256 * 1024 ? size - 256 * 1024 : 0
+        try? handle.seek(toOffset: start)
+        let data = (try? handle.readToEnd()) ?? Data()
+        let text = String(decoding: data, as: UTF8.self)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).suffix(300)
+        return Data(lines.joined(separator: "\n").utf8)
     }
 
     override func sleep() async {

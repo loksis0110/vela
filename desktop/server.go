@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/velaapp/vela/core"
@@ -163,6 +166,95 @@ func (s *Server) Serve(l net.Listener) error {
 		openExternal(req.Target, s.app.dataDir)
 		reply(w, "", nil)
 	}))
+	mux.HandleFunc("/api/favorite", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Node string `json:"node"`
+			On   bool   `json:"on"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		s.app.SetFavorite(req.Node, req.On)
+		reply(w, "", nil)
+	}))
+	mux.HandleFunc("/api/theme", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Theme string `json:"theme"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		s.app.SetTheme(req.Theme)
+		reply(w, "", nil)
+	}))
+	mux.HandleFunc("/api/myip", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		info, err := s.app.MyIP(ctx)
+		if err != nil {
+			reply(w, "", err)
+			return
+		}
+		writeJSON(w, info)
+	}))
+	mux.HandleFunc("/api/speedtest", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		reply(w, "", s.app.SpeedTest())
+	}))
+	mux.HandleFunc("/api/qr", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Text string `json:"text"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		url, err := s.app.QRDataURL(req.Text)
+		if err != nil {
+			reply(w, "", err)
+			return
+		}
+		writeJSON(w, map[string]string{"image": url})
+	}))
+	mux.HandleFunc("/api/qr/decode", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Image string `json:"image"` // base64 or data URL
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		raw := req.Image
+		if i := strings.Index(raw, ","); strings.HasPrefix(raw, "data:") && i > 0 {
+			raw = raw[i+1:]
+		}
+		data, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil {
+			reply(w, "", errors.New("не удалось прочитать картинку"))
+			return
+		}
+		text, err := core.DecodeQR(data)
+		if err != nil {
+			reply(w, "", err)
+			return
+		}
+		writeJSON(w, map[string]string{"text": text})
+	}))
+	mux.HandleFunc("/api/export", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		text, err := s.app.Export()
+		if err != nil {
+			reply(w, "", err)
+			return
+		}
+		out := map[string]string{"text": text}
+		if img, err := s.app.QRDataURL(text); err == nil && len(text) < 2500 {
+			out["image"] = img
+		}
+		writeJSON(w, out)
+	}))
+	mux.HandleFunc("/api/logs", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"lines": s.app.Logs(400)})
+	}))
+	mux.HandleFunc("/api/processes", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"processes": listProcesses()})
+	}))
 	mux.HandleFunc("/api/quit", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		reply(w, "", nil)
 		go quit(s.app)
@@ -265,5 +357,3 @@ func reply(w http.ResponseWriter, msg string, err error) {
 	}
 	writeJSON(w, map[string]string{"message": msg})
 }
-
-var _ = context.Background

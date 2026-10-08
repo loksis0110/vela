@@ -23,8 +23,8 @@ android {
         applicationId = "app.vela.client"
         minSdk = 24
         targetSdk = 37
-        versionCode = 3
-        versionName = "1.1.0"
+        versionCode = 4
+        versionName = "1.2.0"
         base.archivesName.set("Vela-$versionName")
     }
 
@@ -100,6 +100,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    // QR scanner for subscription links (camera screen + decoder)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
     val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
     implementation(composeBom)

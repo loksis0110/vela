@@ -48,3 +48,20 @@ func fatal(msg string) {
 	fmt.Fprintln(os.Stderr, msg)
 	os.Exit(1)
 }
+
+func listProcesses() []string {
+	out, err := exec.Command("ps", "-eo", "comm=").Output()
+	if err != nil {
+		return []string{}
+	}
+	seen := map[string]bool{}
+	list := []string{}
+	for _, l := range strings.Split(string(out), "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !seen[l] {
+			seen[l] = true
+			list = append(list, l)
+		}
+	}
+	return list
+}

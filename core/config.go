@@ -4,8 +4,10 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 //go:embed rules/*.srs
@@ -46,6 +48,28 @@ type Settings struct {
 	DirectDomains []string `json:"directDomains"`
 	ProxyDomains  []string `json:"proxyDomains"`
 	LogLevel      string   `json:"logLevel"`
+
+	// DisableFailover turns off switching to a working server when the
+	// chosen one stops answering (on by default).
+	DisableFailover bool `json:"disableFailover,omitempty"`
+	// TLSFragment splits the TLS handshake to get past simple DPI:
+	// "" off, "record" (light), "full" (strongest, slower).
+	TLSFragment string `json:"tlsFragment,omitempty"`
+	// Rules are user routing rules checked before everything else.
+	Rules []RoutingRule `json:"rules,omitempty"`
+	// Split tunneling by app: "" all apps, "exclude" listed apps go
+	// direct, "only" only listed apps use the VPN. Apps are Android
+	// package names or Windows process names (chrome.exe).
+	AppMode string   `json:"appMode,omitempty"`
+	Apps    []string `json:"apps,omitempty"`
+}
+
+// RoutingRule sends matching traffic direct, through the VPN or blocks it.
+// Match is a domain (example.com also matches subdomains), a keyword in
+// the form *word*, or an IP / CIDR.
+type RoutingRule struct {
+	Match  string `json:"match"`
+	Action string `json:"action"` // "direct" | "proxy" | "block"
 }
 
 // DefaultSettings returns sensible defaults.
@@ -82,7 +106,19 @@ type BuildRequest struct {
 	// latency tests.
 	ControllerPort   int    `json:"controllerPort"`
 	ControllerSecret string `json:"controllerSecret"`
+	// Favorite node ids: when set, automatic selection uses only them.
+	Favorites []string `json:"favorites,omitempty"`
+	// Node ids ordered by the last measured latency, best first. Used to
+	// keep the automatic group small so servers aren't flooded by checks.
+	Ranked []string `json:"ranked,omitempty"`
+	// Node ids that failed the last check; kept out of automatic selection.
+	Failed []string `json:"failed,omitempty"`
+	// Optional log file (Android, iOS); empty keeps logs in memory.
+	LogPath string `json:"logPath,omitempty"`
 }
+
+// MaxAutoCandidates limits how many servers the automatic selection tests.
+const MaxAutoCandidates = 30
 
 // Tag names used in the generated config.
 const (
@@ -177,6 +213,7 @@ func BuildConfig(req BuildRequest) (string, error) {
 		for k, v := range n.Outbound {
 			ob[k] = v
 		}
+		applyFragment(ob, s.TLSFragment)
 		tag := NodeTag(n)
 		ob["tag"] = tag
 		outbounds = append(outbounds, ob)
@@ -204,10 +241,10 @@ func BuildConfig(req BuildRequest) (string, error) {
 		},
 		map[string]any{
 			"type": "urltest", "tag": TagAuto,
-			"outbounds":                   nodeTags,
+			"outbounds":                   autoCandidates(req, nodeTags),
 			"url":                         "https://www.gstatic.com/generate_204",
-			"interval":                    "3m",
-			"tolerance":                   80,
+			"interval":                    "10m",
+			"tolerance":                   100,
 			"idle_timeout":                "30m",
 			"interrupt_exist_connections": false,
 		},
@@ -287,6 +324,14 @@ func BuildConfig(req BuildRequest) (string, error) {
 			tunIn["stack"] = "system"
 			tunIn["mtu"] = 4064
 		}
+		if req.Platform == PlatformAndroid && len(s.Apps) > 0 {
+			switch s.AppMode {
+			case "exclude":
+				tunIn["exclude_package"] = s.Apps
+			case "only":
+				tunIn["include_package"] = s.Apps
+			}
+		}
 		if req.Platform == PlatformAndroid || req.Platform == PlatformIOS {
 			// local network stays reachable (printers, Chromecast, routers)
 			tunIn["route_exclude_address"] = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"}
@@ -314,6 +359,20 @@ func BuildConfig(req BuildRequest) (string, error) {
 		map[string]any{"protocol": "dns", "action": "hijack-dns"},
 		map[string]any{"ip_is_private": true, "outbound": TagDirect},
 	}
+	rules = append(rules, userRules(s.Rules)...)
+	final := TagSelector
+	findProcess := false
+	if !mobile && len(s.Apps) > 0 && s.Mode == "tun" {
+		switch s.AppMode {
+		case "exclude":
+			rules = append(rules, map[string]any{"process_name": s.Apps, "outbound": TagDirect})
+			findProcess = true
+		case "only":
+			rules = append(rules, map[string]any{"process_name": s.Apps, "outbound": TagSelector})
+			final = TagDirect
+			findProcess = true
+		}
+	}
 	if s.BlockAds {
 		rules = append(rules, map[string]any{"rule_set": []string{"ads"}, "action": "reject"})
 	}
@@ -331,12 +390,15 @@ func BuildConfig(req BuildRequest) (string, error) {
 	route := map[string]any{
 		"rules":                   rules,
 		"rule_set":                ruleSets,
-		"final":                   TagSelector,
+		"final":                   final,
 		"auto_detect_interface":   true,
 		"default_domain_resolver": map[string]any{"server": "dns-direct"},
 	}
 	if req.Platform == PlatformAndroid {
 		route["override_android_vpn"] = true
+	}
+	if findProcess {
+		route["find_process"] = true
 	}
 
 	// --- experimental -----------------------------------------------------
@@ -355,7 +417,7 @@ func BuildConfig(req BuildRequest) (string, error) {
 	}
 
 	cfg := map[string]any{
-		"log":          map[string]any{"level": s.LogLevel, "timestamp": true},
+		"log":          logOptions(s.LogLevel, req.LogPath),
 		"dns":          dns,
 		"inbounds":     inbounds,
 		"outbounds":    outbounds,
@@ -367,6 +429,138 @@ func BuildConfig(req BuildRequest) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+func logOptions(level, path string) map[string]any {
+	o := map[string]any{"level": level, "timestamp": true}
+	if path != "" {
+		o["output"] = path
+	}
+	return o
+}
+
+// autoCandidates picks the servers the automatic selection may use:
+// favorites if any, otherwise the best measured ones, otherwise the first
+// ones of the list. A small group keeps background checks light.
+func autoCandidates(req BuildRequest, all []string) []string {
+	present := map[string]bool{}
+	for _, t := range all {
+		present[t] = true
+	}
+	pick := func(ids []string) []string {
+		var out []string
+		seen := map[string]bool{}
+		for _, id := range ids {
+			t := NodeTag(Node{ID: id})
+			if present[t] && !seen[t] {
+				seen[t] = true
+				out = append(out, t)
+			}
+			if len(out) == MaxAutoCandidates {
+				break
+			}
+		}
+		return out
+	}
+	if fav := pick(req.Favorites); len(fav) > 0 {
+		return fav
+	}
+	out := pick(req.Ranked)
+	if len(out) < MaxAutoCandidates {
+		seen := map[string]bool{}
+		for _, t := range out {
+			seen[t] = true
+		}
+		for _, id := range req.Failed {
+			seen[NodeTag(Node{ID: id})] = true
+		}
+		for _, t := range all {
+			if len(out) >= MaxAutoCandidates {
+				break
+			}
+			if !seen[t] {
+				out = append(out, t)
+			}
+		}
+	}
+	if len(out) == 0 {
+		// everything failed last time: still try the first ones
+		n := len(all)
+		if n > MaxAutoCandidates {
+			n = MaxAutoCandidates
+		}
+		out = append(out, all[:n]...)
+	}
+	return out
+}
+
+// applyFragment enables TLS handshake fragmentation on TLS-based servers.
+func applyFragment(ob map[string]any, mode string) {
+	if mode == "" {
+		return
+	}
+	t, ok := ob["tls"].(map[string]any)
+	if !ok || t["enabled"] != true {
+		return
+	}
+	// QUIC-based protocols have no TCP handshake to split
+	switch ob["type"] {
+	case "hysteria2", "hysteria", "tuic":
+		return
+	}
+	copied := map[string]any{}
+	for k, v := range t {
+		copied[k] = v
+	}
+	if mode == "full" {
+		copied["fragment"] = true
+	} else {
+		copied["record_fragment"] = true
+	}
+	ob["tls"] = copied
+}
+
+// userRules converts routing rules from the settings into sing-box rules.
+func userRules(list []RoutingRule) []any {
+	var out []any
+	for _, r := range list {
+		m := strings.TrimSpace(strings.ToLower(r.Match))
+		m = strings.TrimPrefix(strings.TrimPrefix(m, "https://"), "http://")
+		if i := strings.IndexByte(m, '/'); i >= 0 && net.ParseIP(m[:i]) == nil {
+			m = m[:i] // drop URL path, keep CIDR
+		}
+		if m == "" {
+			continue
+		}
+		rule := map[string]any{}
+		switch {
+		case strings.HasPrefix(m, "*") && strings.HasSuffix(m, "*") && len(m) > 2:
+			rule["domain_keyword"] = []string{strings.Trim(m, "*")}
+		case net.ParseIP(m) != nil:
+			if strings.Contains(m, ":") {
+				rule["ip_cidr"] = []string{m + "/128"}
+			} else {
+				rule["ip_cidr"] = []string{m + "/32"}
+			}
+		case strings.Contains(m, "/"):
+			if _, _, err := net.ParseCIDR(m); err != nil {
+				continue
+			}
+			rule["ip_cidr"] = []string{m}
+		default:
+			rule["domain_suffix"] = []string{strings.TrimPrefix(m, "*.")}
+		}
+		switch r.Action {
+		case "block":
+			rule["action"] = "reject"
+		case "proxy":
+			rule["outbound"] = TagSelector
+		default:
+			rule["outbound"] = TagDirect
+		}
+		out = append(out, rule)
+	}
+	return out
 }
 
 // remoteDNS turns "https://1.1.1.1/dns-query", "tls://8.8.8.8" or "1.1.1.1"

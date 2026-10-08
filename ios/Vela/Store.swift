@@ -50,6 +50,15 @@ struct Profile: Codable, Identifiable, Hashable {
     var customName: String?
 }
 
+/// User routing rule: domain, *keyword* or IP/CIDR → direct, proxy or block.
+struct RoutingRule: Codable, Equatable, Identifiable {
+    var id = UUID().uuidString
+    var match: String
+    var action: String = "direct"
+
+    enum CodingKeys: String, CodingKey { case match, action }
+}
+
 struct VelaSettings: Codable, Equatable {
     var routing = "smart"
     var blockAds = false
@@ -58,11 +67,56 @@ struct VelaSettings: Codable, Equatable {
     var directDNS = "77.88.8.8"
     var directDomains: [String] = []
     var proxyDomains: [String] = []
+    /// Switch to a working server when the chosen one stops answering.
+    var disableFailover = false
+    /// "" off, "record" light, "full" strongest TLS handshake splitting.
+    var tlsFragment = ""
+    var rules: [RoutingRule] = []
+
+    init() {}
+
+    // New fields are optional in saved state, so older versions' files still load.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = VelaSettings.defaults
+        routing = try c.decodeIfPresent(String.self, forKey: .routing) ?? d.routing
+        blockAds = try c.decodeIfPresent(Bool.self, forKey: .blockAds) ?? d.blockAds
+        ipv6 = try c.decodeIfPresent(Bool.self, forKey: .ipv6) ?? d.ipv6
+        remoteDNS = try c.decodeIfPresent(String.self, forKey: .remoteDNS) ?? d.remoteDNS
+        directDNS = try c.decodeIfPresent(String.self, forKey: .directDNS) ?? d.directDNS
+        directDomains = try c.decodeIfPresent([String].self, forKey: .directDomains) ?? []
+        proxyDomains = try c.decodeIfPresent([String].self, forKey: .proxyDomains) ?? []
+        disableFailover = try c.decodeIfPresent(Bool.self, forKey: .disableFailover) ?? false
+        tlsFragment = try c.decodeIfPresent(String.self, forKey: .tlsFragment) ?? ""
+        rules = try c.decodeIfPresent([RoutingRule].self, forKey: .rules) ?? []
+    }
+
+    static let defaults = VelaSettings()
 
     var json: [String: Any] {
         ["mode": "tun", "routing": routing, "blockAds": blockAds, "ipv6": ipv6, "stack": "system",
          "remoteDns": remoteDNS, "directDns": directDNS, "directDomains": directDomains,
-         "proxyDomains": proxyDomains, "logLevel": "warn"]
+         "proxyDomains": proxyDomains, "logLevel": "info", "disableFailover": disableFailover,
+         "tlsFragment": tlsFragment,
+         "rules": rules.filter { !$0.match.isEmpty }.map { ["match": $0.match, "action": $0.action] }]
+    }
+
+    /// Reads settings exported by any Vela app (keys of the Go core).
+    init(core o: [String: Any], keeping cur: VelaSettings) {
+        self = cur
+        routing = o["routing"] as? String ?? cur.routing
+        blockAds = o["blockAds"] as? Bool ?? cur.blockAds
+        ipv6 = o["ipv6"] as? Bool ?? cur.ipv6
+        remoteDNS = (o["remoteDns"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? cur.remoteDNS
+        directDNS = (o["directDns"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? cur.directDNS
+        directDomains = o["directDomains"] as? [String] ?? cur.directDomains
+        proxyDomains = o["proxyDomains"] as? [String] ?? cur.proxyDomains
+        disableFailover = o["disableFailover"] as? Bool ?? false
+        tlsFragment = o["tlsFragment"] as? String ?? ""
+        rules = (o["rules"] as? [[String: Any]] ?? []).compactMap { r in
+            guard let m = r["match"] as? String, !m.isEmpty else { return nil }
+            return RoutingRule(match: m, action: r["action"] as? String ?? "direct")
+        }
     }
 }
 
@@ -71,8 +125,24 @@ struct AppState: Codable {
     var activeProfile = ""
     var selectedNode = "auto"
     var settings = VelaSettings()
+    /// Favorite server ids; automatic selection prefers them.
+    var favorites: [String] = []
+    /// "system", "light" or "dark".
+    var theme = "system"
 
     var active: Profile? { profiles.first { $0.id == activeProfile } ?? profiles.first }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        profiles = try c.decodeIfPresent([Profile].self, forKey: .profiles) ?? []
+        activeProfile = try c.decodeIfPresent(String.self, forKey: .activeProfile) ?? ""
+        selectedNode = try c.decodeIfPresent(String.self, forKey: .selectedNode) ?? "auto"
+        settings = try c.decodeIfPresent(VelaSettings.self, forKey: .settings) ?? VelaSettings()
+        favorites = try c.decodeIfPresent([String].self, forKey: .favorites) ?? []
+        theme = try c.decodeIfPresent(String.self, forKey: .theme) ?? "system"
+    }
 }
 
 struct CoreError: LocalizedError {
@@ -116,6 +186,17 @@ final class Store: ObservableObject {
         if let data = try? Data(contentsOf: fileURL), let st = try? JSONDecoder().decode(AppState.self, from: data) {
             state = st
         }
+        if let data = try? Data(contentsOf: dataURL.appendingPathComponent("pings.json")),
+           let saved = try? JSONDecoder().decode([String: Int].self, from: data) {
+            pings = saved.filter { $0.value != 0 }
+        }
+    }
+
+    /// Remembers check results so automatic selection skips dead servers after a restart.
+    func savePings() {
+        if let data = try? JSONEncoder().encode(pings.filter { $0.value != 0 }) {
+            try? data.write(to: dataURL.appendingPathComponent("pings.json"), options: .atomic)
+        }
     }
 
     private func update(_ change: (inout AppState) -> Void) {
@@ -139,6 +220,10 @@ final class Store: ObservableObject {
     func importText(_ text: String) async throws -> String {
         let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { throw CoreError(message: "Вставьте ссылку на подписку или сервер") }
+        var backupError: NSError?
+        let backup = VelacoreDecodeBackup(input, &backupError)
+        if let backupError { throw CoreError(message: backupError.localizedDescription) }
+        if !backup.isEmpty { return try await restore(Self.json(backup)) }
         let split = Self.json(VelacoreSplitImport(input))
         let urls = split["subscriptions"] as? [String] ?? []
         let linksText = split["links"] as? String ?? ""
@@ -297,6 +382,55 @@ final class Store: ObservableObject {
 
     func setSettings(_ s: VelaSettings) { update { $0.settings = s } }
 
+    func setFavorite(_ id: String, _ on: Bool) {
+        update { st in
+            st.favorites.removeAll { $0 == id }
+            if on { st.favorites.append(id) }
+        }
+    }
+
+    func setTheme(_ theme: String) { update { $0.theme = theme } }
+
+    // MARK: - Backup
+
+    /// Everything needed to set Vela up on another device, as text for a QR code.
+    func exportBackup() throws -> String {
+        let st = state
+        let subs = st.profiles.filter { $0.kind == "subscription" }.map { ["url": $0.url, "name": $0.customName ?? ""] }
+        let links = st.profiles.first { $0.id == Self.manualID }?.nodes.map(\.link).filter { !$0.isEmpty } ?? []
+        let favs = st.profiles.flatMap(\.nodes).filter { st.favorites.contains($0.id) }.map(\.link).filter { !$0.isEmpty }
+        let b: [String: Any] = ["subscriptions": subs, "links": links, "favorites": favs, "settings": st.settings.json,
+                                "extra": ["theme": st.theme, "platform": "ios"]]
+        let data = try JSONSerialization.data(withJSONObject: b)
+        var error: NSError?
+        let text = VelacoreEncodeBackup(String(data: data, encoding: .utf8), &error)
+        if let error { throw CoreError(message: error.localizedDescription) }
+        return text
+    }
+
+    private func restore(_ b: [String: Any]) async throws -> String {
+        let subs = b["subscriptions"] as? [[String: Any]] ?? []
+        var lines = subs.compactMap { $0["url"] as? String }.filter { !$0.isEmpty }
+        lines += b["links"] as? [String] ?? []
+        var msg = ""
+        if !lines.isEmpty { msg = try await importText(lines.joined(separator: "\n")) }
+        for s in subs {
+            guard let name = s["name"] as? String, !name.isEmpty, let url = s["url"] as? String,
+                  let p = state.profiles.first(where: { $0.kind == "subscription" && $0.url == url }) else { continue }
+            rename(p.id, to: name)
+        }
+        let favLinks = Set(b["favorites"] as? [String] ?? [])
+        let extra = b["extra"] as? [String: Any] ?? [:]
+        update { st in
+            if let o = b["settings"] as? [String: Any] { st.settings = VelaSettings(core: o, keeping: st.settings) }
+            for n in st.profiles.flatMap(\.nodes) where favLinks.contains(n.link) && !st.favorites.contains(n.id) {
+                st.favorites.append(n.id)
+            }
+            if let t = extra["theme"] as? String, ["system", "light", "dark"].contains(t) { st.theme = t }
+        }
+        return msg.isEmpty ? "Настройки восстановлены" : "Восстановлено. " + msg
+    }
+
     // MARK: - Server check
 
     /// Real request through every server using a temporary core in the app.
@@ -329,6 +463,7 @@ final class Store: ObservableObject {
         }
         try? await Task.sleep(nanoseconds: 200_000_000)
         probe = nil
+        savePings()
     }
 
     // MARK: - Config
@@ -341,11 +476,17 @@ final class Store: ObservableObject {
             throw CoreError(message: "Сначала добавьте сервер или подписку")
         }
         let nodes = profile.nodes.compactMap { Self.json($0.raw) as Any? }
+        let ids = Set(profile.nodes.map(\.id))
+        // automatic selection: favorites first, then the fastest, never the dead ones
+        let ranked = pings.filter { ids.contains($0.key) && $0.value > 0 }.sorted { $0.value < $1.value }.map(\.key)
+        let failed = pings.filter { ids.contains($0.key) && $0.value < 0 }.map(\.key)
         let req: [String: Any] = [
             "platform": "ios", "nodes": nodes,
             "selected": profile.id == state.activeProfile ? state.selectedNode : "auto",
             "settings": state.settings.json, "dataDir": "__VELA_DATA__", "skipRuleInstall": true,
             "controllerPort": port, "controllerSecret": secret,
+            "favorites": state.favorites.filter { ids.contains($0) }, "ranked": ranked, "failed": failed,
+            "logPath": "__VELA_DATA__/core.log",
         ]
         let data = try JSONSerialization.data(withJSONObject: req)
         var error: NSError?

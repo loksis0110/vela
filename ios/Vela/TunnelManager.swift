@@ -1,8 +1,36 @@
 import Foundation
 import NetworkExtension
 import Velacore
+import WidgetKit
 
 enum ConnState { case disconnected, connecting, connected, disconnecting }
+
+struct TrafficPoint: Equatable {
+    let up: Int64
+    let down: Int64
+}
+
+/// What websites see (from MyIP in the Go core).
+struct IPInfo: Equatable {
+    let ip, country, city, isp, flag: String
+}
+
+struct SpeedState: Equatable {
+    var running = false
+    var phase = ""
+    var pingMs = 0.0
+    var downMbps = 0.0
+    var upMbps = 0.0
+    var error: String?
+    var done = false
+}
+
+/// Bridges speed test progress from Go to Swift.
+private final class SpeedCallback: NSObject, VelacoreSpeedHandlerProtocol {
+    let handler: (String, Double) -> Void
+    init(_ handler: @escaping (String, Double) -> Void) { self.handler = handler }
+    func onProgress(_ phase: String?, value: Double) { handler(phase ?? "", value) }
+}
 
 /// Owns the VPN configuration in iOS Settings and talks to the running core.
 @MainActor
@@ -17,6 +45,17 @@ final class TunnelManager: ObservableObject {
     @Published private(set) var total: Int64 = 0
     /// Node id that currently carries traffic (resolves "auto").
     @Published private(set) var activeNode: String?
+    /// Calm message, e.g. that Vela switched to another server.
+    @Published var notice: String?
+    /// Last two minutes of traffic per second.
+    @Published private(set) var history: [TrafficPoint] = []
+    @Published private(set) var ip: IPInfo?
+    @Published private(set) var ipBusy = false
+    @Published private(set) var ipError: String?
+    @Published var speed = SpeedState()
+
+    private var watchTask: Task<Void, Never>?
+    nonisolated static let testURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
 
     private var manager: NETunnelProviderManager?
     private var observer: NSObjectProtocol?
@@ -66,11 +105,20 @@ final class TunnelManager: ObservableObject {
     }
 
     private func apply(_ status: NEVPNStatus) {
+        defer { refreshWidgets(status) }
         switch status {
         case .connected:
+            let wasConnected = state == .connected
             state = .connected
             since = manager?.connection.connectedDate ?? Date()
             startStats()
+            if !wasConnected {
+                startWatchdog()
+                Task {
+                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                    await self.refreshIP()
+                }
+            }
         case .connecting, .reasserting:
             state = .connecting
         case .disconnecting:
@@ -78,9 +126,22 @@ final class TunnelManager: ObservableObject {
         default:
             state = .disconnected
             since = nil
+            if state != .disconnected { ip = nil; ipError = nil }
             up = 0; down = 0; total = 0; activeNode = nil
+            history = []
             statsTask?.cancel()
+            watchTask?.cancel()
         }
+    }
+
+    private var lastWidgetStatus: NEVPNStatus?
+
+    /// Keeps the home screen widget and the Control Center control in sync.
+    private func refreshWidgets(_ status: NEVPNStatus) {
+        guard status != lastWidgetStatus else { return }
+        lastWidgetStatus = status
+        WidgetCenter.shared.reloadAllTimelines()
+        if #available(iOS 18.0, *) { ControlCenter.shared.reloadAllControls() }
     }
 
     private func ensureManager() async throws -> NETunnelProviderManager {
@@ -102,6 +163,7 @@ final class TunnelManager: ObservableObject {
 
     func connect() async {
         error = nil
+        notice = nil
         do {
             let m = try await ensureManager()
             port = Int.random(in: 20000 ... 60000)
@@ -169,13 +231,132 @@ final class TunnelManager: ObservableObject {
                 guard let c = await self.request("GET", "/connections") else { continue }
                 let u = (c["uploadTotal"] as? NSNumber)?.int64Value ?? 0
                 let d = (c["downloadTotal"] as? NSNumber)?.int64Value ?? 0
-                if let last { self.up = max(0, u - last.0); self.down = max(0, d - last.1) }
+                if let last {
+                    self.up = max(0, u - last.0); self.down = max(0, d - last.1)
+                    self.history.append(TrafficPoint(up: self.up, down: self.down))
+                    if self.history.count > 120 { self.history.removeFirst(self.history.count - 120) }
+                }
                 last = (u, d)
                 self.total = u + d
                 if tick % 3 == 0 { self.activeNode = await self.resolveActive() }
                 tick += 1
             }
         }
+    }
+
+    /// Checks the server in use right after connecting and then every 30
+    /// seconds; when the chosen server stops answering, switches to
+    /// automatic selection (unless turned off in Settings).
+    private func startWatchdog() {
+        watchTask?.cancel()
+        watchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            var fails = 0
+            var first = true
+            while !Task.isCancelled {
+                guard let self, self.state == .connected else { return }
+                let ok = await self.request("GET", "/proxies/proxy/delay?url=\(Self.testURL)&timeout=8000", timeout: 11) != nil
+                if ok {
+                    fails = 0
+                } else {
+                    fails += 1
+                    if first || fails >= 2 {
+                        fails = 0
+                        await self.failover(justConnected: first)
+                    }
+                }
+                first = false
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+            }
+        }
+    }
+
+    private func failover(justConnected: Bool) async {
+        let store = Store.shared
+        let st = store.state
+        guard let profile = st.active else { return }
+        let manual = st.selectedNode != "auto" && profile.nodes.contains { $0.id == st.selectedNode }
+        if st.settings.disableFailover || !manual {
+            if manual, justConnected {
+                error = "Выбранный сервер не отвечает. Выберите другой сервер или «Автовыбор»"
+            } else if !manual {
+                _ = await request("GET", "/group/auto/delay?url=\(Self.testURL)&timeout=20000", timeout: 25)
+            }
+            return
+        }
+        let name = profile.nodes.first { $0.id == st.selectedNode }?.name ?? "Сервер"
+        if await switchTo("auto") {
+            store.select(profile: profile.id, node: "auto")
+            error = nil
+            notice = "«\(name)» не отвечает. Vela переключилась на автовыбор"
+        } else if justConnected {
+            error = "Выбранный сервер не отвечает. Выберите другой сервер"
+        }
+    }
+
+    // MARK: - Tools
+
+    /// Asks a website which IP and country it sees (through the VPN when on).
+    func refreshIP() async {
+        guard !ipBusy else { return }
+        ipBusy = true
+        ipError = nil
+        defer { ipBusy = false }
+        let result: Result<[String: Any], Error> = await Task.detached(priority: .userInitiated) {
+            var err: NSError?
+            let text = VelacoreMyIP(&err)
+            if let err { return .failure(CoreError(message: err.localizedDescription)) }
+            return .success(Store.json(text))
+        }.value
+        switch result {
+        case let .success(o):
+            ip = IPInfo(ip: o["ip"] as? String ?? "", country: o["country"] as? String ?? "", city: o["city"] as? String ?? "",
+                        isp: o["isp"] as? String ?? "", flag: o["flag"] as? String ?? "")
+        case let .failure(e):
+            ip = nil
+            ipError = e.localizedDescription
+        }
+    }
+
+    /// Measures ping, download and upload through the current connection.
+    func runSpeedTest() async {
+        guard !speed.running else { return }
+        speed = SpeedState(running: true, phase: "ping")
+        let callback = SpeedCallback { phase, value in
+            Task { @MainActor in
+                let t = TunnelManager.shared
+                switch phase {
+                case "ping": t.speed.pingMs = value; t.speed.phase = "download"
+                case "download": t.speed.downMbps = value; t.speed.phase = "download"
+                case "upload": t.speed.upMbps = value; t.speed.phase = "upload"
+                default: break
+                }
+            }
+        }
+        let json = await Task.detached(priority: .userInitiated) { VelacoreSpeedTest(8, callback) }.value
+        let o = Store.json(json)
+        let err = (o["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        speed = SpeedState(running: false, phase: "done", pingMs: (o["pingMs"] as? NSNumber)?.doubleValue ?? 0,
+                           downMbps: (o["downloadMbps"] as? NSNumber)?.doubleValue ?? 0,
+                           upMbps: (o["uploadMbps"] as? NSNumber)?.doubleValue ?? 0, error: err, done: true)
+    }
+
+    /// Recent core log from the Network Extension.
+    func logs() async -> String {
+        guard state == .connected, let session = manager?.connection as? NETunnelProviderSession else {
+            return "Журнал доступен, пока VPN подключён."
+        }
+        let raw: String = await withCheckedContinuation { cont in
+            do {
+                try session.sendProviderMessage(Data("vela:logs".utf8)) { reply in
+                    cont.resume(returning: reply.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+                }
+            } catch {
+                cont.resume(returning: "")
+            }
+        }
+        let text = VelacoreTidyLog(raw)
+        return text.isEmpty ? "Журнал пуст." : text
     }
 
     private func resolveActive() async -> String? {
@@ -212,7 +393,7 @@ final class TunnelManager: ObservableObject {
                 guard let n = iterator.next() else { return }
                 started += 1
                 group.addTask {
-                    let path = "/proxies/\(VelacoreNodeTag(n.id))/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=8000"
+                    let path = "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=8000"
                     let r = await self.request("GET", path, timeout: 11)
                     return (n.id, (r?["delay"] as? NSNumber)?.intValue ?? -1)
                 }
@@ -226,5 +407,6 @@ final class TunnelManager: ObservableObject {
             }
         }
         store.probe = nil
+        store.savePings()
     }
 }

@@ -34,11 +34,37 @@ data class VpnStatus(
     val downTotal: Long = 0,
     /** Node id that currently carries traffic (resolves "auto"). */
     val activeNode: String? = null,
+    /** Calm message, e.g. that Vela switched to another server. */
+    val notice: String? = null,
+)
+
+/** What websites see: from MyIP in the Go core. */
+data class IpInfo(val ip: String, val country: String, val city: String, val isp: String, val flag: String)
+
+/** Speed test progress and result. */
+data class SpeedState(
+    val running: Boolean = false,
+    val phase: String = "",
+    val pingMs: Double = 0.0,
+    val downMbps: Double = 0.0,
+    val upMbps: Double = 0.0,
+    val error: String? = null,
+    val done: Boolean = false,
 )
 
 /** Shared between the VPN service and the UI (same process). */
 object VpnManager {
     val status = MutableStateFlow(VpnStatus())
+
+    /** Last two minutes of traffic: (upload, download) bytes per second. */
+    val history = MutableStateFlow<List<Pair<Long, Long>>>(emptyList())
+
+    val ip = MutableStateFlow<IpInfo?>(null)
+    val ipBusy = MutableStateFlow(false)
+    val ipError = MutableStateFlow<String?>(null)
+    val speed = MutableStateFlow(SpeedState())
+
+    const val TEST_URL = "https://www.gstatic.com/generate_204"
 
     @Volatile var controllerPort = 0
     @Volatile var controllerSecret = ""
@@ -99,6 +125,67 @@ object VpnManager {
         now.removePrefix("node-")
     }
 
+    /** Real request through the server in use; delay in ms or null. */
+    suspend fun probeCurrent(): Int? = withContext(Dispatchers.IO) {
+        val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
+        request("GET", "/proxies/proxy/delay?$q", timeoutMs = 11000)?.let { JSONObject(it).optInt("delay", 0) }?.takeIf { it > 0 }
+    }
+
+    /** Makes automatic selection re-test its servers right now. */
+    suspend fun retestAuto() = withContext(Dispatchers.IO) {
+        val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=20000"
+        request("GET", "/group/auto/delay?$q", timeoutMs = 25000)
+    }
+
+    fun pushTraffic(up: Long, down: Long) {
+        history.update { (it + (up to down)).takeLast(120) }
+    }
+
+    /** Asks a website which IP and country it sees (through the VPN when on). */
+    suspend fun refreshIp() {
+        if (ipBusy.value) return
+        ipBusy.value = true
+        ipError.value = null
+        try {
+            withContext(Dispatchers.IO) {
+                val o = JSONObject(Velacore.myIP())
+                ip.value = IpInfo(
+                    ip = o.optString("ip"), country = o.optString("country"), city = o.optString("city"),
+                    isp = o.optString("isp"), flag = o.optString("flag"),
+                )
+            }
+        } catch (e: Exception) {
+            ip.value = null
+            ipError.value = e.message ?: "не удалось узнать IP"
+        } finally {
+            ipBusy.value = false
+        }
+    }
+
+    /** Measures ping, download and upload through the current connection. */
+    suspend fun runSpeedTest() {
+        if (speed.value.running) return
+        speed.value = SpeedState(running = true, phase = "ping")
+        val json = withContext(Dispatchers.IO) {
+            Velacore.speedTest(8) { phase, value ->
+                speed.update {
+                    when (phase) {
+                        "ping" -> it.copy(phase = "download", pingMs = value)
+                        "download" -> it.copy(phase = "download", downMbps = value)
+                        "upload" -> it.copy(phase = "upload", upMbps = value)
+                        else -> it
+                    }
+                }
+            }
+        }
+        val o = JSONObject(json)
+        speed.value = SpeedState(
+            running = false, done = true, phase = "done",
+            pingMs = o.optDouble("pingMs", 0.0), downMbps = o.optDouble("downloadMbps", 0.0),
+            upMbps = o.optDouble("uploadMbps", 0.0), error = o.optString("error").ifBlank { null },
+        )
+    }
+
     /** Progress of the server check: done to total, or null when idle. */
     val probe = MutableStateFlow<Pair<Int, Int>?>(null)
 
@@ -129,7 +216,7 @@ object VpnManager {
                 nodes.map { node ->
                     async(Dispatchers.IO) {
                         gate.withPermit {
-                            val q = "url=" + URLEncoder.encode("https://www.gstatic.com/generate_204", "UTF-8") + "&timeout=8000"
+                            val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
                             val ms = request("GET", "/proxies/${Velacore.nodeTag(node.id)}/delay?$q", timeoutMs = 11000)
                                 ?.let { JSONObject(it).optInt("delay", -1) } ?: -1
                             report(node.id, ms, if (ms > 0) "" else "сервер не ответил")
@@ -153,6 +240,7 @@ object VpnManager {
             }
         } finally {
             probe.value = null
+            Store.savePings()
         }
     }
 }

@@ -92,6 +92,11 @@ private fun JSONArray?.toNodes(): List<Node> {
     return (0 until length()).map { Node.from(getJSONObject(it)) }
 }
 
+/** User routing rule: domain, *keyword* or IP/CIDR → direct, proxy or block. */
+data class Rule(val match: String, val action: String = "direct") {
+    fun toJson(): JSONObject = JSONObject().put("match", match).put("action", action)
+}
+
 data class Settings(
     val routing: String = "smart",
     val blockAds: Boolean = false,
@@ -101,6 +106,14 @@ data class Settings(
     val directDns: String = "77.88.8.8",
     val directDomains: List<String> = emptyList(),
     val proxyDomains: List<String> = emptyList(),
+    /** Switch to a working server when the chosen one stops answering. */
+    val disableFailover: Boolean = false,
+    /** "" off, "record" light, "full" strongest TLS handshake splitting. */
+    val tlsFragment: String = "",
+    val rules: List<Rule> = emptyList(),
+    /** "" all apps, "exclude" listed apps bypass the VPN, "only" only listed apps use it. */
+    val appMode: String = "",
+    val apps: List<String> = emptyList(),
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("mode", "tun").put("routing", routing).put("blockAds", blockAds)
@@ -108,7 +121,12 @@ data class Settings(
         .put("directDns", directDns)
         .put("directDomains", JSONArray(directDomains))
         .put("proxyDomains", JSONArray(proxyDomains))
-        .put("logLevel", "warn")
+        .put("logLevel", "info")
+        .put("disableFailover", disableFailover)
+        .put("tlsFragment", tlsFragment)
+        .put("rules", JSONArray().apply { rules.forEach { put(it.toJson()) } })
+        .put("appMode", appMode)
+        .put("apps", JSONArray(apps))
 
     companion object {
         fun from(o: JSONObject?): Settings {
@@ -122,6 +140,15 @@ data class Settings(
                 directDns = o.optString("directDns", "77.88.8.8"),
                 directDomains = o.optJSONArray("directDomains").strings(),
                 proxyDomains = o.optJSONArray("proxyDomains").strings(),
+                disableFailover = o.optBoolean("disableFailover"),
+                tlsFragment = o.optString("tlsFragment"),
+                rules = o.optJSONArray("rules")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { i ->
+                        arr.optJSONObject(i)?.let { r -> Rule(r.optString("match"), r.optString("action", "direct")) }
+                    }.filter { it.match.isNotBlank() }
+                } ?: emptyList(),
+                appMode = o.optString("appMode"),
+                apps = o.optJSONArray("apps").strings(),
             )
         }
     }
@@ -136,6 +163,10 @@ data class AppState(
     val selectedNode: String = "auto",
     val settings: Settings = Settings(),
     val wasConnected: Boolean = false,
+    /** Favorite server ids; automatic selection prefers them. */
+    val favorites: Set<String> = emptySet(),
+    /** "system", "light" or "dark". */
+    val theme: String = "system",
 ) {
     val active: Profile? get() = profiles.firstOrNull { it.id == activeProfile } ?: profiles.firstOrNull()
 }
@@ -161,7 +192,11 @@ object Store {
         dataDir = context.filesDir
         file = File(dataDir, "state.json")
         _state.value = load()
+        loadPings()
     }
+
+    /** Core log of the current connection (shown in Settings). */
+    val logFile: File get() = File(dataDir, "core.log")
 
     private fun load(): AppState = runCatching {
         val o = JSONObject(file.readText())
@@ -173,8 +208,26 @@ object Store {
             selectedNode = o.optString("selectedNode", "auto"),
             settings = Settings.from(o.optJSONObject("settings")),
             wasConnected = o.optBoolean("wasConnected"),
+            favorites = o.optJSONArray("favorites").strings().toSet(),
+            theme = o.optString("theme", "system"),
         )
     }.getOrDefault(AppState())
+
+    private fun loadPings() {
+        runCatching {
+            val o = JSONObject(File(dataDir, "pings.json").readText())
+            pings.value = o.keys().asSequence().associateWith { o.getInt(it) }.filterValues { it != 0 }
+        }
+    }
+
+    /** Remembers check results so automatic selection can skip dead servers after a restart. */
+    fun savePings() {
+        runCatching {
+            val o = JSONObject()
+            pings.value.filterValues { it != 0 }.forEach { (k, v) -> o.put(k, v) }
+            File(dataDir, "pings.json").writeText(o.toString())
+        }
+    }
 
     @Synchronized
     private fun update(block: (AppState) -> AppState) {
@@ -186,6 +239,8 @@ object Store {
             .put("selectedNode", next.selectedNode)
             .put("settings", next.settings.toJson())
             .put("wasConnected", next.wasConnected)
+            .put("favorites", JSONArray(next.favorites.toList()))
+            .put("theme", next.theme)
         val tmp = File(file.parentFile, "state.json.tmp")
         tmp.writeText(o.toString())
         tmp.renameTo(file)
@@ -198,6 +253,8 @@ object Store {
     suspend fun import(text: String): String = withContext(Dispatchers.IO) {
         val input = text.trim()
         require(input.isNotEmpty()) { "Вставьте ссылку на подписку или сервер" }
+        val backup = runCatching { Velacore.decodeBackup(input) }.getOrElse { error(it.message ?: "Резервная копия повреждена") }
+        if (backup.isNotEmpty()) return@withContext restore(JSONObject(backup))
         val split = JSONObject(Velacore.splitImport(input))
         val urls = split.optJSONArray("subscriptions").strings()
         val linksText = split.optString("links")
@@ -367,6 +424,70 @@ object Store {
 
     fun setSettings(settings: Settings) = update { it.copy(settings = settings) }
 
+    fun setFavorite(nodeId: String, on: Boolean) = update {
+        it.copy(favorites = if (on) it.favorites + nodeId else it.favorites - nodeId)
+    }
+
+    fun setTheme(theme: String) = update { it.copy(theme = theme) }
+
+    // ------------------------------------------------------------ backup
+
+    /** Everything needed to set Vela up on another device, as text for a QR code. */
+    fun exportBackup(): String {
+        val st = _state.value
+        val subs = JSONArray()
+        st.profiles.filter { it.kind == "subscription" }.forEach {
+            subs.put(JSONObject().put("url", it.url).put("name", it.customName))
+        }
+        val links = JSONArray()
+        st.profiles.firstOrNull { it.id == MANUAL_ID }?.nodes?.forEach { n ->
+            n.raw.optString("link").takeIf { it.isNotBlank() }?.let { links.put(it) }
+        }
+        val favs = JSONArray()
+        st.profiles.flatMap { it.nodes }.filter { it.id in st.favorites }.forEach { n ->
+            n.raw.optString("link").takeIf { it.isNotBlank() }?.let { favs.put(it) }
+        }
+        val b = JSONObject()
+            .put("subscriptions", subs).put("links", links).put("favorites", favs)
+            .put("settings", st.settings.toJson())
+            .put("extra", JSONObject().put("theme", st.theme).put("platform", "android"))
+        return Velacore.encodeBackup(b.toString())
+    }
+
+    private suspend fun restore(b: JSONObject): String {
+        val lines = mutableListOf<String>()
+        val subs = b.optJSONArray("subscriptions")
+        if (subs != null) for (i in 0 until subs.length()) subs.optJSONObject(i)?.optString("url")?.let { if (it.isNotBlank()) lines += it }
+        lines += b.optJSONArray("links").strings()
+        val msg = if (lines.isNotEmpty()) import(lines.joinToString("\n")) else ""
+        if (subs != null) {
+            for (i in 0 until subs.length()) {
+                val o = subs.optJSONObject(i) ?: continue
+                val name = o.optString("name")
+                if (name.isBlank()) continue
+                _state.value.profiles.firstOrNull { it.kind == "subscription" && it.url == o.optString("url") }?.let { rename(it.id, name) }
+            }
+        }
+        val favLinks = b.optJSONArray("favorites").strings().toSet()
+        val extra = b.optJSONObject("extra")
+        update { st ->
+            var settings = st.settings
+            b.optJSONObject("settings")?.let { o ->
+                val incoming = Settings.from(o)
+                // app lists only make sense on the same kind of device
+                settings = if (extra?.optString("platform") == "android") incoming
+                else incoming.copy(appMode = st.settings.appMode, apps = st.settings.apps)
+            }
+            val favIds = st.profiles.flatMap { it.nodes }.filter { it.raw.optString("link") in favLinks }.map { it.id }
+            st.copy(
+                settings = settings,
+                favorites = st.favorites + favIds,
+                theme = extra?.optString("theme")?.takeIf { it in setOf("system", "light", "dark") } ?: st.theme,
+            )
+        }
+        return if (msg.isEmpty()) "Настройки восстановлены" else "Восстановлено. $msg"
+    }
+
     fun setWasConnected(value: Boolean) = update { it.copy(wasConnected = value) }
 
     /** Builds the sing-box configuration for the active profile. */
@@ -382,6 +503,13 @@ object Store {
             .put("dataDir", dataDir.absolutePath)
             .put("controllerPort", controllerPort)
             .put("controllerSecret", controllerSecret)
+            .put("logPath", logFile.absolutePath)
+        // automatic selection: favorites first, then the fastest, never the dead ones
+        val ids = profile.nodes.map { it.id }.toSet()
+        val p = pings.value
+        req.put("favorites", JSONArray(st.favorites.filter { it in ids }))
+        req.put("ranked", JSONArray(p.filter { it.key in ids && it.value > 0 }.entries.sortedBy { it.value }.map { it.key }))
+        req.put("failed", JSONArray(p.filter { it.key in ids && it.value < 0 }.keys.toList()))
         return Velacore.buildConfig(req.toString())
     }
 

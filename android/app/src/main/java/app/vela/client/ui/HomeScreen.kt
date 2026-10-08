@@ -53,6 +53,8 @@ import androidx.compose.ui.unit.sp
 import app.vela.client.R
 import app.vela.client.data.AppState
 import app.vela.client.vpn.ConnState
+import app.vela.client.vpn.IpInfo
+import app.vela.client.vpn.SpeedState
 import app.vela.client.vpn.VpnStatus
 import kotlinx.coroutines.delay
 
@@ -66,6 +68,14 @@ fun HomeScreen(
     onSettings: () -> Unit,
     onRouting: (String) -> Unit,
     onDismissError: () -> Unit,
+    onDismissNotice: () -> Unit,
+    history: List<Pair<Long, Long>>,
+    ip: IpInfo?,
+    ipBusy: Boolean,
+    ipError: String?,
+    speed: SpeedState,
+    onIp: () -> Unit,
+    onSpeed: () -> Unit,
 ) {
     var now by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
     LaunchedEffect(status.state) {
@@ -157,6 +167,23 @@ fun HomeScreen(
                 SpeedLabel("↓", formatSpeed(status.down))
                 SpeedLabel("↑", formatSpeed(status.up))
             }
+            TrafficGraph(history, Modifier.padding(top = 12.dp).fillMaxWidth())
+        }
+
+        status.notice?.let { msg ->
+            Row(
+                Modifier
+                    .padding(top = 16.dp)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Vela.Sea.copy(alpha = 0.12f))
+                    .border(1.dp, Vela.Sea.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
+                    .padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(msg, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(vertical = 8.dp))
+                TextButton(onClick = onDismissNotice) { Text("Понятно", color = Vela.Muted) }
+            }
         }
 
         status.error?.let { err ->
@@ -179,6 +206,13 @@ fun HomeScreen(
 
     // ---- current server
     Column(Modifier.padding(top = 24.dp, bottom = 16.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            val (ipValue, ipMeta) = ipTexts(ip, ipBusy, ipError)
+            ToolCard("Мой IP", ipValue, ipMeta, ipBusy, Modifier.weight(1f), onIp)
+            val (spValue, spMeta) = speedTexts(speed)
+            ToolCard("Скорость", spValue, spMeta, speed.running, Modifier.weight(1f), onSpeed)
+        }
+        Spacer(Modifier.height(10.dp))
         CurrentServer(app, status, pings, onServers)
         Spacer(Modifier.height(12.dp))
         RoutingSwitch(app.settings.routing, onRouting)
@@ -279,6 +313,6 @@ private fun RoutingOption(title: String, sub: String, selected: Boolean, modifie
 
 private object Brush {
     fun topGlow() = androidx.compose.ui.graphics.Brush.verticalGradient(
-        0f to Color(0xFF16254A), 0.45f to Vela.Ink, 1f to Vela.Ink,
+        0f to Vela.Glow, 0.45f to Vela.Ink, 1f to Vela.Ink,
     )
 }

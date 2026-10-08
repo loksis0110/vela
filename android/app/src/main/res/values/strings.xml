@@ -5,4 +5,10 @@
     <string name="notif_connected">Подключено</string>
     <string name="notif_connecting">Подключение…</string>
     <string name="notif_disconnect">Отключить</string>
+    <string name="widget_description">Подключение одним нажатием</string>
+    <string name="widget_off">Не подключено</string>
+    <string name="widget_on">Защищено</string>
+    <string name="widget_connecting">Подключение…</string>
+    <string name="widget_connect">Подключить</string>
+    <string name="widget_disconnect">Отключить</string>
 </resources>

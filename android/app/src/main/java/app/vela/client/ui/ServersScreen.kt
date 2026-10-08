@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -24,10 +25,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.QrCode2
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.StarBorder
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItemDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -76,12 +85,35 @@ fun ServersScreen(
     onDeleteNode: (Profile, Node) -> Unit,
     onOpenUrl: (String) -> Unit,
     refreshing: Boolean,
+    onFavorite: (nodeId: String, on: Boolean) -> Unit,
+    onShare: (title: String, text: String) -> Unit,
 ) {
     var viewId by rememberSaveable { mutableStateOf(app.active?.id ?: "") }
     val profile = app.profiles.firstOrNull { it.id == viewId } ?: app.active
     var confirmDelete by remember { mutableStateOf<Profile?>(null) }
     var renaming by remember { mutableStateOf<Profile?>(null) }
     var fastestFirst by rememberSaveable { mutableStateOf(false) }
+    var query by rememberSaveable { mutableStateOf("") }
+    var onlyFav by rememberSaveable { mutableStateOf(false) }
+    var onlyOk by rememberSaveable { mutableStateOf(false) }
+    var proto by rememberSaveable { mutableStateOf("") }
+    var country by rememberSaveable { mutableStateOf("") }
+    var protoMenu by remember { mutableStateOf(false) }
+    var countryMenu by remember { mutableStateOf(false) }
+
+    fun matches(n: Node): Boolean {
+        val q = query.trim().lowercase()
+        if (q.isNotEmpty()) {
+            val flag = splitFlag(n.name).first
+            val hay = listOf(n.name, n.protocol, n.security, n.network, n.server, flag?.let { countryName(it) } ?: "").joinToString(" ").lowercase()
+            if (q.split(' ').filter { it.isNotBlank() }.any { it !in hay }) return false
+        }
+        if (onlyFav && n.id !in app.favorites) return false
+        if (onlyOk && (pings[n.id] ?: 0) <= 0) return false
+        if (proto.isNotEmpty() && n.protocol != proto) return false
+        if (country.isNotEmpty() && splitFlag(n.name).first != country) return false
+        return true
+    }
 
     Column(Modifier.fillMaxSize().background(Vela.Ink).safeDrawingPadding()) {
         Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -142,6 +174,50 @@ fun ServersScreen(
             }
         }
 
+        if (profile != null && profile.nodes.isNotEmpty()) {
+            OutlinedTextField(
+                value = query, onValueChange = { query = it }, singleLine = true,
+                leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Vela.Muted) },
+                trailingIcon = {
+                    if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Rounded.Close, "Очистить", tint = Vela.Muted) }
+                },
+                placeholder = { Text("Поиск: страна, город, протокол", color = Vela.Muted) },
+                shape = RoundedCornerShape(14.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Vela.Line, unfocusedBorderColor = Vela.Hull, cursorColor = Vela.Star,
+                    focusedContainerColor = Vela.Deep, unfocusedContainerColor = Vela.Deep,
+                ),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+            val protocols = profile.nodes.map { it.protocol }.filter { it.isNotBlank() }.distinct().sorted()
+            val flags = profile.nodes.mapNotNull { splitFlag(it.name).first }.distinct().sortedBy { countryName(it) }
+            ChipRow {
+                Chip("★ Избранные", onlyFav) { onlyFav = !onlyFav }
+                Chip("Рабочие", onlyOk) { onlyOk = !onlyOk }
+                if (protocols.size > 1) {
+                    Box {
+                        Chip(proto.ifEmpty { "Все протоколы" } + " ▾", proto.isNotEmpty()) { protoMenu = true }
+                        DropdownMenu(protoMenu, { protoMenu = false }, containerColor = Vela.Deep) {
+                            DropdownMenuItem({ Text("Все протоколы") }, { proto = ""; protoMenu = false })
+                            protocols.forEach { p -> DropdownMenuItem({ Text(p) }, { proto = p; protoMenu = false }) }
+                        }
+                    }
+                }
+                if (flags.size > 1) {
+                    Box {
+                        Chip(if (country.isEmpty()) "Все страны ▾" else "$country ${countryName(country)} ▾", country.isNotEmpty()) { countryMenu = true }
+                        DropdownMenu(countryMenu, { countryMenu = false }, containerColor = Vela.Deep) {
+                            DropdownMenuItem({ Text("Все страны") }, { country = ""; countryMenu = false })
+                            flags.forEach { f ->
+                                DropdownMenuItem({ Text("$f ${countryName(f)}  ${profile.nodes.count { splitFlag(it.name).first == f }}") }, { country = f; countryMenu = false })
+                            }
+                        }
+                    }
+                }
+                Chip("Сначала быстрые", fastestFirst) { fastestFirst = !fastestFirst }
+            }
+        }
+
         if (profile == null) {
             Column(
                 Modifier.fillMaxWidth().padding(16.dp).clip(RoundedCornerShape(22.dp))
@@ -169,21 +245,7 @@ fun ServersScreen(
                         profile, refreshing, app.profiles.count { it.kind == "subscription" } > 1,
                         onRefresh = { onRefresh(profile) }, onRefreshAll = onRefreshAll,
                         onRename = { renaming = profile }, onDelete = { confirmDelete = profile }, onOpenUrl = onOpenUrl,
-                    )
-                }
-            }
-            item {
-                Row(Modifier.padding(horizontal = 6.dp, vertical = 4.dp)) {
-                    Text(
-                        "Сначала быстрые",
-                        fontSize = 13.sp,
-                        color = if (fastestFirst) Vela.Star else Vela.Muted,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(if (fastestFirst) Vela.Hull else Color.Transparent)
-                            .border(1.dp, if (fastestFirst) Vela.Line else Vela.Hull, RoundedCornerShape(50))
-                            .clickable(role = Role.Switch) { fastestFirst = !fastestFirst }
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        onShare = { onShare(profile.name, profile.url) },
                     )
                 }
             }
@@ -194,10 +256,12 @@ fun ServersScreen(
                     meta = live?.let { "Сейчас: " + splitFlag(it.name).second } ?: "Самый быстрый сервер, переключается при сбое",
                     ping = null, selected = autoSelected, inUse = false, reason = null,
                     onClick = { onSelect(profile.id, "auto") }, onDelete = null,
+                    meta2 = if (app.favorites.any { f -> profile.nodes.any { it.id == f } }) "только избранные" else null,
                 )
             }
+            val visible = profile.nodes.filter { matches(it) }
             val ordered = if (fastestFirst) {
-                profile.nodes.sortedBy { n ->
+                visible.sortedBy { n ->
                     val ms = pings[n.id]
                     when {
                         ms == null || ms == 0 -> 1_000_000
@@ -206,7 +270,34 @@ fun ServersScreen(
                     }
                 }
             } else {
-                profile.nodes
+                visible.sortedByDescending { it.id in app.favorites }
+            }
+            if (visible.size != profile.nodes.size) {
+                item {
+                    Text(
+                        "Показано ${visible.size} из ${profile.nodes.size}", color = Vela.Muted, fontSize = 12.sp,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
+                    )
+                }
+            }
+            if (visible.isEmpty()) {
+                item {
+                    val elsewhere = if (query.isNotBlank()) app.profiles.filter { it.id != profile.id && it.nodes.any { n -> matches(n) } } else emptyList()
+                    Column(
+                        Modifier.fillMaxWidth().padding(8.dp).clip(RoundedCornerShape(18.dp))
+                            .border(1.dp, Vela.Line, RoundedCornerShape(18.dp)).padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text("Ничего не найдено", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            if (elsewhere.isEmpty()) "Измените поиск или фильтры." else "Есть совпадения в других подписках:",
+                            color = Vela.Muted, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 4.dp),
+                        )
+                        elsewhere.forEach { o ->
+                            TextButton(onClick = { viewId = o.id }) { Text("${o.name} · ${o.nodes.count { matches(it) }}") }
+                        }
+                    }
+                }
             }
             items(ordered, key = { it.id }) { n ->
                 val tags = listOf(n.protocol, n.security, if (n.network.isNotBlank() && n.network != "tcp") n.network.uppercase() else "")
@@ -218,6 +309,9 @@ fun ServersScreen(
                     inUse = connected && status.activeNode == n.id,
                     onClick = { onSelect(profile.id, n.id) },
                     onDelete = if (profile.kind == "manual") ({ onDeleteNode(profile, n) }) else null,
+                    favorite = n.id in app.favorites,
+                    onFavorite = { onFavorite(n.id, n.id !in app.favorites) },
+                    onShare = { onShare(splitFlag(n.name).second, n.raw.optString("link")) },
                 )
             }
         }
@@ -269,6 +363,7 @@ private fun SubscriptionCard(
     onRename: () -> Unit,
     onDelete: () -> Unit,
     onOpenUrl: (String) -> Unit,
+    onShare: () -> Unit,
 ) {
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp)
@@ -298,6 +393,7 @@ private fun SubscriptionCard(
             TextButton(onClick = onRefresh, enabled = !refreshing) { Text(if (refreshing) "Обновляем…" else "Обновить", color = Vela.Muted) }
             if (several) TextButton(onClick = onRefreshAll, enabled = !refreshing) { Text("Обновить все", color = Vela.Muted) }
             TextButton(onClick = onRename) { Text("Переименовать", color = Vela.Muted) }
+            TextButton(onClick = onShare) { Text("Поделиться", color = Vela.Muted) }
             if (p.supportUrl.isNotBlank()) TextButton(onClick = { onOpenUrl(p.supportUrl) }) { Text("Поддержка", color = Vela.Muted) }
             TextButton(onClick = onDelete) { Text("Удалить", color = Vela.Muted) }
         }
@@ -323,6 +419,10 @@ private fun NodeRow(
     reason: String?,
     onClick: () -> Unit,
     onDelete: (() -> Unit)?,
+    favorite: Boolean = false,
+    onFavorite: (() -> Unit)? = null,
+    onShare: (() -> Unit)? = null,
+    meta2: String? = null,
 ) {
     Row(
         Modifier
@@ -341,10 +441,25 @@ private fun NodeRow(
             Row {
                 Text(meta, color = Vela.Muted, fontSize = 12.sp, maxLines = 1)
                 if (inUse) Text("  ● используется", color = Vela.Sea, fontSize = 12.sp)
+                if (meta2 != null) Text("  ★ $meta2", color = Vela.Flare, fontSize = 12.sp, maxLines = 1)
             }
             if (!reason.isNullOrBlank()) Text(reason, color = Vela.Danger, fontSize = 12.sp, maxLines = 2)
         }
         ping?.let { Text(it.text, color = it.color, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp)) }
+        if (onFavorite != null) {
+            IconButton(onClick = onFavorite, modifier = Modifier.size(36.dp)) {
+                Icon(
+                    if (favorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
+                    if (favorite) "Убрать из избранного" else "В избранное",
+                    tint = if (favorite) Vela.Flare else Vela.Line, modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+        if (onShare != null) {
+            IconButton(onClick = onShare, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Rounded.QrCode2, "Поделиться", tint = Vela.Line, modifier = Modifier.size(18.dp))
+            }
+        }
         if (onDelete != null) {
             IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
                 Icon(Icons.Rounded.Close, "Удалить сервер", tint = Vela.Muted, modifier = Modifier.size(18.dp))

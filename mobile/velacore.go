@@ -6,6 +6,7 @@ package velacore
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/velaapp/vela/core"
@@ -87,4 +88,79 @@ func ProbeNodes(nodesJSON string, timeoutMs int32, parallel int32, handler Probe
 // ExplainError turns a core error message into a short Russian explanation.
 func ExplainError(message string) string {
 	return core.ExplainError(message)
+}
+
+// EncodeQR renders text as a PNG QR code.
+func EncodeQR(text string, size int32) ([]byte, error) {
+	return core.EncodeQR(text, int(size))
+}
+
+// DecodeQR returns the text of a QR code found in a PNG/JPEG image.
+func DecodeQR(image []byte) (string, error) {
+	return core.DecodeQR(image)
+}
+
+// MyIP returns JSON {ip,country,countryCode,city,isp,flag} as websites see
+// this device (through the VPN when it's on).
+func MyIP() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	info, err := core.MyIP(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	data, _ := json.Marshal(info)
+	return string(data), nil
+}
+
+// SpeedHandler receives speed test progress: phase is "ping", "download",
+// "upload" or "done"; value is ms or Mbit/s.
+type SpeedHandler interface {
+	OnProgress(phase string, value float64)
+}
+
+// SpeedTest measures ping, download and upload over the current network
+// (through the VPN when it's on). Returns JSON of core.SpeedResult.
+func SpeedTest(seconds int32, handler SpeedHandler) string {
+	res := core.SpeedTest(context.Background(), nil, time.Duration(seconds)*time.Second, func(p string, v float64) {
+		if handler != nil {
+			handler.OnProgress(p, v)
+		}
+	})
+	data, _ := json.Marshal(res)
+	return string(data)
+}
+
+// EncodeBackup turns backup JSON (core.Backup) into shareable text.
+func EncodeBackup(backupJSON string) (string, error) {
+	var b core.Backup
+	if err := json.Unmarshal([]byte(backupJSON), &b); err != nil {
+		return "", err
+	}
+	return core.EncodeBackup(b)
+}
+
+// DecodeBackup returns the backup JSON, or "" when text is not a backup.
+func DecodeBackup(text string) (string, error) {
+	b, ok, err := core.DecodeBackup(text)
+	if !ok || err != nil {
+		return "", err
+	}
+	data, _ := json.Marshal(b)
+	return string(data), nil
+}
+
+// ReadLog returns the last lines of the core log file, tidied for a phone
+// screen and joined with "\n".
+func ReadLog(path string, limit int32) string {
+	return strings.Join(core.ReadLog(path, int(limit)), "\n")
+}
+
+// TidyLog shortens every line of a raw core log (see ReadLog).
+func TidyLog(text string) string {
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = core.TidyLogLine(l)
+	}
+	return strings.Join(lines, "\n")
 }

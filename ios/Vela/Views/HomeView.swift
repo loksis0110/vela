@@ -13,8 +13,15 @@ struct HomeView: View {
                 header
                 controlArea
                 if let err = tunnel.error { errorBanner(err) }
+                if let note = tunnel.notice { noticeBanner(note) }
                 Spacer(minLength: 24)
                 VStack(spacing: 12) {
+                    HStack(spacing: 10) {
+                        let ip = ToolText.ip(tunnel.ip, busy: tunnel.ipBusy, error: tunnel.ipError)
+                        ToolCard(label: "Мой IP", value: ip.0, meta: ip.1, busy: tunnel.ipBusy) { Task { await tunnel.refreshIP() } }
+                        let sp = ToolText.speed(tunnel.speed)
+                        ToolCard(label: "Скорость", value: sp.0, meta: sp.1, busy: tunnel.speed.running) { Task { await tunnel.runSpeedTest() } }
+                    }
                     currentServer
                     routingSwitch
                 }
@@ -24,7 +31,7 @@ struct HomeView: View {
             .frame(minHeight: UIScreen.main.bounds.height - 120)
         }
         .background(
-            LinearGradient(stops: [.init(color: Color(hex: 0x16254A), location: 0), .init(color: Palette.ink, location: 0.45)],
+            LinearGradient(stops: [.init(color: Palette.glow, location: 0), .init(color: Palette.ink, location: 0.45)],
                            startPoint: .top, endPoint: .bottom).ignoresSafeArea()
         )
     }
@@ -84,6 +91,7 @@ struct HomeView: View {
                     speed("↑", tunnel.up)
                 }
                 .padding(.top, 10)
+                TrafficGraph(points: tunnel.history).padding(.top, 12)
             }
         }
     }
@@ -120,6 +128,18 @@ struct HomeView: View {
         .padding(14)
         .background(Palette.danger.opacity(0.14), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.danger.opacity(0.4)))
+        .padding(.top, 16)
+    }
+
+    private func noticeBanner(_ text: String) -> some View {
+        HStack {
+            Text(text).font(.subheadline)
+            Spacer()
+            Button("Понятно") { tunnel.notice = nil }.foregroundStyle(Palette.muted)
+        }
+        .padding(14)
+        .background(Palette.sea.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.sea.opacity(0.4)))
         .padding(.top, 16)
     }
 

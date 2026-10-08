@@ -1,24 +1,46 @@
 import SwiftUI
+import UIKit
 
-/// Night-sail palette shared with the desktop and Android apps.
+/// Night-sail palette shared with the desktop and Android apps. Every color
+/// follows the light/dark appearance chosen in Settings (or by the system).
 enum Palette {
-    static let ink = Color(hex: 0x0C1424)
-    static let deep = Color(hex: 0x121D33)
-    static let hull = Color(hex: 0x1B2944)
-    static let line = Color(hex: 0x26375A)
-    static let star = Color(hex: 0xF3E6C4)
-    static let text = Color(hex: 0xE6ECF5)
-    static let muted = Color(hex: 0x8796B0)
-    static let sea = Color(hex: 0x59D0B0)
-    static let flare = Color(hex: 0xF0A85A)
-    static let danger = Color(hex: 0xEE6B6B)
-    static let onSea = Color(hex: 0x06221B)
-    static let onStar = Color(hex: 0x1B1608)
+    static let ink = Color(light: 0xEEF2F8, dark: 0x0C1424)
+    static let deep = Color(light: 0xFFFFFF, dark: 0x121D33)
+    static let hull = Color(light: 0xE4EAF3, dark: 0x1B2944)
+    static let line = Color(light: 0xCDD7E5, dark: 0x26375A)
+    static let star = Color(light: 0x22406F, dark: 0xF3E6C4)
+    static let text = Color(light: 0x142033, dark: 0xE6ECF5)
+    static let muted = Color(light: 0x5E6C84, dark: 0x8796B0)
+    static let sea = Color(light: 0x148A6D, dark: 0x59D0B0)
+    static let flare = Color(light: 0xC26F17, dark: 0xF0A85A)
+    static let danger = Color(light: 0xCC4040, dark: 0xEE6B6B)
+    static let onSea = Color(light: 0xFFFFFF, dark: 0x06221B)
+    static let onStar = Color(light: 0xFFFFFF, dark: 0x1B1608)
+    static let glow = Color(light: 0xDFE8F6, dark: 0x16254A)
 }
 
 extension Color {
     init(hex: UInt32) {
         self.init(red: Double((hex >> 16) & 0xFF) / 255, green: Double((hex >> 8) & 0xFF) / 255, blue: Double(hex & 0xFF) / 255)
+    }
+
+    init(light: UInt32, dark: UInt32) {
+        self.init(UIColor { trait in
+            let hex = trait.userInterfaceStyle == .dark ? dark : light
+            return UIColor(red: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
+                           blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+        })
+    }
+}
+
+extension ColorScheme {
+    /// "system" → nil, "light", "dark".
+    static func from(_ theme: String) -> ColorScheme? {
+        switch theme {
+        case "light": .light
+        case "dark": .dark
+        default: nil
+        }
     }
 }
 
@@ -56,6 +78,18 @@ enum Fmt {
             return (String(flag), rest.isEmpty ? name : rest)
         }
         return (nil, name)
+    }
+
+    /// "🇩🇪" → "Германия".
+    static func country(_ flag: String) -> String {
+        let scalars = Array(flag.unicodeScalars)
+        guard scalars.count >= 2 else { return flag }
+        let code = String(scalars.prefix(2).compactMap { UnicodeScalar($0.value - 0x1F1E6 + 65).map(Character.init) })
+        return Locale(identifier: "ru_RU").localizedString(forRegionCode: code) ?? code
+    }
+
+    static func mbps(_ v: Double) -> String {
+        v >= 100 ? String(format: "%.0f", v) : String(format: "%.1f", v).replacingOccurrences(of: ".", with: ",")
     }
 
     static func badge(_ name: String) -> String {

@@ -14,6 +14,12 @@ let reasons = {};          // node id -> why it failed
 let probe = null;          // {done,total} while servers are being checked
 let sortByPing = false;
 let viewProfile = null;   // profile shown in the servers sheet
+let favorites = new Set();
+const filters = { q: "", fav: false, ok: false, proto: "", country: "" };
+let traffic = [];          // [{t, up, down}] for the graph
+let editRules = [];        // routing rules being edited in settings
+let editApps = [];         // split tunneling programs
+let ipBusy = false;
 
 // ------------------------------------------------------------------ api
 async function api(path, body) {
@@ -37,9 +43,23 @@ function connectEvents() {
       status = snap.status;
       pings = Object.assign({}, snap.pings || {}, pings);
       reasons = Object.assign({}, snap.reasons || {}, reasons);
+      favorites = new Set(snap.favorites || []);
+      if (!traffic.length && snap.history) traffic = snap.history.slice();
+      applyTheme(snap.theme);
       renderAll();
     } else if (msg.type === "status") {
+      const was = status.state;
       status = msg.data;
+      if (status.state === "connected") {
+        traffic.push({ t: Date.now() / 1000, up: status.up || 0, down: status.down || 0 });
+        if (traffic.length > 300) traffic.splice(0, traffic.length - 300);
+      } else if (status.state === "connecting") {
+        traffic = [];
+      }
+      if (was !== status.state && (status.state === "connected" || status.state === "disconnected")) {
+        setTimeout(refreshIP, status.state === "connected" ? 1500 : 300);
+      }
+      renderGraph();
       renderStatus();
       renderCurrent();
       if (!$("#servers").hidden) renderNodes();
@@ -49,6 +69,8 @@ function connectEvents() {
       if (d.reason) reasons[d.id] = d.reason; else delete reasons[d.id];
       renderPings();
       renderCurrent();
+    } else if (msg.type === "speed") {
+      onSpeed(msg.data);
     } else if (msg.type === "probe") {
       const d = msg.data;
       probe = d.done < d.total ? d : null;
@@ -108,7 +130,7 @@ function fmtDate(unix) {
 function pingInfo(ms) {
   if (ms === undefined) return { text: "", cls: "" };
   if (ms === 0) return { text: "…", cls: "" };
-  if (ms === -1) return { text: "не работает", cls: "bad" };
+  if (ms < 0) return { text: "не работает", cls: "bad" };
   if (ms === -2) return { text: "после подключения", cls: "" };
   const cls = ms < 150 ? "good" : ms < 300 ? "ok" : ms < 600 ? "slow" : "bad";
   return { text: ms + " мс", cls };
@@ -177,9 +199,15 @@ function renderStatus() {
     } else {
       act.hidden = true;
     }
+  } else if (status.notice) {
+    banner.hidden = false;
+    banner.classList.add("notice");
+    $("#bannerText").textContent = status.notice;
+    $("#bannerAction").hidden = true;
   } else {
     banner.hidden = true;
   }
+  if (status.error) banner.classList.remove("notice");
 }
 
 function tickTimer() {
@@ -273,6 +301,7 @@ function renderProfileInfo() {
       <button class="link-btn" data-act="update">Обновить</button>
       ${subs > 1 ? `<button class="link-btn" data-act="update-all">Обновить все</button>` : ""}
       <button class="link-btn" data-act="rename">Переименовать</button>
+      <button class="link-btn" data-act="share">Поделиться</button>
       ${p.supportUrl ? `<button class="link-btn" data-act="support">Поддержка</button>` : ""}
       <span class="spacer"></span>
       <button class="link-btn danger" data-act="delete">Удалить</button>
@@ -299,9 +328,21 @@ function renderNodes() {
       <span class="meta">${live ? "Сейчас: " + esc(splitFlag(live.name).name) : "Самый быстрый сервер, переключается при сбое"}</span></span>
       ${autoSelected ? check : ""}
     </li>`;
+  fillFilterOptions(p);
+  const visible = p.nodes.filter(matchesFilters);
   const ordered = sortByPing
-    ? [...p.nodes].sort((a, b) => rank(pings[a.id]) - rank(pings[b.id]))
-    : p.nodes;
+    ? [...visible].sort((a, b) => rank(pings[a.id]) - rank(pings[b.id]))
+    : (filters.fav ? visible : [...visible].sort((a, b) => (favorites.has(b.id) ? 1 : 0) - (favorites.has(a.id) ? 1 : 0)));
+  const filtered = visible.length !== p.nodes.length;
+  $("#listCount").textContent = filtered ? `Показано ${visible.length} из ${p.nodes.length}` : "";
+  if (!visible.length) {
+    const elsewhere = filters.q ? snap.profiles.filter((o) => o.id !== p.id && o.nodes.some(matchesFilters)) : [];
+    html += `<li class="empty"><b>Ничего не найдено</b>${
+      elsewhere.length
+        ? "Есть совпадения в других подписках:<br>" + elsewhere.map((o) => `<button class="btn ghost" data-goto="${esc(o.id)}">${esc(o.name)} · ${o.nodes.filter(matchesFilters).length}</button>`).join(" ")
+        : "Измените поиск или фильтры."
+    }</li>`;
+  }
   for (const n of ordered) {
     const selected = sel === n.id;
     const pi = pingInfo(pings[n.id]);
@@ -312,6 +353,8 @@ function renderNodes() {
           status.state === "connected" && status.activeNode === n.id && isActiveProfile ? ' <span class="live">● используется</span>' : ""
         }</span><span class="reason" data-reason="${esc(n.id)}">${esc(reasons[n.id] && pings[n.id] === -1 ? reasons[n.id] : "")}</span></span>
         <span class="ping ${pi.cls}" data-ping="${esc(n.id)}" title="${esc(reasons[n.id] || "")}">${pi.text}</span>
+        <button class="icon-btn act ${favorites.has(n.id) ? "on" : ""}" data-fav="${esc(n.id)}" aria-pressed="${favorites.has(n.id)}" aria-label="Избранное" title="${favorites.has(n.id) ? "Убрать из избранного" : "В избранное"}"><svg viewBox="0 0 24 24"><path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.8l-5.2 2.8 1-5.8-4.3-4.1 5.9-.8z"/></svg></button>
+        <button class="icon-btn act" data-share="${esc(n.id)}" aria-label="Поделиться" title="Поделиться: QR-код и ссылка"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 18h2v2h-2zM18 14h2M14 18h2"/></svg></button>
         ${p.kind === "manual" ? `<button class="icon-btn del" data-del="${esc(n.id)}" aria-label="Удалить сервер" title="Удалить"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>` : ""}
         ${selected ? check : ""}
       </li>`;
@@ -350,6 +393,185 @@ function renderProbe() {
   $("#pingAll").disabled = !!probe;
 }
 
+// ------------------------------------------------------------------ filters
+const regionNames = (() => { try { return new Intl.DisplayNames(["ru"], { type: "region" }); } catch (_) { return null; } })();
+
+function countryOf(name) {
+  const { flag } = splitFlag(name);
+  if (!flag) return "";
+  const cps = [...flag].map((c) => c.codePointAt(0) - 0x1F1E6 + 65);
+  return String.fromCharCode(...cps);
+}
+
+function countryName(code) {
+  try { return (regionNames && regionNames.of(code)) || code; } catch (_) { return code; }
+}
+
+function fillFilterOptions(p) {
+  const protos = [...new Set(p.nodes.map((n) => n.protocol).filter(Boolean))].sort();
+  const countries = [...new Set(p.nodes.map((n) => countryOf(n.name)).filter(Boolean))]
+    .sort((a, b) => countryName(a).localeCompare(countryName(b), "ru"));
+  const ps = $("#protoFilter"), cs = $("#countryFilter");
+  const protoHTML = `<option value="">Все протоколы</option>` + protos.map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join("");
+  const countryHTML = `<option value="">Все страны</option>` + countries.map((c) => {
+    const flag = String.fromCodePoint(...[...c].map((ch) => 0x1F1E6 + ch.charCodeAt(0) - 65));
+    return `<option value="${c}">${flag} ${esc(countryName(c))}</option>`;
+  }).join("");
+  if (ps.dataset.html !== protoHTML) { ps.innerHTML = protoHTML; ps.dataset.html = protoHTML; }
+  if (cs.dataset.html !== countryHTML) { cs.innerHTML = countryHTML; cs.dataset.html = countryHTML; }
+  if (!protos.includes(filters.proto)) filters.proto = "";
+  if (!countries.includes(filters.country)) filters.country = "";
+  ps.value = filters.proto;
+  cs.value = filters.country;
+  ps.hidden = protos.length < 2;
+  cs.hidden = countries.length < 2;
+}
+
+function matchesFilters(n) {
+  if (filters.fav && !favorites.has(n.id)) return false;
+  if (filters.ok && !(pings[n.id] > 0)) return false;
+  if (filters.proto && n.protocol !== filters.proto) return false;
+  if (filters.country && countryOf(n.name) !== filters.country) return false;
+  if (filters.q) {
+    const code = countryOf(n.name);
+    const hay = [n.name, n.protocol, n.security, n.network, n.server, code ? countryName(code) : ""].join(" ").toLowerCase();
+    if (!filters.q.split(/\s+/).every((w) => hay.includes(w))) return false;
+  }
+  return true;
+}
+
+// ------------------------------------------------------------------ theme
+const darkQuery = window.matchMedia("(prefers-color-scheme: light)");
+function applyTheme(theme) {
+  const t = theme === "light" || theme === "dark" ? theme : (darkQuery.matches ? "light" : "dark");
+  document.documentElement.dataset.theme = t;
+  document.documentElement.dataset.choice = theme || "system";
+  renderGraph();
+}
+darkQuery.addEventListener("change", () => applyTheme(snap && snap.theme));
+
+// ------------------------------------------------------------------ graph
+function renderGraph() {
+  const box = $("#graphBox");
+  const live = status.state === "connected";
+  box.hidden = !live;
+  if (!live) return;
+  const c = $("#graph");
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth || 300, h = 64;
+  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const css = getComputedStyle(document.documentElement);
+  const sea = css.getPropertyValue("--sea").trim(), star = css.getPropertyValue("--star").trim(), line = css.getPropertyValue("--hull").trim();
+  const pts = traffic.slice(-120);
+  const peak = Math.max(1, ...pts.map((p) => Math.max(p.down, p.up)));
+  ctx.strokeStyle = line; ctx.lineWidth = 1;
+  [0.5, 1].forEach((f) => { ctx.beginPath(); ctx.moveTo(0, h - (h - 4) * f + 0.5); ctx.lineTo(w, h - (h - 4) * f + 0.5); ctx.stroke(); });
+  if (pts.length < 2) { $("#graphPeak").textContent = ""; return; }
+  const x = (i) => (i / (120 - 1)) * w + (w - ((pts.length - 1) / (120 - 1)) * w);
+  const y = (v) => h - 2 - (v / peak) * (h - 6);
+  const path = (key) => { ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(x(i), y(p[key])) : ctx.moveTo(x(i), y(p[key])))); };
+  path("down");
+  ctx.lineTo(x(pts.length - 1), h); ctx.lineTo(x(0), h); ctx.closePath();
+  ctx.globalAlpha = 0.18; ctx.fillStyle = sea; ctx.fill(); ctx.globalAlpha = 1;
+  path("down"); ctx.strokeStyle = sea; ctx.lineWidth = 1.8; ctx.stroke();
+  path("up"); ctx.strokeStyle = star; ctx.lineWidth = 1.4; ctx.stroke();
+  const last = pts[pts.length - 1];
+  ctx.fillStyle = sea; ctx.beginPath(); ctx.arc(x(pts.length - 1), y(last.down), 2.6, 0, 7); ctx.fill();
+  $("#graphPeak").textContent = "пик " + fmtSpeed(peak);
+}
+window.addEventListener("resize", renderGraph);
+
+// ------------------------------------------------------------------ my ip & speed
+async function refreshIP() {
+  if (ipBusy) return;
+  ipBusy = true;
+  $("#ipValue").textContent = "Проверяем…";
+  try {
+    const r = await api("myip");
+    $("#ipValue").textContent = (r.flag ? r.flag + " " : "") + r.ip;
+    $("#ipMeta").textContent = [r.country, r.city].filter(Boolean).join(", ") || r.isp || "";
+    $("#ipCard").title = [r.isp, "Нажмите, чтобы обновить"].filter(Boolean).join(". ");
+  } catch (e) {
+    $("#ipValue").textContent = "Не удалось";
+    $("#ipMeta").textContent = e.message;
+  } finally {
+    ipBusy = false;
+  }
+}
+
+const mbps = (v) => (v >= 100 ? v.toFixed(0) : v.toFixed(1)).replace(".", ",") + " Мбит/с";
+function onSpeed(d) {
+  const v = $("#speedValue"), m = $("#speedMeta");
+  if (d.phase === "ping") { v.textContent = "Пинг " + Math.round(d.value) + " мс"; m.textContent = "Измеряем загрузку…"; }
+  else if (d.phase === "download") { v.textContent = "↓ " + mbps(d.value); m.textContent = "Загрузка…"; }
+  else if (d.phase === "upload") { m.textContent = "↓ " + v.textContent.replace("↓ ", "") + ", ↑ " + mbps(d.value); }
+  else if (d.phase === "result") {
+    $("#speedCard").disabled = false;
+    const r = d.result || {};
+    if (r.error) { v.textContent = "Не удалось"; m.textContent = r.error; return; }
+    v.textContent = "↓ " + mbps(r.downloadMbps) + "  ↑ " + mbps(r.uploadMbps);
+    m.textContent = "Пинг " + r.pingMs + " мс, " + (d.viaVPN ? "через VPN" : "без VPN");
+  }
+}
+
+async function runSpeed() {
+  $("#speedCard").disabled = true;
+  $("#speedValue").textContent = "Начинаем…";
+  $("#speedMeta").textContent = status.state === "connected" ? "Через выбранный сервер" : "VPN выключен: скорость без VPN";
+  try { await api("speedtest"); }
+  catch (e) { $("#speedCard").disabled = false; $("#speedValue").textContent = "Не удалось"; $("#speedMeta").textContent = e.message; }
+}
+
+// ------------------------------------------------------------------ share & QR
+async function share(title, text, hint) {
+  $("#shareTitle").textContent = title;
+  $("#shareHint").textContent = hint || "Отсканируйте QR-код в Vela или другом клиенте на другом устройстве.";
+  $("#shareText").value = text;
+  const img = $("#shareQR");
+  img.hidden = true;
+  $("#shareDialog").showModal();
+  try {
+    const r = await api("qr", { text });
+    img.src = r.image;
+    img.hidden = false;
+  } catch (e) {
+    $("#shareHint").textContent = e.message + ". Скопируйте текст.";
+  }
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast("Скопировано"); }
+  catch (_) { $("#shareText").select(); document.execCommand("copy"); toast("Скопировано"); }
+}
+
+function readImage(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error("не удалось прочитать файл"));
+    r.readAsDataURL(file);
+  });
+}
+
+async function decodeQRFile(file) {
+  if (!file || !file.type.startsWith("image/")) return;
+  const err = $("#addError");
+  err.hidden = true;
+  try {
+    const image = await readImage(file);
+    const r = await api("qr/decode", { image });
+    const ta = $("#addText");
+    ta.value = (ta.value.trim() ? ta.value.trim() + "\n" : "") + r.text;
+    toast("QR-код распознан");
+  } catch (e) {
+    err.textContent = e.message;
+    err.hidden = false;
+  }
+}
+
 // ------------------------------------------------------------------ settings
 const listFields = ["directDomains", "proxyDomains"];
 let fillingSettings = false;
@@ -369,6 +591,16 @@ function fillSettings() {
   f.stack.value = s.stack || "mixed";
   f.proxyPort.value = s.proxyPort || 2080;
   for (const k of listFields) f[k].value = (s[k] || []).join(", ");
+  f.failover.checked = !s.disableFailover;
+  f.tlsFragment.value = s.tlsFragment || "";
+  f.appMode.value = s.appMode || "";
+  $$("input[name=theme]", f).forEach((r) => (r.checked = r.value === (snap.theme || "system")));
+  if (!f.contains(document.activeElement) || !document.activeElement.closest("#rulesList")) {
+    editRules = (s.rules || []).map((r) => ({ match: r.match, action: r.action || "direct" }));
+    renderRules();
+  }
+  editApps = (s.apps || []).slice();
+  renderApps();
   fillingSettings = false;
 }
 
@@ -387,6 +619,11 @@ function saveSettings() {
       directDns: f.directDns.value.trim(),
       stack: f.stack.value,
       proxyPort: parseInt(f.proxyPort.value, 10) || 2080,
+      disableFailover: !f.failover.checked,
+      tlsFragment: f.tlsFragment.value,
+      appMode: f.appMode.value,
+      apps: editApps.slice(),
+      rules: editRules.filter((r) => r.match.trim()).map((r) => ({ match: r.match.trim(), action: r.action })),
     });
     for (const k of listFields) {
       s[k] = f[k].value.split(/[\s,;]+/).map((x) => x.trim().replace(/^https?:\/\//, "").replace(/\/.*$/, "")).filter(Boolean);
@@ -428,6 +665,7 @@ function closeSheets() {
 function openAdd() {
   $("#addError").hidden = true;
   $("#addText").value = "";
+  $("#addText").placeholder = "https://… или vless://…";
   $("#addDialog").showModal();
   $("#addText").focus();
 }
@@ -509,6 +747,8 @@ $("#profileInfo").addEventListener("click", async (e) => {
     finally { b.disabled = false; b.textContent = "Обновить все"; }
   } else if (b.dataset.act === "rename") {
     openRename(p);
+  } else if (b.dataset.act === "share") {
+    share("Подписка «" + p.name + "»", p.url, "Отсканируйте QR-код на другом устройстве: подписка добавится целиком.");
   } else if (b.dataset.act === "support") {
     api("open", { target: p.supportUrl });
   } else if (b.dataset.act === "delete") {
@@ -521,6 +761,25 @@ $("#profileInfo").addEventListener("click", async (e) => {
 
 $("#nodeList").addEventListener("click", async (e) => {
   if (e.target.closest("[data-act=add]")) return openAdd();
+  const go = e.target.closest("[data-goto]");
+  if (go) { viewProfile = go.dataset.goto; renderServers(); return; }
+  const fav = e.target.closest("[data-fav]");
+  if (fav) {
+    e.stopPropagation();
+    const id = fav.dataset.fav, on = !favorites.has(id);
+    if (on) favorites.add(id); else favorites.delete(id);
+    renderNodes();
+    api("favorite", { node: id, on }).catch((err) => toast(err.message, true));
+    return;
+  }
+  const sh = e.target.closest("[data-share]");
+  if (sh) {
+    e.stopPropagation();
+    const p = snap.profiles.find((x) => x.id === viewProfile);
+    const n = p && findNode(p, sh.dataset.share);
+    if (n) share(splitFlag(n.name).name, n.link);
+    return;
+  }
   const del = e.target.closest("[data-del]");
   if (del) {
     e.stopPropagation();
@@ -592,11 +851,171 @@ $("#quit").addEventListener("click", async () => {
 // paste a link anywhere on the home screen to import it
 document.addEventListener("paste", (e) => {
   if (document.querySelector("dialog[open]") || e.target.closest("input, textarea")) return;
+  const img = [...(e.clipboardData || {}).items || []].find((i) => i.type.startsWith("image/"));
+  if (img) { e.preventDefault(); openAdd(); decodeQRFile(img.getAsFile()); return; }
   const text = (e.clipboardData || window.clipboardData).getData("text");
-  if (/^(https?|vless|vmess|trojan|ss|hysteria2|hy2|tuic):\/\//i.test(text.trim())) {
+  if (/^(https?|vless|vmess|trojan|ss|hysteria2|hy2|tuic):\/\//i.test(text.trim()) || text.trim().startsWith("vela-backup:")) {
     openAdd();
     $("#addText").value = text.trim();
   }
+});
+
+// ------------------------------------------------------------------ new wiring
+function renderRules() {
+  const ul = $("#rulesList");
+  ul.innerHTML = editRules.map((r, i) => `<li data-i="${i}">
+      <input data-k="match" value="${esc(r.match)}" placeholder="example.com" spellcheck="false" aria-label="Сайт, слово или IP">
+      <select data-k="action" aria-label="Действие">
+        <option value="direct"${r.action === "direct" ? " selected" : ""}>Напрямую</option>
+        <option value="proxy"${r.action === "proxy" ? " selected" : ""}>Через VPN</option>
+        <option value="block"${r.action === "block" ? " selected" : ""}>Блокировать</option>
+      </select>
+      <button type="button" class="icon-btn" data-rm="${i}" aria-label="Удалить правило"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    </li>`).join("");
+}
+
+function renderApps() {
+  const f = $("#settingsForm");
+  $("#appsBox").hidden = !f.appMode.value;
+  $("#appChips").innerHTML = editApps.map((a, i) =>
+    `<span class="app-chip">${esc(a)}<button type="button" data-rm-app="${i}" aria-label="Убрать ${esc(a)}">×</button></span>`).join("");
+}
+
+$("#rulesList").addEventListener("input", (e) => {
+  const li = e.target.closest("li");
+  if (!li) return;
+  editRules[+li.dataset.i][e.target.dataset.k] = e.target.value;
+  e.stopPropagation();
+  saveSettings();
+});
+$("#rulesList").addEventListener("change", (e) => e.stopPropagation());
+$("#rulesList").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-rm]");
+  if (!b) return;
+  editRules.splice(+b.dataset.rm, 1);
+  renderRules();
+  saveSettings();
+});
+$("#addRule").addEventListener("click", () => {
+  editRules.push({ match: "", action: "proxy" });
+  renderRules();
+  $("#rulesList li:last-child input").focus();
+});
+
+$("#appChips").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-rm-app]");
+  if (!b) return;
+  editApps.splice(+b.dataset.rmApp, 1);
+  renderApps();
+  saveSettings();
+});
+function addApps(names) {
+  for (const n of names) {
+    const v = n.trim();
+    if (v && !editApps.some((a) => a.toLowerCase() === v.toLowerCase())) editApps.push(v);
+  }
+  renderApps();
+  saveSettings();
+}
+$("#addApp").addEventListener("click", () => {
+  const inp = $("#appInput");
+  let v = inp.value.trim();
+  if (v && !/\.[a-z0-9]+$/i.test(v)) v += ".exe";
+  if (v) addApps([v]);
+  inp.value = "";
+});
+$("#appInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("#addApp").click(); } });
+$("#appInput").addEventListener("input", (e) => e.stopPropagation());
+$("#settingsForm").appMode.addEventListener("change", renderApps);
+
+let runningApps = [];
+$("#pickApps").addEventListener("click", async () => {
+  try {
+    runningApps = (await api("processes")).processes || [];
+  } catch (e) { return toast(e.message, true); }
+  $("#appsFilter").value = "";
+  renderPick();
+  $("#appsDialog").showModal();
+});
+function renderPick() {
+  const q = $("#appsFilter").value.trim().toLowerCase();
+  const chosen = new Set(editApps.map((a) => a.toLowerCase()));
+  $("#appsList").innerHTML = runningApps.filter((a) => !q || a.toLowerCase().includes(q)).map((a) =>
+    `<li><label><input type="checkbox" value="${esc(a)}"${chosen.has(a.toLowerCase()) ? " checked" : ""}>${esc(a)}</label></li>`).join("")
+    || `<li class="hint">Ничего не найдено</li>`;
+}
+$("#appsFilter").addEventListener("input", renderPick);
+$("#appsCancel").addEventListener("click", () => $("#appsDialog").close());
+$("#appsForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const boxes = $$("#appsList input");
+  const on = boxes.filter((b) => b.checked).map((b) => b.value);
+  const off = new Set(boxes.filter((b) => !b.checked).map((b) => b.value.toLowerCase()));
+  editApps = editApps.filter((a) => !off.has(a.toLowerCase()));
+  $("#appsDialog").close();
+  addApps(on);
+});
+
+$$("input[name=theme]").forEach((r) => r.addEventListener("change", (e) => {
+  e.stopPropagation();
+  applyTheme(r.value);
+  api("theme", { theme: r.value }).catch((err) => toast(err.message, true));
+}));
+
+$("#exportBtn").addEventListener("click", async () => {
+  try {
+    const r = await api("export");
+    $("#shareTitle").textContent = "Резервная копия";
+    $("#shareHint").textContent = r.image
+      ? "Отсканируйте QR-код в Vela на другом устройстве или скопируйте текст и вставьте его в окно «Добавить»."
+      : "Данных много для QR-кода. Скопируйте текст и вставьте его в окно «Добавить» на другом устройстве.";
+    $("#shareText").value = r.text;
+    const img = $("#shareQR");
+    img.hidden = !r.image;
+    if (r.image) img.src = r.image;
+    $("#shareDialog").showModal();
+  } catch (e) { toast(e.message, true); }
+});
+$("#importBtn").addEventListener("click", () => {
+  openAdd();
+  $("#addText").placeholder = "Вставьте резервную копию: vela-backup:…";
+});
+$("#shareCopy").addEventListener("click", () => copyText($("#shareText").value));
+
+async function loadLogs() {
+  try {
+    const r = await api("logs");
+    const pre = $("#logsText");
+    pre.textContent = (r.lines || []).join("\n") || "Журнал пуст. Он появится после подключения.";
+    pre.scrollTop = pre.scrollHeight;
+  } catch (e) { toast(e.message, true); }
+}
+$("#showLogs").addEventListener("click", () => { $("#logsDialog").showModal(); loadLogs(); });
+$("#logsRefresh").addEventListener("click", loadLogs);
+
+$("#ipCard").addEventListener("click", refreshIP);
+$("#speedCard").addEventListener("click", runSpeed);
+
+$("#search").addEventListener("input", (e) => { filters.q = e.target.value.trim().toLowerCase(); renderNodes(); });
+$("#filters").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-filter]");
+  if (!b) return;
+  filters[b.dataset.filter] = !filters[b.dataset.filter];
+  b.setAttribute("aria-pressed", String(filters[b.dataset.filter]));
+  renderNodes();
+});
+$("#protoFilter").addEventListener("change", (e) => { filters.proto = e.target.value; renderNodes(); });
+$("#countryFilter").addEventListener("change", (e) => { filters.country = e.target.value; renderNodes(); });
+
+$("#qrPick").addEventListener("click", () => $("#qrFile").click());
+$("#qrFile").addEventListener("change", (e) => { decodeQRFile(e.target.files[0]); e.target.value = ""; });
+const drop = $("#qrDrop");
+["dragenter", "dragover"].forEach((ev) => $("#addDialog").addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((ev) => $("#addDialog").addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+$("#addDialog").addEventListener("drop", (e) => decodeQRFile(e.dataTransfer.files[0]));
+$("#addDialog").addEventListener("paste", (e) => {
+  const item = [...(e.clipboardData || {}).items || []].find((i) => i.type.startsWith("image/"));
+  if (item) { e.preventDefault(); decodeQRFile(item.getAsFile()); }
 });
 
 function applyLayout() {

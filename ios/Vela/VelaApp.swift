@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 @main
@@ -10,7 +11,7 @@ struct VelaApp: App {
             RootView()
                 .environmentObject(store)
                 .environmentObject(tunnel)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(ColorScheme.from(store.state.theme))
                 .tint(Palette.star)
         }
     }
@@ -89,6 +90,14 @@ struct AddSheet: View {
     @State private var text = ""
     @State private var error: String?
     @State private var busy = false
+    @State private var scanning = false
+    @State private var photo: PhotosPickerItem?
+
+    private func append(_ found: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        text = t.isEmpty ? found : t + "\n" + found
+        error = nil
+    }
 
     var body: some View {
         NavigationStack {
@@ -109,6 +118,10 @@ struct AddSheet: View {
                     if let s = UIPasteboard.general.string, !s.isEmpty { text = s.trimmingCharacters(in: .whitespacesAndNewlines) }
                     else { error = "Буфер обмена пуст" }
                 } label: { Label("Вставить из буфера", systemImage: "doc.on.clipboard") }
+                HStack(spacing: 18) {
+                    Button { scanning = true } label: { Label("Сканировать QR", systemImage: "qrcode.viewfinder") }
+                    PhotosPicker(selection: $photo, matching: .images) { Label("QR из фото", systemImage: "photo") }
+                }
                 Spacer()
             }
             .padding(20)
@@ -126,6 +139,17 @@ struct AddSheet: View {
         .tint(Palette.star)
         .presentationDetents([.medium, .large])
         .onAppear { text = initial }
+        .fullScreenCover(isPresented: $scanning) {
+            QRScannerSheet { code in append(code.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        }
+        .onChange(of: photo) { item in
+            guard let item else { return }
+            Task {
+                let data = try? await item.loadTransferable(type: Data.self)
+                photo = nil
+                if let data, let code = QR.decode(data) { append(code) } else { error = "На картинке не нашли QR-код" }
+            }
+        }
     }
 
     private func submit() {

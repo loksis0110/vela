@@ -9,8 +9,8 @@ settings:
   base:
     # Put your Apple Developer Team ID here (or pass DEVELOPMENT_TEAM=... to xcodebuild)
     DEVELOPMENT_TEAM: ""
-    MARKETING_VERSION: "1.1.0"
-    CURRENT_PROJECT_VERSION: "3"
+    MARKETING_VERSION: "1.2.0"
+    CURRENT_PROJECT_VERSION: "4"
     SWIFT_VERSION: "5.9"
     APP_GROUP_IDENTIFIER: group.app.vela.client
     ENABLE_BITCODE: NO
@@ -27,9 +27,12 @@ targets:
     dependencies:
       - target: VelaTunnel
         embed: true
+      - target: VelaWidgets
+        embed: true
       - framework: Frameworks/Velacore.xcframework
         embed: false
       - sdk: NetworkExtension.framework
+      - sdk: WidgetKit.framework
       - sdk: libresolv.tbd
     entitlements:
       path: Vela/Vela.entitlements
@@ -52,7 +55,7 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        UIUserInterfaceStyle: Dark
+        NSCameraUsageDescription: Камера нужна, чтобы отсканировать QR-код подписки или сервера.
         ITSAppUsesNonExemptEncryption: true
         AppGroupIdentifier: $(APP_GROUP_IDENTIFIER)
         CFBundleURLTypes:
@@ -96,4 +99,32 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.vela.client.tunnel
         OTHER_LDFLAGS: ["-lresolv"]
+        TARGETED_DEVICE_FAMILY: "1,2"
+  VelaWidgets:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: VelaWidgets
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+      - sdk: AppIntents.framework
+      - sdk: NetworkExtension.framework
+    entitlements:
+      path: VelaWidgets/VelaWidgets.entitlements
+      properties:
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        com.apple.security.application-groups: [$(APP_GROUP_IDENTIFIER)]
+    info:
+      path: VelaWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Vela
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.vela.client.widgets
         TARGETED_DEVICE_FAMILY: "1,2"

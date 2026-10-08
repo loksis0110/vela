@@ -51,6 +51,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import app.vela.client.data.Store
 import app.vela.client.vpn.ConnState
 import app.vela.client.vpn.VpnManager
@@ -62,6 +64,9 @@ class MainActivity : ComponentActivity() {
     /** Text arriving from a tapped link or the share sheet, shown in the add dialog. */
     private val incoming = MutableStateFlow<String?>(null)
 
+    /** Set when the widget or tile asks to connect but VPN permission is missing. */
+    private val connectRequest = MutableStateFlow(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(Vela.Ink.toArgb()),
@@ -70,7 +75,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         handleIntent(intent)
         lifecycleScope.launch { Store.refreshDue() }
-        setContent { VelaTheme { App(incoming) } }
+        setContent {
+            val st by Store.state.collectAsState()
+            VelaTheme(st.theme) { App(incoming, connectRequest) }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -79,6 +87,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
+        if (intent?.action == ACTION_CONNECT) {
+            connectRequest.value = true
+            return
+        }
         val text = when (intent?.action) {
             Intent.ACTION_VIEW -> intent.dataString?.let { decodeVelaLink(it) }
             Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
@@ -90,12 +102,16 @@ class MainActivity : ComponentActivity() {
     /** vela://import/<url-encoded subscription or link> */
     private fun decodeVelaLink(link: String): String =
         if (link.startsWith("vela://import/")) Uri.decode(link.removePrefix("vela://import/")) else link
+
+    companion object {
+        const val ACTION_CONNECT = "app.vela.client.CONNECT"
+    }
 }
 
 private enum class Screen { Home, Servers, Settings }
 
 @Composable
-private fun App(incoming: MutableStateFlow<String?>) {
+private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStateFlow<Boolean>) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     val app by Store.state.collectAsState()
@@ -104,6 +120,20 @@ private fun App(incoming: MutableStateFlow<String?>) {
     val reasons by Store.reasons.collectAsState()
     val probe by VpnManager.probe.collectAsState()
     val pendingText by incoming.collectAsState()
+    val wantConnect by connectRequest.collectAsState()
+    val history by VpnManager.history.collectAsState()
+    val ip by VpnManager.ip.collectAsState()
+    val ipBusy by VpnManager.ipBusy.collectAsState()
+    val ipError by VpnManager.ipError.collectAsState()
+    val speed by VpnManager.speed.collectAsState()
+    var share by remember { mutableStateOf<Triple<String, String, String>?>(null) }
+
+    val activity = context as? ComponentActivity
+    val dark = Vela.isDark
+    LaunchedEffect(dark) {
+        val bar = if (dark) SystemBarStyle.dark(Vela.Ink.toArgb()) else SystemBarStyle.light(Vela.Ink.toArgb(), Vela.Text.toArgb())
+        activity?.enableEdgeToEdge(statusBarStyle = bar, navigationBarStyle = bar)
+    }
 
     var screen by remember { mutableStateOf(Screen.Home) }
     var addOpen by remember { mutableStateOf(false) }
@@ -137,6 +167,29 @@ private fun App(incoming: MutableStateFlow<String?>) {
                 connect()
             }
         }
+    }
+
+    LaunchedEffect(wantConnect) {
+        if (wantConnect) {
+            connectRequest.value = false
+            if (VpnManager.status.value.state == ConnState.Disconnected && app.profiles.isNotEmpty()) connect()
+        }
+    }
+
+    // what websites see changes with the connection
+    LaunchedEffect(status.state) {
+        when (status.state) {
+            ConnState.Connected -> {
+                kotlinx.coroutines.delay(1200)
+                VpnManager.refreshIp()
+            }
+            ConnState.Disconnected -> {
+                VpnManager.ip.value = null
+                VpnManager.ipError.value = null
+            }
+            else -> {}
+        }
+        if (!VpnManager.speed.value.running) VpnManager.speed.value = app.vela.client.vpn.SpeedState()
     }
 
     LaunchedEffect(pendingText) {
@@ -176,6 +229,10 @@ private fun App(incoming: MutableStateFlow<String?>) {
                     }
                 },
                 onDismissError = { VpnManager.status.value = VpnManager.status.value.copy(error = null) },
+                onDismissNotice = { VpnManager.status.value = VpnManager.status.value.copy(notice = null) },
+                history = history, ip = ip, ipBusy = ipBusy, ipError = ipError, speed = speed,
+                onIp = { scope.launch { VpnManager.refreshIp() } },
+                onSpeed = { scope.launch { VpnManager.runSpeedTest() } },
             )
             Screen.Servers -> ServersScreen(
                 app = app, status = status, pings = pings, reasons = reasons, probe = probe,
@@ -228,6 +285,10 @@ private fun App(incoming: MutableStateFlow<String?>) {
                     }
                 },
                 refreshing = refreshing,
+                onFavorite = { id, on -> Store.setFavorite(id, on) },
+                onShare = { title, text ->
+                    share = Triple(title, "Отсканируйте QR-код в Vela или другом клиенте на другом устройстве.", text)
+                },
             )
             Screen.Settings -> SettingsScreen(
                 settings = app.settings,
@@ -237,6 +298,20 @@ private fun App(incoming: MutableStateFlow<String?>) {
                 onSystemVpnSettings = {
                     runCatching { context.startActivity(Intent(AndroidSettings.ACTION_VPN_SETTINGS)) }
                 },
+                theme = app.theme,
+                onTheme = { Store.setTheme(it) },
+                onExport = {
+                    runCatching { Store.exportBackup() }
+                        .onSuccess {
+                            share = Triple(
+                                "Резервная копия",
+                                "Отсканируйте QR-код в Vela на другом устройстве или отправьте текст и вставьте его в окно «Добавить».",
+                                it,
+                            )
+                        }
+                        .onFailure { toast(it.message ?: "Не удалось") }
+                },
+                onImport = { addText = ""; addOpen = true },
             )
         }
     }
@@ -259,6 +334,10 @@ private fun App(incoming: MutableStateFlow<String?>) {
         )
     }
 
+    share?.let { (title, hint, text) ->
+        ShareDialog(title, hint, text) { share = null }
+    }
+
     if (privacyOpen) {
         AlertDialog(
             onDismissRequest = { privacyOpen = false },
@@ -279,9 +358,26 @@ private fun App(incoming: MutableStateFlow<String?>) {
 @Composable
 private fun AddDialog(initial: String, onDismiss: () -> Unit, onSubmit: (String, (String?) -> Unit) -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
     var text by remember { mutableStateOf(initial) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+
+    fun append(found: String) {
+        text = if (text.isBlank()) found else text.trimEnd() + "\n" + found
+        error = null
+    }
+    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.takeIf { it.isNotBlank() }?.let { append(it.trim()) }
+    }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val found = runCatching { decodeQr(context, uri) }.getOrNull()
+                if (found.isNullOrBlank()) error = "На картинке не нашли QR-код" else append(found.trim())
+            }
+        }
+    }
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
         containerColor = Vela.Deep,
@@ -307,8 +403,20 @@ private fun AddDialog(initial: String, onDismiss: () -> Unit, onSubmit: (String,
                         val clip = context.getSystemService(ClipboardManager::class.java).primaryClip
                         val pasted = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
                         if (pasted.isNullOrBlank()) error = "Буфер обмена пуст" else text = pasted.trim()
-                    }) { Text("Вставить из буфера", color = Vela.Star) }
+                    }) { Text("Из буфера", color = Vela.Star) }
                     Spacer(Modifier.weight(1f))
+                }
+                Row {
+                    TextButton(onClick = {
+                        scanner.launch(
+                            ScanOptions()
+                                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                .setPrompt("Наведите камеру на QR-код подписки или сервера")
+                                .setBeepEnabled(false)
+                                .setOrientationLocked(false),
+                        )
+                    }) { Text("Сканировать QR", color = Vela.Star) }
+                    TextButton(onClick = { picker.launch("image/*") }) { Text("QR из фото", color = Vela.Star) }
                 }
             }
         },

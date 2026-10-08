@@ -2,16 +2,18 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
+	"encoding/json"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/json"
+	sjson "github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 )
 
@@ -45,7 +47,7 @@ func TestParse(t *testing.T) {
 func checkConfig(t *testing.T, content string) {
 	t.Helper()
 	ctx := include.Context(service.ContextWith(context.Background(), deprecated.NewStderrManager(log.StdLogger())))
-	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(content))
+	opts, err := sjson.UnmarshalExtendedContext[option.Options](ctx, []byte(content))
 	if err != nil {
 		t.Fatalf("decode: %v\n%s", err, content)
 	}
@@ -104,4 +106,75 @@ func TestPortableDataDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkConfig(t, strings.ReplaceAll(cfg, "__VELA_DATA__", dir))
+}
+
+func TestAdvancedSettings(t *testing.T) {
+	res := ParseText(strings.Join(sampleLinks, "\n"))
+	ids := []string{}
+	for _, n := range res.Nodes {
+		ids = append(ids, n.ID)
+	}
+	for _, platform := range []string{PlatformWindows, PlatformAndroid, PlatformIOS} {
+		for _, frag := range []string{"", "record", "full"} {
+			for _, mode := range []string{"", "exclude", "only"} {
+				s := DefaultSettings()
+				s.TLSFragment = frag
+				s.AppMode = mode
+				if platform == PlatformAndroid {
+					s.Apps = []string{"ru.sberbankmobile", "com.android.chrome"}
+				} else {
+					s.Apps = []string{"chrome.exe"}
+				}
+				s.Rules = []RoutingRule{
+					{Match: "https://Example.com/path", Action: "proxy"},
+					{Match: "*torrent*", Action: "block"},
+					{Match: "10.1.2.3", Action: "direct"},
+					{Match: "2001:db8::/32", Action: "direct"},
+					{Match: "bad/cidr/x", Action: "direct"},
+				}
+				cfg, err := BuildConfig(BuildRequest{Platform: platform, Nodes: res.Nodes, Selected: "auto",
+					Settings: s, DataDir: t.TempDir(), Favorites: ids[:2], Ranked: ids})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if platform == PlatformAndroid {
+					cfg = strings.Replace(cfg, `"override_android_vpn": true`, `"override_android_vpn": false`, 1)
+					// package filters need the Android package manager
+					cfg = strings.Replace(cfg, `"include_package"`, `"x_include_package"`, 1)
+					cfg = strings.Replace(cfg, `"exclude_package"`, `"x_exclude_package"`, 1)
+					var m map[string]any
+					json.Unmarshal([]byte(cfg), &m)
+					for _, ib := range m["inbounds"].([]any) {
+						delete(ib.(map[string]any), "x_include_package")
+						delete(ib.(map[string]any), "x_exclude_package")
+					}
+					b, _ := json.Marshal(m)
+					cfg = string(b)
+				}
+				checkConfig(t, cfg)
+			}
+		}
+	}
+}
+
+func TestAutoCandidates(t *testing.T) {
+	var all []string
+	var ids []string
+	for i := 0; i < 100; i++ {
+		id := fmt.Sprintf("n%03d", i)
+		ids = append(ids, id)
+		all = append(all, NodeTag(Node{ID: id}))
+	}
+	got := autoCandidates(BuildRequest{}, all)
+	if len(got) != MaxAutoCandidates || got[0] != "node-n000" {
+		t.Fatalf("default %v", got[:3])
+	}
+	got = autoCandidates(BuildRequest{Ranked: []string{"n050", "n051"}}, all)
+	if got[0] != "node-n050" || len(got) != MaxAutoCandidates {
+		t.Fatalf("ranked %v", got[:3])
+	}
+	got = autoCandidates(BuildRequest{Favorites: []string{"n099", "zzz"}, Ranked: ids}, all)
+	if len(got) != 1 || got[0] != "node-n099" {
+		t.Fatalf("fav %v", got)
+	}
 }

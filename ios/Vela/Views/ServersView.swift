@@ -13,6 +13,26 @@ struct ServersView: View {
     @State private var renaming: Profile?
     @State private var renameText = ""
     @State private var fastestFirst = false
+    @State private var query = ""
+    @State private var onlyFav = false
+    @State private var onlyOK = false
+    @State private var proto = ""
+    @State private var country = ""
+    @State private var sharing: ShareItem?
+
+    private func matches(_ n: Node) -> Bool {
+        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+        if !q.isEmpty {
+            let flag = Fmt.splitFlag(n.name).flag
+            let hay = [n.name, n.proto, n.security, n.network, n.server, flag.map(Fmt.country) ?? ""].joined(separator: " ").lowercased()
+            if q.split(separator: " ").contains(where: { !hay.contains($0) }) { return false }
+        }
+        if onlyFav, !store.state.favorites.contains(n.id) { return false }
+        if onlyOK, (store.pings[n.id] ?? 0) <= 0 { return false }
+        if !proto.isEmpty, n.proto != proto { return false }
+        if !country.isEmpty, Fmt.splitFlag(n.name).flag != country { return false }
+        return true
+    }
 
     private var profile: Profile? {
         store.state.profiles.first { $0.id == viewID } ?? store.state.active
@@ -35,9 +55,7 @@ struct ServersView: View {
                     if p.kind == "subscription" {
                         subscriptionCard(p).listRowBackground(Color.clear).listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
                     }
-                    Toggle("Сначала быстрые", isOn: $fastestFirst)
-                        .toggleStyle(.button).font(.footnote).tint(Palette.star)
-                        .listRowBackground(Color.clear)
+                    filters(p).listRowBackground(Color.clear).listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
                     rows(p)
                 } else {
                     empty.listRowBackground(Color.clear)
@@ -47,6 +65,8 @@ struct ServersView: View {
             .scrollContentBackground(.hidden)
             .background(Palette.ink)
             .refreshable { await refresh() }
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Страна, город, протокол")
+            .sheet(item: $sharing) { item in ShareSheet(title: item.title, hint: item.hint, text: item.text) }
             .navigationTitle("Серверы")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -128,6 +148,7 @@ struct ServersView: View {
                     Button("Все") { Task { await refreshAll() } }.disabled(refreshing)
                 }
                 Button("Имя") { renameText = p.customName ?? p.name; renaming = p }
+                Button("QR") { share(p.name, p.url) }
                 if let url = URL(string: p.supportURL), !p.supportURL.isEmpty {
                     Button("Поддержка") { openURL(url) }
                 }
@@ -153,6 +174,41 @@ struct ServersView: View {
         .font(.system(size: 13))
     }
 
+    private func share(_ title: String, _ text: String) {
+        sharing = ShareItem(title: title, hint: "Отсканируйте QR-код в Vela или другом клиенте на другом устройстве.", text: text)
+    }
+
+    private func filters(_ p: Profile) -> some View {
+        let protocols = Array(Set(p.nodes.map(\.proto).filter { !$0.isEmpty })).sorted()
+        let flags = Array(Set(p.nodes.compactMap { Fmt.splitFlag($0.name).flag })).sorted { Fmt.country($0) < Fmt.country($1) }
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Chip(text: "★ Избранные", on: onlyFav) { onlyFav.toggle() }
+                Chip(text: "Рабочие", on: onlyOK) { onlyOK.toggle() }
+                if protocols.count > 1 {
+                    Menu {
+                        Button("Все протоколы") { proto = "" }
+                        ForEach(protocols, id: \.self) { v in Button(v) { proto = v } }
+                    } label: {
+                        Chip(text: (proto.isEmpty ? "Все протоколы" : proto) + " ▾", on: !proto.isEmpty) {}.allowsHitTesting(false)
+                    }
+                }
+                if flags.count > 1 {
+                    Menu {
+                        Button("Все страны") { country = "" }
+                        ForEach(flags, id: \.self) { f in
+                            Button("\(f) \(Fmt.country(f))  \(p.nodes.filter { Fmt.splitFlag($0.name).flag == f }.count)") { country = f }
+                        }
+                    } label: {
+                        Chip(text: (country.isEmpty ? "Все страны" : "\(country) \(Fmt.country(country))") + " ▾", on: !country.isEmpty) {}.allowsHitTesting(false)
+                    }
+                }
+                Chip(text: "Сначала быстрые", on: fastestFirst) { fastestFirst.toggle() }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 4)
+        }
+    }
+
     @ViewBuilder private func rows(_ p: Profile) -> some View {
         let isActive = p.id == store.state.activeProfile
         let sel = store.state.selectedNode
@@ -160,22 +216,52 @@ struct ServersView: View {
         let connected = tunnel.state == .connected && isActive
         let live = autoSelected && connected ? p.nodes.first { $0.id == tunnel.activeNode } : nil
 
+        let favs = Set(store.state.favorites)
+        let hasFavs = p.nodes.contains { favs.contains($0.id) }
         row(badge: "✦", title: "Автовыбор",
-            meta: live.map { "Сейчас: " + Fmt.splitFlag($0.name).rest } ?? "Самый быстрый сервер, переключается при сбое",
+            meta: live.map { "Сейчас: " + Fmt.splitFlag($0.name).rest }
+                ?? (hasFavs ? "Среди избранных, переключается при сбое" : "Самый быстрый сервер, переключается при сбое"),
             ping: nil, selected: autoSelected, inUse: false, reason: nil) { choose(p, "auto") }
 
-        let ordered = fastestFirst ? p.nodes.sorted { rank(store.pings[$0.id]) < rank(store.pings[$1.id]) } : p.nodes
+        let visible = p.nodes.filter(matches)
+        let ordered = fastestFirst
+            ? visible.sorted { rank(store.pings[$0.id]) < rank(store.pings[$1.id]) }
+            : visible.filter { favs.contains($0.id) } + visible.filter { !favs.contains($0.id) }
+        if visible.count != p.nodes.count {
+            Text("Показано \(visible.count) из \(p.nodes.count)").font(.caption).foregroundStyle(Palette.muted).listRowBackground(Color.clear)
+        }
+        if visible.isEmpty {
+            let elsewhere = query.isEmpty ? [] : store.state.profiles.filter { $0.id != p.id && $0.nodes.contains(where: matches) }
+            VStack(spacing: 6) {
+                Text("Ничего не найдено").font(.headline)
+                Text(elsewhere.isEmpty ? "Измените поиск или фильтры." : "Есть совпадения в других подписках:")
+                    .foregroundStyle(Palette.muted)
+                ForEach(elsewhere) { o in
+                    Button("\(o.name) · \(o.nodes.filter(matches).count)") { viewID = o.id }
+                }
+            }
+            .frame(maxWidth: .infinity).padding(20)
+            .listRowBackground(Color.clear)
+        }
         ForEach(ordered) { n in
             let tags = [n.proto, n.security, (!n.network.isEmpty && n.network != "tcp") ? n.network.uppercased() : ""]
                 .filter { !$0.isEmpty }.joined(separator: " ")
             row(badge: Fmt.badge(n.name), title: Fmt.splitFlag(n.name).rest, meta: tags,
                 ping: Fmt.ping(store.pings[n.id]), selected: isActive && sel == n.id,
                 inUse: connected && tunnel.activeNode == n.id,
-                reason: (store.pings[n.id] ?? 0) < 0 ? store.reasons[n.id] : nil) { choose(p, n.id) }
+                reason: (store.pings[n.id] ?? 0) < 0 ? store.reasons[n.id] : nil,
+                favorite: favs.contains(n.id), onFavorite: { store.setFavorite(n.id, !favs.contains(n.id)) }) { choose(p, n.id) }
                 .swipeActions {
                     if p.kind == "manual" {
                         Button("Удалить", role: .destructive) { store.deleteNode(profile: p.id, node: n.id) }
                     }
+                    Button { share(Fmt.splitFlag(n.name).rest, n.link) } label: { Label("QR", systemImage: "qrcode") }.tint(Palette.hull)
+                }
+                .contextMenu {
+                    Button { store.setFavorite(n.id, !favs.contains(n.id)) } label: {
+                        Label(favs.contains(n.id) ? "Убрать из избранного" : "В избранное", systemImage: favs.contains(n.id) ? "star.slash" : "star")
+                    }
+                    Button { share(Fmt.splitFlag(n.name).rest, n.link) } label: { Label("Поделиться", systemImage: "qrcode") }
                 }
         }
     }
@@ -199,7 +285,8 @@ struct ServersView: View {
         do { message = try await store.refreshAll() } catch { message = error.localizedDescription }
     }
 
-    private func row(badge: String, title: String, meta: String, ping: (String, Color)?, selected: Bool, inUse: Bool, reason: String?, action: @escaping () -> Void) -> some View {
+    private func row(badge: String, title: String, meta: String, ping: (String, Color)?, selected: Bool, inUse: Bool, reason: String?,
+                     favorite: Bool = false, onFavorite: (() -> Void)? = nil, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 12) {
                 Badge(text: badge, size: 36)
@@ -215,6 +302,15 @@ struct ServersView: View {
                 }
                 Spacer()
                 if let ping { Text(ping.0).font(.system(size: 13)).foregroundStyle(ping.1).monospacedDigit() }
+                if let onFavorite {
+                    Button(action: onFavorite) {
+                        Image(systemName: favorite ? "star.fill" : "star")
+                            .foregroundStyle(favorite ? Palette.flare : Palette.line)
+                            .frame(width: 32, height: 32)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(favorite ? "Убрать из избранного" : "В избранное")
+                }
                 if selected { Image(systemName: "checkmark").foregroundStyle(Palette.sea).fontWeight(.semibold) }
             }
             .padding(.vertical, 4)

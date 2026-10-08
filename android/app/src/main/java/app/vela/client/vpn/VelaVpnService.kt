@@ -66,6 +66,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     private var commandServer: CommandServer? = null
     private var tunFd: ParcelFileDescriptor? = null
     private var statsJob: Job? = null
+    private var watchJob: Job? = null
 
     // ------------------------------------------------------------- lifecycle
 
@@ -101,6 +102,8 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             val port = freePort()
             val secret = Store.randomId(16)
             val config = Store.buildConfig(port, secret)
+            runCatching { Store.logFile.writeText("") }
+            VpnManager.history.value = emptyList()
             VpnManager.controllerPort = port
             VpnManager.controllerSecret = secret
             DefaultNetworkMonitor.start()
@@ -113,6 +116,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             VpnManager.status.value = VpnStatus(state = ConnState.Connected, since = System.currentTimeMillis() / 1000)
             showNotification(getString(R.string.notif_connected))
             startStats()
+            startWatchdog()
         } catch (e: Exception) {
             Log.e(TAG, "start failed", e)
             cleanup()
@@ -134,6 +138,8 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     private fun cleanup() {
         statsJob?.cancel()
         statsJob = null
+        watchJob?.cancel()
+        watchJob = null
         runCatching { commandServer?.closeService() }
         runCatching { tunFd?.close() }
         tunFd = null
@@ -157,14 +163,77 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 last = now
                 val s = VpnManager.status.value
                 if (s.state != ConnState.Connected) continue
+                val up = if (prev != null) (now.first - prev.first).coerceAtLeast(0) else 0
+                val down = if (prev != null) (now.second - prev.second).coerceAtLeast(0) else 0
+                VpnManager.pushTraffic(up, down)
                 VpnManager.status.value = s.copy(
-                    up = if (prev != null) (now.first - prev.first).coerceAtLeast(0) else 0,
-                    down = if (prev != null) (now.second - prev.second).coerceAtLeast(0) else 0,
+                    up = up,
+                    down = down,
                     upTotal = now.first,
                     downTotal = now.second,
                     activeNode = active ?: s.activeNode,
                 )
             }
+        }
+    }
+
+    /**
+     * Checks the server in use right after connecting and then every 30
+     * seconds. When the chosen server stops answering Vela switches to
+     * automatic selection (unless the user turned that off).
+     */
+    private fun startWatchdog() {
+        watchJob?.cancel()
+        watchJob = scope.launch {
+            delay(2500)
+            val power = getSystemService(PowerManager::class.java)
+            var fails = 0
+            var first = true
+            while (isActive) {
+                if (!first && !power.isInteractive) {
+                    delay(60_000)
+                    continue
+                }
+                if (VpnManager.status.value.state != ConnState.Connected) return@launch
+                val ok = VpnManager.probeCurrent() != null
+                if (ok) {
+                    fails = 0
+                } else {
+                    fails++
+                    if (first || fails >= 2) {
+                        fails = 0
+                        failover(first)
+                    }
+                }
+                first = false
+                delay(30_000)
+            }
+        }
+    }
+
+    private suspend fun failover(justConnected: Boolean) {
+        val st = Store.state.value
+        val profile = st.active ?: return
+        val selected = st.selectedNode
+        val manual = selected != "auto" && profile.nodes.any { it.id == selected }
+        val s = VpnManager.status.value
+        if (st.settings.disableFailover || !manual) {
+            if (manual && justConnected) {
+                VpnManager.status.value = s.copy(error = "Выбранный сервер не отвечает. Выберите другой сервер или «Автовыбор»")
+            } else if (!manual) {
+                VpnManager.retestAuto()
+            }
+            return
+        }
+        val name = profile.nodes.first { it.id == selected }.name
+        if (VpnManager.switchTo("auto")) {
+            Store.select(profile.id, "auto")
+            VpnManager.status.value = VpnManager.status.value.copy(
+                error = null,
+                notice = "«${name}» не отвечает. Vela переключилась на автовыбор",
+            )
+        } else if (justConnected) {
+            VpnManager.status.value = s.copy(error = "Выбранный сервер не отвечает. Выберите другой сервер")
         }
     }
 
@@ -263,6 +332,23 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE),
             )
         if (Build.VERSION.SDK_INT >= 29) builder.setMetered(false)
+
+        // split tunneling by app
+        val include = options.includePackage
+        val exclude = options.excludePackage
+        if (include.hasNext()) {
+            // Vela itself stays inside so «My IP» and the speed test see the VPN
+            runCatching { builder.addAllowedApplication(packageName) }
+            while (include.hasNext()) {
+                val pkg = include.next()
+                runCatching { builder.addAllowedApplication(pkg) }
+            }
+        } else {
+            while (exclude.hasNext()) {
+                val pkg = exclude.next()
+                if (pkg != packageName) runCatching { builder.addDisallowedApplication(pkg) }
+            }
+        }
 
         val v4 = options.inet4Address
         while (v4.hasNext()) v4.next().let { builder.addAddress(it.address(), it.prefix()) }

@@ -60,7 +60,12 @@ jobs:
           python3 -c "import plistlib; plistlib.dump({'com.apple.developer.networking.networkextension': ['packet-tunnel-provider'], 'com.apple.security.application-groups': ['group.app.vela.client']}, open('ent-tunnel.plist', 'wb'))"
           cp ent-tunnel.plist ent-app.plist
           codesign -f -s - --entitlements ent-tunnel.plist "$APPEX"
+          # home screen widget + Control Center control
+          if [ -d "$APP/PlugIns/VelaWidgets.appex" ]; then
+            codesign -f -s - --entitlements ent-tunnel.plist "$APP/PlugIns/VelaWidgets.appex"
+          fi
           codesign -f -s - --entitlements ent-app.plist "$APP"
+          ls "$APP/PlugIns"
           codesign -d --entitlements - "$APPEX"
           mkdir -p Payload
           cp -R "$APP" Payload/

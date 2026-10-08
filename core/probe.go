@@ -109,48 +109,100 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 	if parallel <= 0 {
 		parallel = 8
 	}
-	sem := make(chan struct{}, parallel)
-	var wg sync.WaitGroup
-	for _, n := range nodes {
-		select {
-		case <-ctx.Done():
-			wg.Wait()
-			return ctx.Err()
-		case sem <- struct{}{}:
+	// Many subscription entries point to the same server. Hitting one host
+	// with lots of parallel handshakes makes it drop connections, so checks
+	// are limited per host and failures get a calm second attempt.
+	const perHost = 2
+	var hostMu sync.Mutex
+	hostSem := map[string]chan struct{}{}
+	hostGate := func(host string) chan struct{} {
+		hostMu.Lock()
+		defer hostMu.Unlock()
+		g, ok := hostSem[host]
+		if !ok {
+			g = make(chan struct{}, perHost)
+			hostSem[host] = g
 		}
-		wg.Add(1)
-		go func(n Node) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			res := ProbeResult{ID: n.ID}
-			outbound, ok := instance.Outbound().Outbound(NodeTag(n))
-			if !ok {
-				res.Error = "outbound not found"
-				res.Reason = "сервер не удалось разобрать"
-				onResult(res)
-				return
-			}
-			tctx, cancel := context.WithTimeout(ctx, timeout)
-			delay, err := urltest.URLTest(tctx, TestURL, outbound)
-			timedOut := errors.Is(tctx.Err(), context.DeadlineExceeded)
-			cancel()
-			if err == nil && delay == 0 {
-				delay = 1
-			}
-			if err != nil {
-				if timedOut {
-					err = fmt.Errorf("timeout after %s: %w", timeout, err)
-				}
-				res.Error = err.Error()
-				res.Reason = ExplainError(res.Error)
-			} else {
-				res.Delay = int(delay)
-			}
-			onResult(res)
-		}(n)
+		return g
 	}
-	wg.Wait()
-	return nil
+	test := func(n Node) ProbeResult {
+		res := ProbeResult{ID: n.ID}
+		outbound, ok := instance.Outbound().Outbound(NodeTag(n))
+		if !ok {
+			res.Error = "outbound not found"
+			res.Reason = "сервер не удалось разобрать"
+			return res
+		}
+		gate := hostGate(n.Server)
+		select {
+		case gate <- struct{}{}:
+		case <-ctx.Done():
+			res.Error = ctx.Err().Error()
+			res.Reason = ExplainError(res.Error)
+			return res
+		}
+		defer func() { <-gate }()
+		tctx, cancel := context.WithTimeout(ctx, timeout)
+		delay, err := urltest.URLTest(tctx, TestURL, outbound)
+		timedOut := errors.Is(tctx.Err(), context.DeadlineExceeded)
+		cancel()
+		if err != nil {
+			if timedOut {
+				err = fmt.Errorf("timeout after %s: %w", timeout, err)
+			}
+			res.Error = err.Error()
+			res.Reason = ExplainError(res.Error)
+			return res
+		}
+		if delay == 0 {
+			delay = 1
+		}
+		res.Delay = int(delay)
+		return res
+	}
+	run := func(list []Node, workers int, report func(ProbeResult)) {
+		sem := make(chan struct{}, workers)
+		var wg sync.WaitGroup
+		for _, n := range list {
+			if ctx.Err() != nil {
+				break
+			}
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(n Node) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				report(test(n))
+			}(n)
+		}
+		wg.Wait()
+	}
+	// first pass: results that succeed are reported right away
+	var failedMu sync.Mutex
+	var failed []Node
+	byID := map[string]Node{}
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+	firstErr := map[string]ProbeResult{}
+	run(nodes, parallel, func(r ProbeResult) {
+		if r.Delay > 0 {
+			onResult(r)
+			return
+		}
+		failedMu.Lock()
+		failed = append(failed, byID[r.ID])
+		firstErr[r.ID] = r
+		failedMu.Unlock()
+	})
+	// second pass for failures, slowly: tells real failures from overload
+	run(failed, 2, func(r ProbeResult) {
+		if r.Delay <= 0 && r.Error == "" {
+			r = firstErr[r.ID]
+		}
+		onResult(r)
+	})
+	return ctx.Err()
 }
 
 // probeDNS resolves server domain names for the temporary core. Mobile apps

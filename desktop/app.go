@@ -54,6 +54,10 @@ type State struct {
 	ConnectOnLaunch  bool          `json:"connectOnLaunch"`
 	WasConnected     bool          `json:"wasConnected"`
 	OnboardingPassed bool          `json:"onboardingPassed"`
+	// Favorite node ids (stable across subscription updates).
+	Favorites []string `json:"favorites,omitempty"`
+	// "system" | "light" | "dark"
+	Theme string `json:"theme,omitempty"`
 }
 
 // Status is pushed to the UI.
@@ -68,6 +72,15 @@ type Status struct {
 	DownTotal  int64  `json:"downTotal"`
 	ActiveNode string `json:"activeNode,omitempty"` // node id actually used (auto resolves)
 	Elevated   bool   `json:"elevated"`
+	// Notice is an informational message (e.g. automatic switch).
+	Notice string `json:"notice,omitempty"`
+}
+
+// TrafficPoint is one second of traffic for the graph.
+type TrafficPoint struct {
+	T    int64 `json:"t"`
+	Up   int64 `json:"up"`
+	Down int64 `json:"down"`
 }
 
 type App struct {
@@ -90,6 +103,9 @@ type App struct {
 	reasons map[string]string
 	pingsMu sync.Mutex
 	probing atomic.Bool
+
+	history  []TrafficPoint // last minutes of traffic, guarded by mu
+	speeding atomic.Bool
 }
 
 func NewApp(dataDir string) *App {
@@ -98,6 +114,7 @@ func NewApp(dataDir string) *App {
 	a.load()
 	a.status.State = "disconnected"
 	a.status.Elevated = isElevated()
+	a.loadPings()
 	return a
 }
 
@@ -140,6 +157,9 @@ type Snapshot struct {
 	Pings           map[string]int    `json:"pings"`
 	Reasons         map[string]string `json:"reasons"`
 	Probing         bool              `json:"probing"`
+	Favorites       []string          `json:"favorites"`
+	Theme           string            `json:"theme"`
+	History         []TrafficPoint    `json:"history"`
 	Onboarding      bool              `json:"onboarding"`
 }
 
@@ -165,6 +185,8 @@ func (a *App) Snapshot() Snapshot {
 		SelectedNode: a.state.SelectedNode, Settings: a.state.Settings,
 		ConnectOnLaunch: a.state.ConnectOnLaunch, Status: a.status, Pings: pings,
 		Reasons: reasons, Probing: a.probing.Load(),
+		Favorites: append([]string{}, a.state.Favorites...), Theme: a.state.Theme,
+		History:    append([]TrafficPoint{}, a.history...),
 		Onboarding: !a.state.OnboardingPassed,
 	}
 }
@@ -223,6 +245,12 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return "", errors.New("вставьте ссылку на подписку или сервер")
+	}
+	if b, ok, err := core.DecodeBackup(text); ok {
+		if err != nil {
+			return "", err
+		}
+		return a.importBackup(ctx, b)
 	}
 	a.mu.Lock()
 	prevActive := a.state.ActiveProfile
@@ -701,7 +729,8 @@ func (a *App) Connect() error {
 	nodes := append([]core.Node(nil), p.Nodes...)
 	selected := a.state.SelectedNode
 	a.status.State = "connecting"
-	a.status.Error, a.status.ErrorCode = "", ""
+	a.status.Error, a.status.ErrorCode, a.status.Notice = "", "", ""
+	a.history = nil
 	a.mu.Unlock()
 	a.pushStatus()
 
@@ -711,9 +740,14 @@ func (a *App) Connect() error {
 		return err
 	}
 	secret := randomID() + randomID()
+	a.mu.Lock()
+	favorites := a.favoritesIn(nodes)
+	a.mu.Unlock()
+	ranked, failed := a.rankNodes(nodes)
 	cfg, err := core.BuildConfig(core.BuildRequest{
 		Platform: runtimePlatform(), Nodes: nodes, Selected: selected, Settings: settings,
 		DataDir: a.dataDir, ControllerPort: port, ControllerSecret: secret,
+		Favorites: favorites, Ranked: ranked, Failed: failed,
 	})
 	if err != nil {
 		a.setStatus("disconnected", err.Error(), "")
@@ -737,6 +771,7 @@ func (a *App) Connect() error {
 	a.mu.Unlock()
 	a.setStatus("connected", "", "")
 	go a.statsLoop(stop)
+	go a.watchdog(stop)
 	go a.selfCheck(selected)
 	return nil
 }
@@ -860,6 +895,12 @@ func (a *App) statsLoop(stop chan struct{}) {
 			a.status.Down = max(0, conns.DownloadTotal-lastDown)
 		}
 		a.status.UpTotal, a.status.DownTotal = conns.UploadTotal, conns.DownloadTotal
+		if lastUp >= 0 {
+			a.history = append(a.history, TrafficPoint{T: time.Now().Unix(), Up: a.status.Up, Down: a.status.Down})
+			if len(a.history) > 300 {
+				a.history = a.history[len(a.history)-300:]
+			}
+		}
 		if active != "" {
 			a.status.ActiveNode = active
 		}
@@ -981,27 +1022,43 @@ func (a *App) Ping(profileID string) {
 		return
 	}
 	core.WriteReport(filepath.Join(a.dataDir, "diagnostics.txt"), nodes, results)
+	a.savePings()
 }
 
-// FastestFirst returns node ids sorted by measured latency (unused nodes last).
+// FastestFirst returns ids of servers that worked in the last check, best
+// first, and the ids that failed.
 func (a *App) FastestFirst(nodes []core.Node) []string {
+	ranked, _ := a.rankNodes(nodes)
+	return ranked
+}
+
+func (a *App) rankNodes(nodes []core.Node) (ranked, failed []string) {
 	a.pingsMu.Lock()
 	defer a.pingsMu.Unlock()
-	ids := make([]string, 0, len(nodes))
 	for _, n := range nodes {
-		ids = append(ids, n.ID)
+		switch ms := a.pings[n.ID]; {
+		case ms > 0:
+			ranked = append(ranked, n.ID)
+		case ms < 0:
+			failed = append(failed, n.ID)
+		}
 	}
-	sort.SliceStable(ids, func(i, j int) bool {
-		pi, pj := a.pings[ids[i]], a.pings[ids[j]]
-		if pi <= 0 {
-			return false
+	sort.SliceStable(ranked, func(i, j int) bool { return a.pings[ranked[i]] < a.pings[ranked[j]] })
+	return ranked, failed
+}
+
+func (a *App) favoritesIn(nodes []core.Node) []string {
+	fav := map[string]bool{}
+	for _, id := range a.state.Favorites {
+		fav[id] = true
+	}
+	var out []string
+	for _, n := range nodes {
+		if fav[n.ID] {
+			out = append(out, n.ID)
 		}
-		if pj <= 0 {
-			return true
-		}
-		return pi < pj
-	})
-	return ids
+	}
+	return out
 }
 
 // ---------------------------------------------------------------- utils

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
 <title>Vela</title>
 <link rel="icon" href="icon.png">
 <link rel="stylesheet" href="app.css">
@@ -63,6 +63,10 @@
         <div><span class="arrow">↓</span><b id="down">0 Б/с</b></div>
         <div><span class="arrow">↑</span><b id="up">0 Б/с</b></div>
       </div>
+      <figure class="graph" id="graphBox" hidden>
+        <canvas id="graph" height="64" aria-label="Скорость за последние минуты"></canvas>
+        <figcaption><span class="key down">загрузка</span><span class="key up">отдача</span><span id="graphPeak"></span></figcaption>
+      </figure>
     </section>
 
     <div class="banner" id="banner" hidden>
@@ -71,6 +75,18 @@
     </div>
 
     <section class="panel-home">
+      <div class="tools-row">
+        <button class="tool" id="ipCard" title="Обновить">
+          <span class="tool-label">Мой IP</span>
+          <span class="tool-value" id="ipValue">Узнать</span>
+          <span class="tool-meta" id="ipMeta">Как вас видят сайты</span>
+        </button>
+        <button class="tool" id="speedCard">
+          <span class="tool-label">Скорость</span>
+          <span class="tool-value" id="speedValue">Измерить</span>
+          <span class="tool-meta" id="speedMeta">Через выбранный сервер</span>
+        </button>
+      </div>
       <button class="current" id="currentServer">
         <span class="current-flag" id="curFlag">✦</span>
         <span class="current-body">
@@ -103,10 +119,23 @@
     </header>
     <nav class="tabs" id="profileTabs" aria-label="Подписки"></nav>
     <div class="profile-info" id="profileInfo"></div>
-    <div class="list-tools">
+    <div class="search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+      <input id="search" type="search" placeholder="Поиск: страна, город, протокол" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="list-tools" id="filters">
+      <button class="chip" data-filter="fav" aria-pressed="false">★ Избранные</button>
+      <button class="chip" data-filter="ok" aria-pressed="false">Рабочие</button>
+      <select class="chip select" id="protoFilter" aria-label="Протокол">
+        <option value="">Все протоколы</option>
+      </select>
+      <select class="chip select" id="countryFilter" aria-label="Страна">
+        <option value="">Все страны</option>
+      </select>
       <button class="chip" id="sortToggle" aria-pressed="false">Сначала быстрые</button>
       <button class="chip" id="openReport" title="Открыть отчёт последней проверки">Отчёт</button>
     </div>
+    <p class="list-count" id="listCount"></p>
     <div class="probe" id="probeBar" hidden>
       <span id="probeText"></span>
       <div class="bar"><i id="probeFill"></i></div>
@@ -127,6 +156,41 @@
         <label class="choice"><input type="radio" name="mode" value="proxy"><span><b>Только системный прокси</b><em>Браузеры и программы, которые его поддерживают. Права не нужны</em></span></label>
         <label class="choice"><input type="radio" name="mode" value="local"><span><b>Только локальный прокси</b><em>SOCKS5/HTTP на 127.0.0.1, порт задаётся ниже. Для ручной настройки программ</em></span></label>
         <label class="switch"><span><b>Подключаться при запуске</b></span><input type="checkbox" name="connectOnLaunch"><i></i></label>
+        <label class="switch"><span><b>Автопереключение при сбое</b><em>Если сервер перестал отвечать, Vela сама перейдёт на рабочий</em></span><input type="checkbox" name="failover"><i></i></label>
+      </fieldset>
+      <fieldset>
+        <legend>Оформление</legend>
+        <div class="segmented" role="radiogroup" aria-label="Тема">
+          <label><input type="radio" name="theme" value="system"><span>Как в системе</span></label>
+          <label><input type="radio" name="theme" value="light"><span>Светлая</span></label>
+          <label><input type="radio" name="theme" value="dark"><span>Тёмная</span></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Раздельное туннелирование</legend>
+        <label class="field"><span>Какие программы идут через VPN</span>
+          <select name="appMode">
+            <option value="">Все программы</option>
+            <option value="exclude">Все, кроме выбранных</option>
+            <option value="only">Только выбранные</option>
+          </select></label>
+        <div class="apps" id="appsBox">
+          <div class="app-chips" id="appChips"></div>
+          <div class="row-btns">
+            <button type="button" class="btn ghost small" id="pickApps">Выбрать из запущенных</button>
+            <input class="text-input small" id="appInput" placeholder="или имя: chrome.exe" spellcheck="false">
+            <button type="button" class="btn ghost small" id="addApp">Добавить</button>
+          </div>
+          <p class="hint">Работает в режиме «Весь компьютер».</p>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Резервная копия</legend>
+        <p class="hint">Подписки, свои серверы, избранное и настройки одним текстом или QR-кодом. Чтобы восстановить, вставьте его в окно «Добавить».</p>
+        <div class="row-btns">
+          <button type="button" class="btn ghost small" id="exportBtn">Экспортировать</button>
+          <button type="button" class="btn ghost small" id="importBtn">Импортировать</button>
+        </div>
       </fieldset>
       <fieldset>
         <legend>Фильтры</legend>
@@ -143,6 +207,21 @@
           <select name="stack"><option value="mixed">Смешанный (рекомендуется)</option><option value="system">Системный (быстрее)</option><option value="gvisor">gVisor (совместимее)</option></select></label>
         <label class="field"><span>Порт локального прокси</span><input name="proxyPort" type="number" min="1024" max="65535"></label>
         <label class="switch"><span><b>Доступ из локальной сети</b><em>Другие устройства смогут использовать этот прокси</em></span><input type="checkbox" name="allowLan"><i></i></label>
+        <label class="field"><span>Фрагментация TLS</span>
+          <select name="tlsFragment">
+            <option value="">Выключена</option>
+            <option value="record">Лёгкая: помогает против простых блокировок</option>
+            <option value="full">Сильная: если не помогла лёгкая, медленнее</option>
+          </select></label>
+        <div class="field">
+          <span>Свои правила</span>
+          <p class="hint">Сайт (example.com), слово (*torrent*), IP или подсеть (10.0.0.0/8). Правила проверяются первыми.</p>
+          <ul class="rules" id="rulesList"></ul>
+          <button type="button" class="btn ghost small" id="addRule">Добавить правило</button>
+        </div>
+        <div class="row-btns">
+          <button type="button" class="btn ghost small" id="showLogs">Показать журнал</button>
+        </div>
       </details>
       <fieldset class="about">
         <legend>О программе</legend>
@@ -162,6 +241,11 @@
       <h3>Добавить серверы</h3>
       <p class="hint">Вставьте ссылки на подписки или на серверы: vless, vmess, trojan, ss, hysteria2, tuic. Несколько штук можно вставить сразу, каждую с новой строки.</p>
       <textarea id="addText" rows="5" spellcheck="false" placeholder="https://… или vless://…"></textarea>
+      <div class="drop" id="qrDrop">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z"/><path d="M14 14h2v2h-2zM18 14h2v2M14 18h2M18 18h2v2h-2"/></svg>
+        <span>QR-код: перетащите картинку, вставьте скриншот (Ctrl+V) или <button type="button" class="link-inline" id="qrPick">выберите файл</button></span>
+        <input type="file" id="qrFile" accept="image/*" hidden>
+      </div>
       <p class="form-error" id="addError" hidden></p>
       <div class="dialog-btns">
         <button type="button" class="btn ghost" id="pasteBtn">Вставить из буфера</button>
@@ -181,6 +265,46 @@
         <span class="spacer"></span>
         <button type="button" class="btn ghost" id="renameCancel">Отмена</button>
         <button type="submit" class="btn">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog" id="shareDialog">
+    <form method="dialog">
+      <h3 id="shareTitle">Поделиться</h3>
+      <p class="hint" id="shareHint">Отсканируйте QR-код в Vela или другом клиенте на другом устройстве.</p>
+      <img class="qr" id="shareQR" alt="QR-код" width="260" height="260">
+      <textarea id="shareText" rows="3" readonly spellcheck="false"></textarea>
+      <div class="dialog-btns">
+        <button type="button" class="btn ghost" id="shareCopy">Скопировать</button>
+        <span class="spacer"></span>
+        <button class="btn">Готово</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog" id="appsDialog">
+    <form id="appsForm">
+      <h3>Запущенные программы</h3>
+      <input class="text-input" id="appsFilter" placeholder="Поиск" spellcheck="false">
+      <ul class="pick-list" id="appsList"></ul>
+      <div class="dialog-btns">
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" id="appsCancel">Отмена</button>
+        <button type="submit" class="btn">Готово</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog wide" id="logsDialog">
+    <form method="dialog">
+      <h3>Журнал ядра</h3>
+      <pre class="logs" id="logsText"></pre>
+      <div class="dialog-btns">
+        <button type="button" class="btn ghost" id="logsRefresh">Обновить</button>
+        <button type="button" class="btn ghost" data-open="logs">Открыть папку</button>
+        <span class="spacer"></span>
+        <button class="btn">Закрыть</button>
       </div>
     </form>
   </dialog>

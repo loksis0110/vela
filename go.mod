@@ -3,6 +3,8 @@ module github.com/velaapp/vela
 go 1.25.5
 
 require (
+	github.com/makiuchi-d/gozxing v0.1.1
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	fyne.io/systray v1.12.2
 	github.com/sagernet/sing v0.9.6-0.20260922013354-87c33f17688f
 	github.com/sagernet/gomobile v0.1.13

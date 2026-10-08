@@ -3,6 +3,14 @@ package app.vela.client
 import android.app.Application
 import android.os.Build
 import app.vela.client.data.Store
+import app.vela.client.vpn.VpnManager
+import app.vela.client.widget.VelaWidget
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 import app.vela.client.vpn.DefaultNetworkMonitor
 import app.vela.libbox.Libbox
 import app.vela.libbox.SetupOptions
@@ -27,5 +35,11 @@ class VelaApp : Application() {
                 it.appMarketingVersion = BuildConfig.VERSION_NAME
             },
         )
+        // keep the home screen widget in sync with the connection
+        CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
+            combine(VpnManager.status, Store.state) { s, st -> Triple(s.state, s.activeNode, st.active?.id to st.selectedNode) }
+                .distinctUntilChanged()
+                .collect { runCatching { VelaWidget.updateAll(this@VelaApp) } }
+        }
     }
 }

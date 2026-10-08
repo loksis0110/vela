@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -105,4 +106,33 @@ func fatal(msg string) {
 	text, _ := windows.UTF16PtrFromString(msg)
 	procMessageBox.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), 0x10)
 	os.Exit(1)
+}
+
+// listProcesses returns names of running programs for the split tunneling
+// picker (e.g. "chrome.exe"), without duplicates and system processes.
+func listProcesses() []string {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return []string{}
+	}
+	defer windows.CloseHandle(snap)
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	seen := map[string]bool{}
+	skip := map[string]bool{"system": true, "[system process]": true, "svchost.exe": true, "csrss.exe": true,
+		"wininit.exe": true, "services.exe": true, "lsass.exe": true, "smss.exe": true, "winlogon.exe": true,
+		"registry": true, "fontdrvhost.exe": true, "dwm.exe": true, "conhost.exe": true, "vela.exe": true,
+		"memory compression": true, "runtimebroker.exe": true, "sihost.exe": true, "dllhost.exe": true}
+	out := []string{}
+	for err = windows.Process32First(snap, &entry); err == nil; err = windows.Process32Next(snap, &entry) {
+		name := windows.UTF16ToString(entry.ExeFile[:])
+		key := strings.ToLower(name)
+		if name == "" || seen[key] || skip[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, name)
+	}
+	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i]) < strings.ToLower(out[j]) })
+	return out
 }
