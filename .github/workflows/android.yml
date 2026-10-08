@@ -60,7 +60,7 @@ jobs:
           fi
           chmod +x gradlew
           set -o pipefail
-          ./gradlew --no-daemon assembleRelease bundleRelease 2>&1 | tee $RUNNER_TEMP/gradle.log
+          ./gradlew --no-daemon assembleRelease 2>&1 | tee $RUNNER_TEMP/gradle.log
       - name: Report errors
         if: failure()
         run: |
@@ -69,7 +69,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Vela-android
-          path: |
-            android/app/build/outputs/apk/release/*.apk
-            android/app/build/outputs/bundle/release/*.aab
+          path: android/app/build/outputs/apk/release/*.apk
 

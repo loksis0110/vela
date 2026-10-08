@@ -97,7 +97,8 @@ struct Sparkle: Shape {
         for i in 0 ..< 8 {
             let ang = Double.pi / 4 * Double(i) - Double.pi / 2
             let rr = i % 2 == 0 ? r : r * 0.28
-            let pt = CGPoint(x: c.x + rr * cos(ang), y: c.y + rr * sin(ang))
+            let dx = CGFloat(Foundation.cos(ang)), dy = CGFloat(Foundation.sin(ang))
+            let pt = CGPoint(x: c.x + rr * dx, y: c.y + rr * dy)
             if i == 0 { path.move(to: pt) } else { path.addLine(to: pt) }
         }
         path.closeSubpath()

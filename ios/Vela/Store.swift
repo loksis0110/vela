@@ -314,13 +314,12 @@ final class Store: ObservableObject {
                 if let p = s.probe { s.probe = (p.done + 1, p.total) }
             }
         }
-        let error: Error? = await Task.detached(priority: .userInitiated) {
-            do {
-                try VelacoreProbeNodes(nodesJSON, 9000, 12, callback)
-                return nil
-            } catch { return error }
+        let failed: Bool = await Task.detached(priority: .userInitiated) {
+            var err: NSError?
+            let ok = VelacoreProbeNodes(nodesJSON, 9000, 12, callback, &err)
+            return !ok || err != nil
         }.value
-        if error != nil {
+        if failed {
             // temporary core unavailable: fall back to TCP reachability
             for n in profile.nodes where (pings[n.id] ?? 0) == 0 {
                 let ms = await Task.detached { Int(VelacoreTCPPing(n.server, Int32(n.port))) }.value
