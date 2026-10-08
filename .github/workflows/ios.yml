@@ -27,7 +27,9 @@ jobs:
           go-version: "1.26"
 
       - name: Build core frameworks
-        run: ./scripts/build-mobile-libs.sh ios
+        run: |
+          set -o pipefail
+          ./scripts/build-mobile-libs.sh ios 2>&1 | tee $RUNNER_TEMP/lib.log
 
       - name: Generate Xcode project
         working-directory: ios
@@ -38,10 +40,11 @@ jobs:
       - name: Build app (unsigned)
         working-directory: ios
         run: |
+          set -o pipefail
           xcodebuild -project Vela.xcodeproj -scheme Vela -configuration Release \
             -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build
+            build 2>&1 | tee $RUNNER_TEMP/xcode.log
 
       # The IPA is ad-hoc signed with its entitlements embedded, so any
       # re-signing tool (Sideloadly, ESign, Feather, Xcode) knows that the app
@@ -61,6 +64,11 @@ jobs:
           zip -qry Vela-unsigned.ipa Payload
           ls -la Vela-unsigned.ipa
 
+      - name: Report errors
+        if: failure()
+        run: |
+          ./scripts/ci-report.sh $RUNNER_TEMP/lib.log
+          ./scripts/ci-report.sh $RUNNER_TEMP/xcode.log
       - uses: actions/upload-artifact@v4
         with:
           name: Vela-iOS-unsigned-ipa

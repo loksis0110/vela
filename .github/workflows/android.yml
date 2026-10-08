@@ -36,7 +36,9 @@ jobs:
       - name: Build core library
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: ./scripts/build-mobile-libs.sh android
+        run: |
+          set -o pipefail
+          ./scripts/build-mobile-libs.sh android 2>&1 | tee $RUNNER_TEMP/lib.log
       - name: Build APK and App Bundle
         working-directory: android
         env:
@@ -51,7 +53,13 @@ jobs:
             export VELA_KEYSTORE_FILE="$RUNNER_TEMP/release.keystore"
           fi
           chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease bundleRelease
+          set -o pipefail
+          ./gradlew --no-daemon assembleRelease bundleRelease 2>&1 | tee $RUNNER_TEMP/gradle.log
+      - name: Report errors
+        if: failure()
+        run: |
+          ./scripts/ci-report.sh $RUNNER_TEMP/lib.log
+          ./scripts/ci-report.sh $RUNNER_TEMP/gradle.log
       - uses: actions/upload-artifact@v4
         with:
           name: Vela-android
