@@ -239,6 +239,29 @@ func BuildConfig(req BuildRequest) (string, error) {
 			selected = nodeTags[0]
 		}
 	}
+	auto := autoCandidates(req, nodeTags)
+	if req.Platform == PlatformIOS && len(nodeTags) > MaxAutoCandidates {
+		// The Network Extension may use only ~50 MB: hundreds of servers don't
+		// fit. Keep the chosen one, the automatic group and the favorites;
+		// the app rebuilds the config when another server is picked.
+		keep := map[string]bool{selected: true}
+		for _, t := range auto {
+			keep[t] = true
+		}
+		for _, id := range req.Favorites {
+			keep[NodeTag(Node{ID: id})] = true
+		}
+		var obs []any
+		var tags []string
+		for _, ob := range outbounds {
+			if t, _ := ob.(map[string]any)["tag"].(string); keep[t] {
+				obs = append(obs, ob)
+				tags = append(tags, t)
+			}
+		}
+		outbounds, nodeTags = obs, tags
+		selectorItems = append([]string{TagAuto}, nodeTags...)
+	}
 	outbounds = append([]any{
 		map[string]any{
 			"type": "selector", "tag": TagSelector,
@@ -247,7 +270,7 @@ func BuildConfig(req BuildRequest) (string, error) {
 		},
 		map[string]any{
 			"type": "urltest", "tag": TagAuto,
-			"outbounds":                   autoCandidates(req, nodeTags),
+			"outbounds":                   auto,
 			"url":                         "https://www.gstatic.com/generate_204",
 			"interval":                    "10m",
 			"tolerance":                   100,

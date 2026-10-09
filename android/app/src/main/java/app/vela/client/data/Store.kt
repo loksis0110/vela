@@ -122,7 +122,7 @@ data class Settings(
         .put("directDns", directDns)
         .put("directDomains", JSONArray(directDomains))
         .put("proxyDomains", JSONArray(proxyDomains))
-        .put("logLevel", "info")
+        .put("logLevel", "warn")
         .put("disableFailover", disableFailover)
         .put("tlsFragment", tlsFragment)
         .put("rules", JSONArray().apply { rules.forEach { put(it.toJson()) } })

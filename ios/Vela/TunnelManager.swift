@@ -418,7 +418,11 @@ final class TunnelManager: ObservableObject {
         let store = Store.shared
         guard let p = store.state.profiles.first(where: { $0.id == profileID }),
               let n = p.nodes.first(where: { $0.id == nodeID }) else { return }
+        var inCore = false
         if state == .connected, p.id == store.state.activeProfile {
+            inCore = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))") != nil
+        }
+        if inCore {
             store.pings[n.id] = 0
             store.reasons[n.id] = nil
             let r = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=8000", timeout: 11)
@@ -447,9 +451,15 @@ final class TunnelManager: ObservableObject {
         for n in profile.nodes { store.pings[n.id] = 0; store.reasons[n.id] = nil }
         store.probe = (0, profile.nodes.count)
         store.stopRequested = false
+        // the running core holds only some of the servers (memory limit of
+        // the extension); the rest are checked with a temporary core
+        let all = await request("GET", "/proxies")
+        let present = Set((all?["proxies"] as? [String: Any] ?? [:]).keys)
+        let inCore = profile.nodes.filter { present.contains(VelacoreNodeTag($0.id)) }
+        let outside = profile.nodes.filter { !present.contains(VelacoreNodeTag($0.id)) }
         await withTaskGroup(of: (String, Int).self) { group in
             var started = 0
-            var iterator = profile.nodes.makeIterator()
+            var iterator = inCore.makeIterator()
             func addNext() {
                 guard !store.stopRequested, let n = iterator.next() else { return }
                 started += 1
@@ -468,6 +478,7 @@ final class TunnelManager: ObservableObject {
                 addNext()
             }
         }
+        if !store.stopRequested { await store.probeWithTempCore(outside) }
         for n in profile.nodes where store.pings[n.id] == 0 { store.pings[n.id] = nil }
         store.probe = nil
         store.savePings()

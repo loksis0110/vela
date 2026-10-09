@@ -96,7 +96,7 @@ struct VelaSettings: Codable, Equatable {
     var json: [String: Any] {
         ["mode": "tun", "routing": routing, "blockAds": blockAds, "ipv6": ipv6, "stack": "system",
          "remoteDns": remoteDNS, "directDns": directDNS, "directDomains": directDomains,
-         "proxyDomains": proxyDomains, "logLevel": "info", "disableFailover": disableFailover,
+         "proxyDomains": proxyDomains, "logLevel": "warn", "disableFailover": disableFailover,
          "tlsFragment": tlsFragment,
          "rules": rules.filter { !$0.match.isEmpty }.map { ["match": $0.match, "action": $0.action] }]
     }
@@ -545,7 +545,19 @@ final class Store: ObservableObject {
         stopRequested = false
         for n in profile.nodes { pings[n.id] = 0; reasons[n.id] = nil }
         probe = (0, profile.nodes.count)
-        let nodesJSON = "[" + profile.nodes.map(\.raw).joined(separator: ",") + "]"
+        await probeWithTempCore(profile.nodes)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        // stopped: servers that weren't checked must not stay "measuring"
+        for n in profile.nodes where pings[n.id] == 0 { pings[n.id] = nil }
+        probe = nil
+        savePings()
+    }
+
+    /// Real request through each server with a temporary core in the app.
+    /// Updates pings, reasons and the progress counter.
+    func probeWithTempCore(_ nodes: [Node]) async {
+        guard !nodes.isEmpty else { return }
+        let nodesJSON = "[" + nodes.map(\.raw).joined(separator: ",") + "]"
         let callback = ProbeCallback { id, ms, reason in
             Task { @MainActor in
                 let s = Store.shared
@@ -562,17 +574,12 @@ final class Store: ObservableObject {
         }.value
         if failed, !stopRequested {
             // temporary core unavailable: fall back to TCP reachability
-            for n in profile.nodes where (pings[n.id] ?? 0) == 0 {
+            for n in nodes where (pings[n.id] ?? 0) == 0 {
                 let ms = await Task.detached { Int(VelacoreTCPPing(n.server, Int32(n.port))) }.value
                 pings[n.id] = ms > 0 ? ms : -1
                 if ms <= 0 { reasons[n.id] = "сервер недоступен" }
             }
         }
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        // stopped: servers that weren't checked must not stay "measuring"
-        for n in profile.nodes where pings[n.id] == 0 { pings[n.id] = nil }
-        probe = nil
-        savePings()
     }
 
     /// Checks one server with a temporary core (VPN off).

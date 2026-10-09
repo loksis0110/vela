@@ -135,6 +135,8 @@ func NewApp(dataDir string) *App {
 	a.status.State = "disconnected"
 	a.status.Elevated = isElevated()
 	a.loadPings()
+	// left by older versions: it restored stale server choices
+	os.Remove(filepath.Join(dataDir, "cache.db"))
 	if a.state.HWID == "" {
 		a.state.HWID = randomID() + randomID()
 		a.saveLocked()
@@ -819,7 +821,11 @@ func (a *App) connect() error {
 		return errors.New("сначала добавьте сервер или подписку")
 	}
 	settings := a.state.Settings
-	settings.LogLevel = "info"
+	// warnings and errors only: «info» writes a line per connection (gigabytes a day)
+	settings.LogLevel = "warn"
+	if settings.IPv6 && settings.Mode == "tun" && !core.HostHasIPv6() {
+		settings.IPv6 = false // the provider of this network has no IPv6
+	}
 	if settings.Mode == "tun" && !isElevated() {
 		a.mu.Unlock()
 		a.setStatus("disconnected", "Для режима «Весь трафик» нужны права администратора", "need_admin")
@@ -942,7 +948,11 @@ func (a *App) Reconnect() {
 func startBox(cfg string, logPath string) (*box.Box, context.CancelFunc, error) {
 	// fresh log on every connect, detailed enough to diagnose server problems
 	os.Remove(logPath + ".old")
-	os.Rename(logPath, logPath+".old")
+	if st, err := os.Stat(logPath); err == nil && st.Size() > 20<<20 {
+		os.Remove(logPath) // older versions could write gigabytes
+	} else {
+		os.Rename(logPath, logPath+".old")
+	}
 	return core.StartBox(cfg, logPath)
 }
 

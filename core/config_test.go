@@ -225,3 +225,23 @@ func TestDuplicatesAndOddLinks(t *testing.T) {
 		t.Fatal("regex")
 	}
 }
+
+func TestIOSKeepsConfigSmall(t *testing.T) {
+	var nodes []Node
+	base := ParseText(sampleLinks[0]).Nodes[0]
+	for i := 0; i < 200; i++ {
+		n := base
+		n.ID = fmt.Sprintf("x%03d", i)
+		n.Link = ""
+		nodes = append(nodes, n)
+	}
+	cfg, err := BuildConfig(BuildRequest{Platform: PlatformIOS, Nodes: nodes, Selected: "x150", Settings: DefaultSettings(),
+		DataDir: t.TempDir(), Favorites: []string{"x199"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := strings.Count(cfg, `"tag": "node-`)
+	if n > MaxAutoCandidates+2 || !strings.Contains(cfg, "node-x150") || !strings.Contains(cfg, "node-x199") {
+		t.Fatalf("ios config has %d servers", n)
+	}
+}

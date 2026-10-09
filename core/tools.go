@@ -432,3 +432,31 @@ func ReadLog(path string, limit int) []string {
 	}
 	return lines
 }
+
+// HostHasIPv6 reports whether this computer has a global IPv6 address, i.e.
+// IPv6 websites can be reached directly. Without it IPv6 inside the tunnel
+// only slows things down (apps try IPv6 first and wait).
+func HostHasIPv6() bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return true
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := ifc.Addrs()
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok || ipn.IP.To4() != nil {
+				continue
+			}
+			ip := ipn.IP
+			// global unicast, not ULA (fc00::/7) — VPN adapters use ULA
+			if ip.IsGlobalUnicast() && ip[0]&0xfe != 0xfc {
+				return true
+			}
+		}
+	}
+	return false
+}
