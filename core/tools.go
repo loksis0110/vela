@@ -48,7 +48,7 @@ func EncodeQR(text string, size int) ([]byte, error) {
 func DecodeQR(data []byte) (string, error) {
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return "", errors.New("это не картинка")
+		return "", errors.New(T("это не картинка"))
 	}
 	bmp, err := gozxing.NewBinaryBitmapFromImage(img)
 	if err != nil {
@@ -57,7 +57,7 @@ func DecodeQR(data []byte) (string, error) {
 	hints := map[gozxing.DecodeHintType]interface{}{gozxing.DecodeHintType_TRY_HARDER: true}
 	res, err := qrcode.NewQRCodeReader().Decode(bmp, hints)
 	if err != nil {
-		return "", errors.New("на картинке не найден QR-код")
+		return "", errors.New(T("на картинке не найден QR-код"))
 	}
 	return strings.TrimSpace(res.GetText()), nil
 }
@@ -132,7 +132,7 @@ func MyIP(ctx context.Context, dialer N.Dialer) (*IPInfo, error) {
 			}
 			return nil
 		}); err2 != nil {
-			return nil, errors.New("нет ответа: " + ExplainError(err.Error()))
+			return nil, errors.New(T("нет ответа: ") + ExplainError(err.Error()))
 		}
 	}
 	info.Flag = flagEmoji(info.CountryCode)
@@ -208,7 +208,7 @@ func SpeedTest(ctx context.Context, dialer N.Dialer, limit time.Duration, progre
 		resp, err := client.Do(req)
 		if err != nil {
 			if i == 0 {
-				res.Error = "сервер не отвечает: " + ExplainError(err.Error())
+				res.Error = T("сервер не отвечает: ") + ExplainError(err.Error())
 				progress("done", 0)
 				return res
 			}
@@ -258,7 +258,7 @@ func SpeedTest(ctx context.Context, dialer N.Dialer, limit time.Duration, progre
 	}, func(mbps float64) { progress("upload", mbps) })
 
 	if res.DownloadMbps == 0 && res.UploadMbps == 0 {
-		res.Error = "не удалось измерить скорость"
+		res.Error = T("не удалось измерить скорость")
 	}
 	progress("done", 0)
 	return res
@@ -378,10 +378,10 @@ func DecodeBackup(text string) (b Backup, ok bool, err error) {
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(text, BackupPrefix))
 	if err != nil {
-		return b, true, errors.New("резервная копия повреждена")
+		return b, true, errors.New(T("резервная копия повреждена"))
 	}
 	if err := json.Unmarshal(raw, &b); err != nil {
-		return b, true, errors.New("резервная копия повреждена")
+		return b, true, errors.New(T("резервная копия повреждена"))
 	}
 	return b, true, nil
 }
