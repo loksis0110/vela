@@ -36,3 +36,10 @@ jobs:
           unzip -q -o xray.zip xray -d xr
           ./xr/xray version | head -1
           python3 tools/diag/xray.py ./xr/xray
+      - name: Hysteria2 check
+        if: always()
+        run: |
+          curl -sSL -o hysteria https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64
+          chmod +x hysteria
+          ./hysteria version | head -3 || true
+          python3 tools/diag/hy2.py ./hysteria
