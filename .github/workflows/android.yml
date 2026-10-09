@@ -4,7 +4,29 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths:
+      - "android/**"
+      - "core/**"
+      - "mobile/**"
+      - "xrayout/**"
+      - "go.mod"
+      - "patches/**"
+      - "scripts/**"
+      - "tools/rules/**"
+      - "Makefile"
+      - ".github/workflows/android.yml"
   pull_request:
+    paths:
+      - "android/**"
+      - "core/**"
+      - "mobile/**"
+      - "xrayout/**"
+      - "go.mod"
+      - "patches/**"
+      - "scripts/**"
+      - "tools/rules/**"
+      - "Makefile"
+      - ".github/workflows/android.yml"
   workflow_dispatch:
 
 permissions:
