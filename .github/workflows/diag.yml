@@ -1,0 +1,38 @@
+name: Diagnose
+
+# Manual check of a subscription: every server with the Vela core and with
+# Xray-core, from a GitHub runner. Results are annotations (no keys).
+on:
+  workflow_dispatch:
+    inputs:
+      sub:
+        description: Subscription URL
+        required: true
+      ua:
+        description: User-Agent (optional)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Prepare core
+        run: ./scripts/prepare-core.sh && go mod tidy
+      - name: Vela check
+        env:
+          SUB_URL: ${{ inputs.sub }}
+          SUB_UA: ${{ inputs.ua }}
+        run: go run -tags "with_gvisor,with_quic,with_utls,with_clash_api" ./tools/diag
+      - name: Xray check
+        run: |
+          curl -sSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q -o xray.zip xray -d xr
+          ./xr/xray version | head -1
+          python3 tools/diag/xray.py ./xr/xray
