@@ -538,7 +538,7 @@ final class Store: ObservableObject {
     /// Real request through every server using a temporary core in the app.
     /// Call while the VPN is off; reasons for failures are reported.
     /// Set by «Остановить»: failures that arrive after it are not real.
-    var stopRequested = false
+    nonisolated(unsafe) var stopRequested = false
 
     func probeOffline(_ profile: Profile) async {
         guard probe == nil else { return }
