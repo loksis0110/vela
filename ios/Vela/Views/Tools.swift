@@ -357,3 +357,43 @@ struct Chip: View {
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 }
+
+// MARK: - Diagnostics
+
+struct DiagnosticsSheet: View {
+    @EnvironmentObject var tunnel: TunnelManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = "Собираем…"
+    @State private var copied = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Если VPN не подключается, нажмите «Подключить», дождитесь ошибки и откройте этот отчёт. Скопируйте его и пришлите разработчику. Ключей и адресов серверов в нём нет.")
+                        .font(.footnote).foregroundStyle(Palette.muted)
+                    Text(text)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(Palette.ink, in: RoundedRectangle(cornerRadius: 12))
+                }
+                .padding(16)
+            }
+            .background(Palette.deep.ignoresSafeArea())
+            .navigationTitle("Диагностика")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Закрыть") { dismiss() } }
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button(copied ? "Скопировано" : "Скопировать") { UIPasteboard.general.string = text; copied = true }
+                    Button { Task { text = await tunnel.diagnostics() } } label: { Image(systemName: "arrow.clockwise") }
+                        .accessibilityLabel("Обновить")
+                }
+            }
+        }
+        .tint(Palette.star)
+        .task { text = await tunnel.diagnostics() }
+    }
+}

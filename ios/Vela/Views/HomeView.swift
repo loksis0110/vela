@@ -6,6 +6,7 @@ struct HomeView: View {
     @Binding var showServers: Bool
     @Binding var showSettings: Bool
     @Binding var showAdd: Bool
+    @State private var showDiag = false
 
     var body: some View {
         ScrollView {
@@ -30,6 +31,7 @@ struct HomeView: View {
             .padding(.horizontal, 20)
             .frame(minHeight: UIScreen.main.bounds.height - 120)
         }
+        .sheet(isPresented: $showDiag) { DiagnosticsSheet() }
         .background(
             LinearGradient(stops: [.init(color: Palette.glow, location: 0), .init(color: Palette.ink, location: 0.45)],
                            startPoint: .top, endPoint: .bottom).ignoresSafeArea()
@@ -123,7 +125,10 @@ struct HomeView: View {
         HStack {
             Text(text).font(.subheadline)
             Spacer()
-            Button("Скрыть") { tunnel.error = nil }.foregroundStyle(Palette.muted)
+            VStack(spacing: 6) {
+                Button("Скрыть") { tunnel.error = nil }.foregroundStyle(Palette.muted)
+                Button("Отчёт") { showDiag = true }.foregroundStyle(Palette.star)
+            }
         }
         .padding(14)
         .background(Palette.danger.opacity(0.14), in: RoundedRectangle(cornerRadius: 14))

@@ -29,13 +29,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let dataPlaceholder = "__VELA_DATA__"
 
     override func startTunnel(options: [String: NSObject]?) async throws {
+        var step = "подготовка"
+        do {
+            try await start(options: options, step: &step)
+            note("ok: tunnel started")
+            log.info("tunnel started")
+        } catch {
+            // The app can't see the extension's errors by itself: keep the
+            // reason in a file (read through the App Group when it exists)
+            // and show it to the user directly.
+            let text = "Vela не подключилась (\(step)): \(error.localizedDescription)"
+            note("ERROR: " + text)
+            log.error("\(text, privacy: .public)")
+            displayMessage(text) { _ in }
+            throw TunnelError(text)
+        }
+    }
+
+    private func start(options: [String: NSObject]?, step: inout String) async throws {
         let base = dataURL
+        step = "папки"
         let working = base.appendingPathComponent("core", isDirectory: true)
         try? FileManager.default.createDirectory(at: working, withIntermediateDirectories: true)
+        try? Data().write(to: base.appendingPathComponent("start.log"))
+        note("start, data: \(base.path), app group: \(hasAppGroup)")
+        step = "правила маршрутизации"
         try installRules(into: base.appendingPathComponent("rules", isDirectory: true))
 
         // The app passes the config; when the system starts the tunnel by itself
         // (Connect On Demand, Settings) the last config saved here is used.
+        step = "конфигурация"
         let snapshot = base.appendingPathComponent("tunnel-config.json")
         if let config = options?["configContent"] as? String {
             configContent = config
@@ -43,27 +66,66 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         } else {
             configContent = try? String(contentsOf: snapshot, encoding: .utf8)
         }
-        guard configContent != nil else {
-            throw TunnelError("Откройте Vela и подключитесь из приложения")
+        guard let config = configContent else {
+            throw TunnelError("откройте Vela и подключитесь из приложения")
         }
+        note("config: \(config.utf8.count) bytes, memory: \(memoryMB()) MB")
         // a fresh log for every connection
         try? Data().write(to: base.appendingPathComponent("core.log"))
 
+        step = "запуск ядра"
         let setup = LibboxSetupOptions()
         setup.basePath = base.path
         setup.workingPath = working.path
         setup.tempPath = FileManager.default.temporaryDirectory.path
         setup.logMaxLines = 1000
         setup.oomKillerEnabled = true
+        // TCP instead of a unix socket: the socket path in the extension's own
+        // container (re-signed builds without App Group) is longer than the
+        // 104 characters iOS allows, and the core could not start at all.
+        setup.commandServerListenPort = Int32.random(in: 10000 ... 19999)
+        setup.commandServerSecret = UUID().uuidString
         var error: NSError?
         LibboxSetup(setup, &error)
-        if let error { throw TunnelError("setup: \(error.localizedDescription)") }
+        if let error { throw error }
 
+        step = "служба управления"
         commandServer = LibboxNewCommandServer(platform, platform, &error)
-        if let error { throw TunnelError("command server: \(error.localizedDescription)") }
+        if let error { throw error }
         try commandServer!.start()
+        step = "подключение к серверу"
         try startService()
-        log.info("tunnel started")
+        note("service started, memory: \(memoryMB()) MB")
+    }
+
+    private var hasAppGroup: Bool {
+        let group = Bundle.main.object(forInfoDictionaryKey: "AppGroupIdentifier") as? String ?? ""
+        return !group.isEmpty && FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil
+    }
+
+    /// Appends a line to start.log (shown in the app when the App Group works).
+    private func note(_ line: String) {
+        let url = dataURL.appendingPathComponent("start.log")
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let data = Data("\(stamp) \(line)\n".utf8)
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile()
+            h.write(data)
+            try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    private func memoryMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? Int(info.phys_footprint / 1_048_576) : -1
     }
 
     /// Rule sets for the "smart" mode ship inside the extension bundle.
@@ -113,6 +175,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             trimLog()
             return tailLog()
         }
+        if config == "vela:memory" { return Data("\(memoryMB())".utf8) }
         trimLog()
         let previous = configContent
         configContent = config

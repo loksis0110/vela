@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var proxy = ""
     @State private var showPrivacy = false
     @State private var showLogs = false
+    @State private var showDiag = false
     @State private var showImport = false
     @State private var sharing: ShareItem?
     @State private var message: String?
@@ -122,6 +123,7 @@ struct SettingsView: View {
                         Text("Сильная").tag("full")
                     }
                     Button("Журнал ядра") { showLogs = true }
+                    Button("Диагностика подключения") { showDiag = true }
                 }
                 Section {
                     ForEach($s.rules) { $rule in
@@ -154,6 +156,7 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Готово") { save(); dismiss() } } }
             .sheet(isPresented: $showLogs) { LogsSheet() }
+            .sheet(isPresented: $showDiag) { DiagnosticsSheet() }
             .sheet(item: $sharing) { item in ShareSheet(title: item.title, hint: item.hint, text: item.text) }
             .sheet(isPresented: $showImport) {
                 AddSheet(initial: "") { msg in

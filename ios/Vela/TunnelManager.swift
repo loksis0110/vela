@@ -133,11 +133,88 @@ final class TunnelManager: ObservableObject {
             state = .disconnected
             since = nil
             if was != .disconnected { ip = nil; ipError = nil }
+            if was != .disconnected, !userStopped {
+                // the tunnel stopped by itself: tell the user why
+                Task { await self.explainDisconnect() }
+            }
+            userStopped = false
             up = 0; down = 0; total = 0; activeNode = nil
             history = []
             statsTask?.cancel()
             watchTask?.cancel()
         }
+    }
+
+    /// Set when the user presses «Отключить», so that isn't reported as a failure.
+    private var userStopped = false
+    /// Why the last connection failed (for the diagnostics report).
+    @Published private(set) var lastFailure: String?
+
+    private func explainDisconnect() async {
+        guard let m = manager else { return }
+        let err: Error? = await withCheckedContinuation { c in
+            m.connection.fetchLastDisconnectError { c.resume(returning: $0) }
+        }
+        var text = err.map { e -> String in
+            let ns = e as NSError
+            return "\(ns.localizedDescription) [\(ns.domain) \(ns.code)]"
+        }
+        // the extension's own words, when the App Group lets us read them
+        if let log = try? String(contentsOf: Store.shared.dataURL.appendingPathComponent("start.log"), encoding: .utf8),
+           let line = log.split(separator: "\n").last(where: { $0.contains("ERROR:") }) {
+            text = String(line.components(separatedBy: "ERROR: ").last ?? String(line))
+        }
+        guard let text else { return }
+        lastFailure = text
+        error = "Не удалось подключиться: " + text
+    }
+
+    /// Everything useful for finding out why the VPN doesn't work.
+    func diagnostics() async -> String {
+        let store = Store.shared
+        var lines: [String] = []
+        let info = Bundle.main.infoDictionary ?? [:]
+        lines.append("Vela \(info["CFBundleShortVersionString"] ?? "?") (\(info["CFBundleVersion"] ?? "?")), iOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        let group = Bundle.main.object(forInfoDictionaryKey: "AppGroupIdentifier") as? String ?? ""
+        let hasGroup = !group.isEmpty && FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil
+        lines.append("App Group: \(hasGroup ? "есть" : "нет (подпись без группы, журнал запуска недоступен)")")
+        lines.append("Расширение VPN: \(Self.tunnelBundleID)")
+        let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
+        lines.append("Профилей VPN в iOS: \(managers.count)")
+        if let m = manager {
+            lines.append("Профиль включён: \(m.isEnabled), On Demand: \(m.isOnDemandEnabled), статус: \(m.connection.status.rawValue)")
+            let err: Error? = await withCheckedContinuation { c in m.connection.fetchLastDisconnectError { c.resume(returning: $0) } }
+            if let e = err as NSError? { lines.append("Последняя ошибка iOS: \(e.localizedDescription) [\(e.domain) \(e.code)]") }
+        } else {
+            lines.append("Профиль VPN ещё не создан")
+        }
+        if let f = lastFailure { lines.append("Последняя ошибка Vela: \(f)") }
+        if let p = store.state.active {
+            let sel = store.state.selectedNode
+            let name = p.nodes.first { $0.id == sel }?.name ?? "Автовыбор"
+            lines.append("Подписка: \(p.name), серверов: \(p.nodes.count), выбран: \(name)")
+            if let ms = store.pings[sel] { lines.append("Последняя проверка выбранного: \(ms > 0 ? "\(ms) мс" : (store.reasons[sel] ?? "не работает"))") }
+        }
+        do {
+            let cfg = try store.buildConfig(port: 1, secret: "x")
+            lines.append("Конфигурация: \(cfg.utf8.count / 1024) КБ, серверов в ней: \(cfg.components(separatedBy: "\"tag\": \"node-").count - 1)")
+        } catch {
+            lines.append("Конфигурация не собирается: \(error.localizedDescription)")
+        }
+        if state == .connected, let session = manager?.connection as? NETunnelProviderSession {
+            let mem: String = await withCheckedContinuation { c in
+                do {
+                    try session.sendProviderMessage(Data("vela:memory".utf8)) { c.resume(returning: $0.flatMap { String(data: $0, encoding: .utf8) } ?? "?") }
+                } catch { c.resume(returning: "?") }
+            }
+            lines.append("Память расширения: \(mem) МБ из ~50")
+        }
+        if let log = try? String(contentsOf: store.dataURL.appendingPathComponent("start.log"), encoding: .utf8), !log.isEmpty {
+            lines.append("")
+            lines.append("Журнал запуска:")
+            lines.append(log)
+        }
+        return lines.joined(separator: "\n")
     }
 
     private var lastWidgetStatus: NEVPNStatus?
@@ -175,6 +252,7 @@ final class TunnelManager: ObservableObject {
     func connect() async {
         error = nil
         notice = nil
+        userStopped = false
         startedHere = true
         do {
             let m = try await ensureManager()
@@ -190,6 +268,7 @@ final class TunnelManager: ObservableObject {
     }
 
     func disconnect() {
+        userStopped = true
         guard let m = manager else { return }
         if m.isOnDemandEnabled {
             // otherwise iOS would connect again right away
