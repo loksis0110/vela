@@ -186,6 +186,9 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 	}
 	firstErr := map[string]ProbeResult{}
 	run(nodes, parallel, func(r ProbeResult) {
+		if r.Delay <= 0 && ctx.Err() != nil {
+			return // stopped by the user: not a server failure
+		}
 		if r.Delay > 0 {
 			onResult(r)
 			return
@@ -197,6 +200,9 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 	})
 	// second pass for failures, slowly: tells real failures from overload
 	run(failed, 2, func(r ProbeResult) {
+		if r.Delay <= 0 && ctx.Err() != nil {
+			return
+		}
 		if r.Delay <= 0 && r.Error == "" {
 			r = firstErr[r.ID]
 		}

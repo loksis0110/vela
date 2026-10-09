@@ -12,7 +12,7 @@ struct ServersView: View {
     @State private var message: String?
     @State private var renaming: Profile?
     @State private var renameText = ""
-    @State private var fastestFirst = false
+    private var fastestFirst: Bool { store.state.sortByPing }
     @State private var query = ""
     @State private var onlyFav = false
     @State private var onlyOK = false
@@ -46,7 +46,11 @@ struct ServersView: View {
                 }
                 if let probe = store.probe {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Проверяем серверы: \(probe.done) из \(probe.total)").font(.footnote).foregroundStyle(Palette.muted)
+                        HStack {
+                            Text("Проверяем серверы: \(probe.done) из \(probe.total)").font(.footnote).foregroundStyle(Palette.muted)
+                            Spacer()
+                            Button("Остановить") { tunnel.stopProbe() }.font(.footnote).buttonStyle(.borderless)
+                        }
                         ProgressView(value: Double(probe.done), total: Double(max(1, probe.total))).tint(Palette.star)
                     }
                     .listRowBackground(Color.clear)
@@ -72,9 +76,20 @@ struct ServersView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Готово") { dismiss() } }
                 ToolbarItemGroup(placement: .primaryAction) {
-                    Button { Task { await check() } } label: { Image(systemName: "speedometer") }
-                        .disabled(store.probe != nil)
-                        .accessibilityLabel("Проверить все серверы")
+                    if store.state.profiles.contains(where: { $0.kind == "subscription" }) {
+                        Button { Task { await refreshCurrent() } } label: {
+                            if refreshing { ProgressView() } else { Image(systemName: "arrow.clockwise") }
+                        }
+                        .disabled(refreshing)
+                        .accessibilityLabel("Обновить подписку")
+                    }
+                    if store.probe != nil {
+                        Button { tunnel.stopProbe() } label: { Image(systemName: "stop.circle.fill").foregroundStyle(Palette.danger) }
+                            .accessibilityLabel("Остановить проверку")
+                    } else {
+                        Button { Task { await check() } } label: { Image(systemName: "speedometer") }
+                            .accessibilityLabel("Проверить все серверы")
+                    }
                     Button("Добавить") { showAdd = true }
                 }
             }
@@ -205,7 +220,7 @@ struct ServersView: View {
                         Chip(text: (country.isEmpty ? "Все страны" : "\(country) \(Fmt.country(country))") + " ▾", on: !country.isEmpty) {}.allowsHitTesting(false)
                     }
                 }
-                Chip(text: "Сначала быстрые", on: fastestFirst) { fastestFirst.toggle() }
+                Chip(text: "Сначала быстрые", on: fastestFirst) { store.setSortByPing(!fastestFirst) }
             }
             .padding(.horizontal, 16).padding(.vertical, 4)
         }
@@ -252,7 +267,8 @@ struct ServersView: View {
                 ping: Fmt.ping(store.pings[n.id]), selected: isActive && sel == n.id,
                 inUse: connected && tunnel.activeNode == n.id,
                 reason: (store.pings[n.id] ?? 0) < 0 ? store.reasons[n.id] : nil,
-                favorite: favs.contains(n.id), onFavorite: { store.setFavorite(n.id, !favs.contains(n.id)) }) { choose(p, n.id) }
+                favorite: favs.contains(n.id), onFavorite: { store.setFavorite(n.id, !favs.contains(n.id)) },
+                onPing: { Task { await tunnel.pingOne(profile: p.id, node: n.id) } }) { choose(p, n.id) }
                 .swipeActions {
                     if p.kind == "manual" {
                         Button("Удалить", role: .destructive) { store.deleteNode(profile: p.id, node: n.id) }
@@ -264,6 +280,7 @@ struct ServersView: View {
                         Label(favs.contains(n.id) ? "Убрать из избранного" : "В избранное", systemImage: favs.contains(n.id) ? "star.slash" : "star")
                     }
                     Button { share(Fmt.splitFlag(n.name).rest, n.link) } label: { Label("Поделиться", systemImage: "qrcode") }
+                    Button { Task { await tunnel.pingOne(profile: p.id, node: n.id) } } label: { Label("Проверить сервер", systemImage: "speedometer") }
                 }
         }
     }
@@ -288,7 +305,8 @@ struct ServersView: View {
     }
 
     private func row(badge: String, title: String, meta: String, ping: (String, Color)?, selected: Bool, inUse: Bool, reason: String?,
-                     favorite: Bool = false, onFavorite: (() -> Void)? = nil, action: @escaping () -> Void) -> some View {
+                     favorite: Bool = false, onFavorite: (() -> Void)? = nil, onPing: (() -> Void)? = nil,
+                     action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 12) {
                 Badge(text: badge, size: 36)
@@ -303,7 +321,21 @@ struct ServersView: View {
                     }
                 }
                 Spacer()
-                if let ping { Text(ping.0).font(.system(size: 13)).foregroundStyle(ping.1).monospacedDigit() }
+                // tap the delay (or the gauge) to check only this server
+                if let onPing {
+                    Button(action: onPing) {
+                        if let ping {
+                            Text(ping.0).font(.system(size: 13)).foregroundStyle(ping.1).monospacedDigit()
+                        } else {
+                            Image(systemName: "speedometer").foregroundStyle(Palette.line)
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .frame(minWidth: 32, minHeight: 32)
+                    .accessibilityLabel("Проверить сервер")
+                } else if let ping {
+                    Text(ping.0).font(.system(size: 13)).foregroundStyle(ping.1).monospacedDigit()
+                }
                 if let onFavorite {
                     Button(action: onFavorite) {
                         Image(systemName: favorite ? "star.fill" : "star")
@@ -344,6 +376,15 @@ struct ServersView: View {
             }
         }
         dismiss()
+    }
+
+    /// The refresh button: the subscription on screen, or all of them.
+    private func refreshCurrent() async {
+        if let p = profile, p.kind == "subscription" {
+            await refresh()
+        } else {
+            await refreshAll()
+        }
     }
 
     private func refresh() async {

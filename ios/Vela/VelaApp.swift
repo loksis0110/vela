@@ -28,6 +28,10 @@ func applyTheme(_ theme: String) {
     }
 }
 
+private enum LaunchState {
+    static var handled = false
+}
+
 struct RootView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var tunnel: TunnelManager
@@ -60,10 +64,7 @@ struct RootView: View {
                 }
             }
             .animation(.easeOut(duration: 0.2), value: toast)
-            .task {
-                await tunnel.load()
-                await store.refreshDue()
-            }
+            .task { await launchWork() }
             .onChange(of: phase) { p in
                 if p == .active { Task { await tunnel.load() } }
             }
@@ -76,6 +77,23 @@ struct RootView: View {
                 addText = text
                 showAdd = true
             }
+    }
+
+    @MainActor
+    private func launchWork() async {
+        await tunnel.load()
+        // «Подключаться при запуске»: once per app start
+        if !LaunchState.handled {
+            LaunchState.handled = true
+            if store.state.connectOnLaunch, tunnel.state == .disconnected, !store.state.profiles.isEmpty {
+                await tunnel.connect()
+            }
+        }
+        // subscriptions are refreshed while the app is open, as often as set
+        while !Task.isCancelled {
+            await store.refreshDue()
+            try? await Task.sleep(nanoseconds: 10 * 60 * 1_000_000_000)
+        }
     }
 
     private func done(_ message: String?) {

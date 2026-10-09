@@ -12,11 +12,29 @@ struct SettingsView: View {
     @State private var showImport = false
     @State private var sharing: ShareItem?
     @State private var message: String?
+    @State private var sub = SubPrefs()
+    @State private var confirmReset = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Подключение") {
+                    Toggle(isOn: Binding(get: { store.state.connectOnLaunch }, set: { store.setConnectOnLaunch($0) })) {
+                        VStack(alignment: .leading) {
+                            Text("Подключаться при запуске")
+                            Text("Vela подключится сама, когда вы её откроете").font(.caption).foregroundStyle(Palette.muted)
+                        }
+                    }
+                    Toggle(isOn: Binding(get: { store.state.alwaysOn }, set: { on in
+                        store.setAlwaysOn(on)
+                        Task { await tunnel.applyAlwaysOn() }
+                    })) {
+                        VStack(alignment: .leading) {
+                            Text("Постоянный VPN")
+                            Text("iOS сама восстановит подключение после смены сети или перезагрузки, пока вы не нажмёте «Отключить»")
+                                .font(.caption).foregroundStyle(Palette.muted)
+                        }
+                    }
                     Toggle(isOn: Binding(get: { !s.disableFailover }, set: { s.disableFailover = !$0 })) {
                         VStack(alignment: .leading) {
                             Text("Автопереключение при сбое")
@@ -31,6 +49,33 @@ struct SettingsView: View {
                         Text("Тёмная").tag("dark")
                     }
                     .pickerStyle(.segmented)
+                }
+                Section {
+                    Toggle(isOn: Binding(get: { !sub.noAutoUpdate }, set: { sub.noAutoUpdate = !$0; store.setSubPrefs(sub) })) {
+                        Text("Обновлять автоматически")
+                    }
+                    if !sub.noAutoUpdate {
+                        Picker("Как часто", selection: Binding(get: { sub.updateHours }, set: { sub.updateHours = $0; store.setSubPrefs(sub) })) {
+                            Text("Как у провайдера").tag(0)
+                            Text("Каждые 3 часа").tag(3)
+                            Text("Каждые 12 часов").tag(12)
+                            Text("Раз в сутки").tag(24)
+                        }
+                    }
+                    Toggle(isOn: Binding(get: { !sub.noHWID }, set: { sub.noHWID = !$0; store.setSubPrefs(sub) })) {
+                        VStack(alignment: .leading) {
+                            Text("Отправлять HWID")
+                            Text("Случайный номер этой установки, модель iPhone и версия iOS. Нужен провайдерам с лимитом устройств, личных данных нет")
+                                .font(.caption).foregroundStyle(Palette.muted)
+                        }
+                    }
+                    LabeledContent("User-Agent") {
+                        TextField("по умолчанию Vela", text: $sub.userAgent)
+                            .multilineTextAlignment(.trailing).textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .onSubmit { store.setSubPrefs(sub) }
+                    }
+                } header: { Text("Подписки") } footer: {
+                    Text("Меняйте User-Agent, только если провайдер просит определённый клиент. Затем обновите подписку.")
                 }
                 Section {
                     Button("Экспортировать") {
@@ -100,6 +145,7 @@ struct SettingsView: View {
                     Text("Vela \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""). Открытый исходный код под лицензией GPL-3.0. Vela не собирает статистику и не передаёт данные о вашем трафике.")
                         .font(.footnote).foregroundStyle(Palette.muted)
                     Button("Политика конфиденциальности") { showPrivacy = true }
+                    Button("Сбросить настройки", role: .destructive) { confirmReset = true }
                 }
             }
             .scrollContentBackground(.hidden)
@@ -123,6 +169,22 @@ struct SettingsView: View {
             .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
                 Button("OK", role: .cancel) {}
             }
+            .confirmationDialog("Сбросить настройки?", isPresented: $confirmReset, titleVisibility: .visible) {
+                Button("Сбросить", role: .destructive) {
+                    store.resetSettings()
+                    s = store.state.settings
+                    sub = store.state.sub
+                    direct = ""
+                    proxy = ""
+                    applyTheme(store.state.theme)
+                    Task {
+                        await tunnel.applyAlwaysOn()
+                        await tunnel.reload()
+                    }
+                }
+            } message: {
+                Text("Все настройки вернутся по умолчанию. Подписки, серверы и избранное останутся.")
+            }
             .alert("Конфиденциальность", isPresented: $showPrivacy) {
                 Button("Понятно", role: .cancel) {}
             } message: {
@@ -132,6 +194,7 @@ struct SettingsView: View {
         .tint(Palette.star)
         .onAppear {
             s = store.state.settings
+            sub = store.state.sub
             direct = s.directDomains.joined(separator: ", ")
             proxy = s.proxyDomains.joined(separator: ", ")
         }
@@ -145,6 +208,7 @@ struct SettingsView: View {
     }
 
     private func save() {
+        if sub != store.state.sub { store.setSubPrefs(sub) }
         var next = s
         next.directDomains = domains(direct)
         next.proxyDomains = domains(proxy)

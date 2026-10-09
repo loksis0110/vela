@@ -222,8 +222,49 @@ object VpnManager {
      * off a temporary core does it and reports the reason for each failure;
      * while connected the running core is asked through its controller.
      */
+    @Volatile private var stopRequested = false
+
+    /** Stops the server check; servers not checked yet keep no result. */
+    fun stopProbe() {
+        stopRequested = true
+        runCatching { Velacore.stopProbe() }
+    }
+
+    /** Checks one server (through the running core when it's connected). */
+    suspend fun pingOne(profileId: String, nodeId: String) = withContext(Dispatchers.IO) {
+        val st = Store.state.value
+        val profile = st.profiles.firstOrNull { it.id == profileId } ?: return@withContext
+        val node = profile.nodes.firstOrNull { it.id == nodeId } ?: return@withContext
+        Store.pings.update { it + (node.id to 0) }
+        Store.reasons.update { it - node.id }
+        var ms = -1
+        var reason = ""
+        var got = true
+        if (status.value.state == ConnState.Connected && profile.id == st.activeProfile) {
+            val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
+            ms = request("GET", "/proxies/${Velacore.nodeTag(node.id)}/delay?$q", timeoutMs = 11000)
+                ?.let { JSONObject(it).optInt("delay", -1) } ?: -1
+            if (ms <= 0) reason = "сервер не ответил"
+        } else {
+            val json = JSONArray().put(node.raw).toString()
+            got = false
+            runCatching {
+                Velacore.probeNodes(json, 9000, 1) { _, delay, r, _ -> ms = delay; reason = r; got = true }
+            }.onFailure { reason = "не удалось проверить"; got = true }
+        }
+        if (!got) {
+            // stopped before an answer
+            Store.pings.update { it - node.id }
+            return@withContext
+        }
+        Store.pings.update { it + (node.id to (if (ms > 0) ms else -1)) }
+        if (ms <= 0 && reason.isNotEmpty()) Store.reasons.update { it + (node.id to reason) }
+        Store.savePings()
+    }
+
     suspend fun pingAll(profileId: String? = null) = coroutineScope {
         if (probe.value != null) return@coroutineScope
+        stopRequested = false
         val st = Store.state.value
         val profile = st.profiles.firstOrNull { it.id == (profileId ?: st.activeProfile) } ?: st.active ?: return@coroutineScope
         val nodes = profile.nodes
@@ -233,6 +274,7 @@ object VpnManager {
         var done = 0
         probe.value = 0 to nodes.size
         fun report(id: String, ms: Int, reason: String) {
+            if (stopRequested && ms <= 0) return
             Store.pings.update { it + (id to (if (ms > 0) ms else -1)) }
             if (ms <= 0 && reason.isNotEmpty()) Store.reasons.update { it + (id to reason) }
             synchronized(this@VpnManager) { done++ }
@@ -244,6 +286,7 @@ object VpnManager {
                 nodes.map { node ->
                     async(Dispatchers.IO) {
                         gate.withPermit {
+                            if (stopRequested) return@withPermit
                             val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
                             val ms = request("GET", "/proxies/${Velacore.nodeTag(node.id)}/delay?$q", timeoutMs = 11000)
                                 ?.let { JSONObject(it).optInt("delay", -1) } ?: -1
@@ -267,6 +310,9 @@ object VpnManager {
                 }
             }
         } finally {
+            // stopped: servers that weren't checked must not stay "measuring"
+            val ids = nodes.map { it.id }.toSet()
+            Store.pings.update { m -> m.filterNot { it.key in ids && it.value == 0 } }
             probe.value = null
             Store.savePings()
         }

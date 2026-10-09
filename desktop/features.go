@@ -322,3 +322,58 @@ func (a *App) importBackup(ctx context.Context, b core.Backup) (string, error) {
 func (a *App) Logs(limit int) []string {
 	return core.ReadLog(filepath.Join(a.dataDir, "core.log"), limit)
 }
+
+// StopPing stops the server check in progress.
+func (a *App) StopPing() {
+	a.mu.Lock()
+	stop := a.probeStop
+	a.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+// PingNode checks one server, through the running core when it belongs to
+// the connected profile, otherwise with a temporary core.
+func (a *App) PingNode(profileID, nodeID string) error {
+	a.mu.Lock()
+	p := a.findProfile(profileID)
+	if p == nil {
+		a.mu.Unlock()
+		return errors.New("профиль не найден")
+	}
+	n := a.findNode(p, nodeID)
+	if n == nil {
+		a.mu.Unlock()
+		return errors.New("сервер не найден")
+	}
+	node := *n
+	instance := a.instance
+	if a.state.ActiveProfile != profileID {
+		instance = nil
+	}
+	a.mu.Unlock()
+	a.pingsMu.Lock()
+	a.pings[node.ID] = 0
+	delete(a.reasons, node.ID)
+	a.pingsMu.Unlock()
+	a.broadcast("ping", map[string]any{"id": node.ID, "ms": 0})
+	var res core.ProbeResult
+	err := core.ProbeNodes(context.Background(), instance, []core.Node{node}, 9*time.Second, 1, func(r core.ProbeResult) { res = r })
+	ms := res.Delay
+	if ms <= 0 {
+		ms = -1
+	}
+	if err != nil && res.ID == "" {
+		res.Reason = core.ExplainError(err.Error())
+	}
+	a.pingsMu.Lock()
+	a.pings[node.ID] = ms
+	if ms < 0 && res.Reason != "" {
+		a.reasons[node.ID] = res.Reason
+	}
+	a.pingsMu.Unlock()
+	a.broadcast("ping", map[string]any{"id": node.ID, "ms": ms, "reason": res.Reason})
+	a.savePings()
+	return nil
+}

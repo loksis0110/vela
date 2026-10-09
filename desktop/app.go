@@ -58,6 +58,18 @@ type State struct {
 	Favorites []string `json:"favorites,omitempty"`
 	// "system" | "light" | "dark"
 	Theme string `json:"theme,omitempty"`
+	// Subscription download preferences (see SubPrefs).
+	Sub SubPrefs `json:"sub"`
+	// Random id of this installation sent as HWID when enabled.
+	HWID string `json:"hwid,omitempty"`
+}
+
+// SubPrefs are the subscription settings. Zero values are the defaults.
+type SubPrefs struct {
+	NoAutoUpdate bool   `json:"noAutoUpdate,omitempty"`
+	UpdateHours  int    `json:"updateHours,omitempty"` // 0: as the provider says (12 h if it doesn't)
+	NoHWID       bool   `json:"noHwid,omitempty"`
+	UserAgent    string `json:"userAgent,omitempty"`
 }
 
 // Status is pushed to the UI.
@@ -107,6 +119,8 @@ type App struct {
 	history  []TrafficPoint // last minutes of traffic, guarded by mu
 	speeding atomic.Bool
 
+	probeStop context.CancelFunc // stops a running server check, guarded by mu
+
 	// lifecycle serializes Connect, Disconnect and Reconnect; connGen
 	// (guarded by mu) changes on every Disconnect so a connect that is still
 	// starting knows it was cancelled.
@@ -121,7 +135,57 @@ func NewApp(dataDir string) *App {
 	a.status.State = "disconnected"
 	a.status.Elevated = isElevated()
 	a.loadPings()
+	if a.state.HWID == "" {
+		a.state.HWID = randomID() + randomID()
+		a.saveLocked()
+	}
+	a.applyFetchOptions()
 	return a
+}
+
+// applyFetchOptions passes the subscription settings to the core.
+func (a *App) applyFetchOptions() {
+	o := core.FetchOptions{UserAgent: a.state.Sub.UserAgent}
+	if !a.state.Sub.NoHWID {
+		o.HWID, o.DeviceOS, o.OSVersion, o.DeviceModel = a.state.HWID, deviceOS(), osVersion(), "PC"
+	}
+	core.SetFetchOptions(o)
+}
+
+// SetSubPrefs saves the subscription settings.
+func (a *App) SetSubPrefs(p SubPrefs) {
+	a.mu.Lock()
+	if p.UpdateHours < 0 || p.UpdateHours > 168 {
+		p.UpdateHours = 0
+	}
+	p.UserAgent = strings.TrimSpace(p.UserAgent)
+	a.state.Sub = p
+	a.applyFetchOptions()
+	a.saveLocked()
+	a.mu.Unlock()
+	a.pushState()
+}
+
+// ResetSettings returns settings to defaults; subscriptions, servers and
+// favorites stay.
+func (a *App) ResetSettings() {
+	a.mu.Lock()
+	mode := a.state.Settings.Mode
+	a.state.Settings = core.DefaultSettings()
+	if mode != "" {
+		a.state.Settings.Mode = mode // keeps admin-rights choice
+	}
+	a.state.Theme = ""
+	a.state.Sub = SubPrefs{}
+	a.state.ConnectOnLaunch = false
+	a.applyFetchOptions()
+	connected := a.status.State == "connected"
+	a.saveLocked()
+	a.mu.Unlock()
+	a.pushState()
+	if connected {
+		go a.Reconnect()
+	}
 }
 
 func (a *App) statePath() string { return filepath.Join(a.dataDir, "state.json") }
@@ -167,6 +231,7 @@ type Snapshot struct {
 	Theme           string            `json:"theme"`
 	History         []TrafficPoint    `json:"history"`
 	Onboarding      bool              `json:"onboarding"`
+	Sub             SubPrefs          `json:"sub"`
 }
 
 func (a *App) Snapshot() Snapshot {
@@ -197,6 +262,7 @@ func (a *App) Snapshot() Snapshot {
 		Favorites: append([]string{}, a.state.Favorites...), Theme: a.state.Theme,
 		History:    append([]TrafficPoint{}, a.history...),
 		Onboarding: !a.state.OnboardingPassed,
+		Sub:        a.state.Sub,
 	}
 }
 
@@ -525,11 +591,15 @@ func (a *App) AutoUpdate() {
 		a.mu.Lock()
 		var due []string
 		now := time.Now().Unix()
+		prefs := a.state.Sub
 		for _, p := range a.state.Profiles {
-			if p.Kind != "subscription" {
+			if p.Kind != "subscription" || prefs.NoAutoUpdate {
 				continue
 			}
 			interval := int64(p.Interval)
+			if prefs.UpdateHours > 0 {
+				interval = int64(prefs.UpdateHours)
+			}
 			if interval <= 0 {
 				interval = 12
 			}
@@ -543,7 +613,7 @@ func (a *App) AutoUpdate() {
 			a.UpdateProfile(ctx, id)
 			cancel()
 		}
-		time.Sleep(20 * time.Minute)
+		time.Sleep(10 * time.Minute)
 	}
 }
 
@@ -1029,6 +1099,16 @@ func (a *App) Ping(profileID string) {
 		return
 	}
 	defer a.probing.Store(false)
+	ctx, stop := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.probeStop = stop
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.probeStop = nil
+		a.mu.Unlock()
+		stop()
+	}()
 	a.mu.Lock()
 	p := a.findProfile(profileID)
 	if p == nil {
@@ -1053,7 +1133,7 @@ func (a *App) Ping(profileID string) {
 
 	results := map[string]core.ProbeResult{}
 	var mu sync.Mutex
-	err := core.ProbeNodes(context.Background(), instance, nodes, 9*time.Second, 12, func(r core.ProbeResult) {
+	err := core.ProbeNodes(ctx, instance, nodes, 9*time.Second, 12, func(r core.ProbeResult) {
 		ms := r.Delay
 		if ms <= 0 {
 			ms = -1
@@ -1074,6 +1154,19 @@ func (a *App) Ping(profileID string) {
 			a.broadcast("probe", map[string]int{"done": d, "total": total})
 		}
 	})
+	if errors.Is(err, context.Canceled) {
+		a.pingsMu.Lock()
+		for _, n := range nodes {
+			if a.pings[n.ID] == 0 {
+				delete(a.pings, n.ID)
+			}
+		}
+		a.pingsMu.Unlock()
+		a.broadcast("probe", map[string]any{"done": total, "total": total, "stopped": true})
+		a.pushState()
+		a.savePings()
+		return
+	}
 	if err != nil {
 		// servers that were not checked must not stay "measuring"
 		a.pingsMu.Lock()

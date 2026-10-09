@@ -65,3 +65,12 @@ func listProcesses() []string {
 	}
 	return list
 }
+
+func deviceOS() string {
+	if runtime.GOOS == "darwin" {
+		return "macOS"
+	}
+	return "Linux"
+}
+
+func osVersion() string { return "" }

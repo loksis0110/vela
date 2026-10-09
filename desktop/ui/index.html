@@ -113,6 +113,7 @@
       <button class="icon-btn back" data-close aria-label="Назад"><svg viewBox="0 0 24 24"><path d="m15 6-6 6 6 6"/></svg></button>
       <h2>Серверы</h2>
       <div class="sheet-actions">
+        <button class="icon-btn" id="refreshSub" title="Обновить подписку" aria-label="Обновить подписку"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.5L4 8"/><path d="M4 4v4h4"/><path d="M4 13a8 8 0 0 0 14.6 4.5L20 16"/><path d="M20 20v-4h-4"/></svg></button>
         <button class="icon-btn" id="pingAll" title="Проверить все серверы" aria-label="Проверить все серверы"><svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 1 1 16 0"/><path d="m12 16 4-6"/></svg></button>
         <button class="btn small" id="openAdd">Добавить</button>
       </div>
@@ -137,7 +138,7 @@
     </div>
     <p class="list-count" id="listCount"></p>
     <div class="probe" id="probeBar" hidden>
-      <span id="probeText"></span>
+      <div class="probe-head"><span id="probeText"></span><button type="button" class="link-btn" id="probeStop">Остановить</button></div>
       <div class="bar"><i id="probeFill"></i></div>
     </div>
     <ul class="nodes" id="nodeList"></ul>
@@ -184,6 +185,23 @@
           <p class="hint">Работает в режиме «Весь компьютер».</p>
         </div>
       </fieldset>
+      <fieldset id="subPrefs">
+        <legend>Подписки</legend>
+        <label class="switch"><span><b>Обновлять автоматически</b><em>Списки серверов обновляются сами, пока Vela открыта</em></span><input type="checkbox" data-sub="autoUpdate"><i></i></label>
+        <label class="field"><span>Как часто</span>
+          <select data-sub="updateHours">
+            <option value="0">Как задаёт провайдер</option>
+            <option value="1">Каждый час</option>
+            <option value="3">Каждые 3 часа</option>
+            <option value="6">Каждые 6 часов</option>
+            <option value="12">Каждые 12 часов</option>
+            <option value="24">Раз в сутки</option>
+          </select>
+        </label>
+        <label class="switch"><span><b>Отправлять HWID</b><em>Случайный номер этой установки, Windows и её версия. Нужен провайдерам с лимитом устройств, личных данных нет</em></span><input type="checkbox" data-sub="hwid"><i></i></label>
+        <label class="field"><span>User-Agent</span><input type="text" data-sub="userAgent" placeholder="по умолчанию Vela" spellcheck="false" autocomplete="off"></label>
+        <p class="hint">Меняйте User-Agent, только если провайдер просит определённый клиент. После изменения нажмите «Обновить» у подписки.</p>
+      </fieldset>
       <fieldset>
         <legend>Резервная копия</legend>
         <p class="hint">Подписки, свои серверы, избранное и настройки одним текстом или QR-кодом. Чтобы восстановить, вставьте его в окно «Добавить».</p>
@@ -229,6 +247,7 @@
         <div class="row-btns">
           <button type="button" class="btn ghost small" data-open="logs">Открыть логи</button>
           <button type="button" class="btn ghost small" data-open="privacy">Конфиденциальность</button>
+          <button type="button" class="btn ghost small" id="resetSettings">Сбросить настройки</button>
           <button type="button" class="btn danger small" id="quit">Выйти из Vela</button>
         </div>
       </fieldset>

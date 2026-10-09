@@ -23,8 +23,8 @@ android {
         applicationId = "app.vela.client"
         minSdk = 24
         targetSdk = 37
-        versionCode = 5
-        versionName = "1.2.1"
+        versionCode = 6
+        versionName = "1.3.0"
         base.archivesName.set("Vela-$versionName")
     }
 

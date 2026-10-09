@@ -98,3 +98,19 @@ func TestTidyLogLine(t *testing.T) {
 		t.Fatal("plain")
 	}
 }
+
+func TestFetchHeaders(t *testing.T) {
+	SetFetchOptions(FetchOptions{UserAgent: "Test/1", HWID: "abc", DeviceOS: "Android", OSVersion: "15", DeviceModel: "Pixel"})
+	defer SetFetchOptions(FetchOptions{})
+	h := http.Header{}
+	applyFetchHeaders(h)
+	if h.Get("User-Agent") != "Test/1" || h.Get("x-hwid") != "abc" || h.Get("x-device-model") != "Pixel" {
+		t.Fatal(h)
+	}
+	SetFetchOptions(FetchOptions{})
+	h = http.Header{}
+	applyFetchHeaders(h)
+	if h.Get("User-Agent") != UserAgent || h.Get("x-hwid") != "" {
+		t.Fatal(h)
+	}
+}

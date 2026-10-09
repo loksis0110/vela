@@ -12,7 +12,7 @@ let status = { state: "disconnected" };
 let pings = {};
 let reasons = {};          // node id -> why it failed
 let probe = null;          // {done,total} while servers are being checked
-let sortByPing = false;
+let sortByPing = (() => { try { return localStorage.getItem("vela-sort") === "ping"; } catch (_) { return false; } })();
 let viewProfile = null;   // profile shown in the servers sheet
 let favorites = new Set();
 const filters = { q: "", fav: false, ok: false, proto: "", country: "" };
@@ -78,13 +78,17 @@ function connectEvents() {
     } else if (msg.type === "probe") {
       const d = msg.data;
       probe = d.done < d.total ? d : null;
-      if (d.error) {
+      if (d.stopped) {
+        for (const id of Object.keys(pings)) if (pings[id] === 0) delete pings[id];
+        renderPings();
+        toast("Проверка остановлена");
+      } else if (d.error) {
         toast("Проверка не удалась: " + d.error, true);
         for (const id of Object.keys(pings)) if (pings[id] === 0) delete pings[id];
         renderPings();
       }
       renderProbe();
-      if (!probe && d.total && !d.error) {
+      if (!probe && d.total && !d.error && !d.stopped) {
         const p = snap && snap.profiles.find((x) => x.id === viewProfile);
         if (p) {
           const ok = p.nodes.filter((n) => pings[n.id] > 0).length;
@@ -276,6 +280,7 @@ function renderServers() {
     `<button role="tab" data-id="${esc(p.id)}" aria-selected="${p.id === viewProfile}">${p.id === snap.activeProfile ? '<i class="dot" aria-hidden="true"></i>' : ""}${esc(p.name)}<small>${p.nodes.length}</small></button>`
   ).join("") + `<button class="tab-add" data-act="add-sub" title="Добавить подписку">+ Подписка</button>`;
   tabs.hidden = snap.profiles.length === 0;
+  $("#refreshSub").hidden = !snap.profiles.some((p) => p.kind === "subscription");
   renderProfileInfo();
   renderNodes();
 }
@@ -363,6 +368,7 @@ function renderNodes() {
         }</span><span class="reason" data-reason="${esc(n.id)}">${esc(reasons[n.id] && pings[n.id] === -1 ? reasons[n.id] : "")}</span></span>
         <span class="ping ${pi.cls}" data-ping="${esc(n.id)}" title="${esc(reasons[n.id] || "")}">${pi.text}</span>
         <button class="icon-btn act ${favorites.has(n.id) ? "on" : ""}" data-fav="${esc(n.id)}" aria-pressed="${favorites.has(n.id)}" aria-label="Избранное" title="${favorites.has(n.id) ? "Убрать из избранного" : "В избранное"}"><svg viewBox="0 0 24 24"><path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.8l-5.2 2.8 1-5.8-4.3-4.1 5.9-.8z"/></svg></button>
+        <button class="icon-btn act" data-pingone="${esc(n.id)}" aria-label="Проверить сервер" title="Проверить только этот сервер"><svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 1 1 16 0"/><path d="m12 16 4-6"/></svg></button>
         <button class="icon-btn act" data-share="${esc(n.id)}" aria-label="Поделиться" title="Поделиться: QR-код и ссылка"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 18h2v2h-2zM18 14h2M14 18h2"/></svg></button>
         ${p.kind === "manual" ? `<button class="icon-btn del" data-del="${esc(n.id)}" aria-label="Удалить сервер" title="Удалить"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>` : ""}
         ${selected ? check : ""}
@@ -399,7 +405,18 @@ function renderProbe() {
     $("#probeText").textContent = `Проверяем серверы: ${probe.done} из ${probe.total}`;
     $("#probeFill").style.width = ((probe.done / Math.max(1, probe.total)) * 100).toFixed(1) + "%";
   }
-  $("#pingAll").disabled = !!probe;
+  // while checking, the button stops the check
+  const b = $("#pingAll");
+  b.classList.toggle("stop", !!probe);
+  b.title = probe ? "Остановить проверку" : "Проверить все серверы";
+  b.setAttribute("aria-label", b.title);
+  b.innerHTML = probe
+    ? '<svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>'
+    : '<svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 1 1 16 0"/><path d="m12 16 4-6"/></svg>';
+}
+
+function stopProbe() {
+  api("ping/stop").catch((e) => toast(e.message, true));
 }
 
 // ------------------------------------------------------------------ filters
@@ -588,7 +605,41 @@ async function decodeQRFile(file) {
 const listFields = ["directDomains", "proxyDomains"];
 let fillingSettings = false;
 
+function fillSubPrefs() {
+  const box = $("#subPrefs");
+  if (!box || !snap || box.contains(document.activeElement) && document.activeElement.type === "text") return;
+  const sp = snap.sub || {};
+  box.querySelector("[data-sub=autoUpdate]").checked = !sp.noAutoUpdate;
+  box.querySelector("[data-sub=updateHours]").value = String(sp.updateHours || 0);
+  box.querySelector("[data-sub=updateHours]").disabled = !!sp.noAutoUpdate;
+  box.querySelector("[data-sub=hwid]").checked = !sp.noHwid;
+  box.querySelector("[data-sub=userAgent]").value = sp.userAgent || "";
+}
+
+function saveSubPrefs() {
+  const box = $("#subPrefs");
+  const v = (k) => box.querySelector(`[data-sub=${k}]`);
+  const prefs = {
+    noAutoUpdate: !v("autoUpdate").checked,
+    updateHours: +v("updateHours").value || 0,
+    noHwid: !v("hwid").checked,
+    userAgent: v("userAgent").value.trim(),
+  };
+  v("updateHours").disabled = prefs.noAutoUpdate;
+  api("subprefs", prefs).catch((e) => toast(e.message, true));
+}
+
+// subscription settings have their own endpoint and don't touch the VPN
+$("#subPrefs").addEventListener("input", (e) => e.stopPropagation());
+$("#subPrefs").addEventListener("change", (e) => { e.stopPropagation(); saveSubPrefs(); });
+
+$("#resetSettings").addEventListener("click", async () => {
+  if (!confirm("Вернуть все настройки по умолчанию? Подписки, серверы и избранное останутся.")) return;
+  try { toast((await api("settings/reset")).message || "Настройки сброшены"); } catch (e) { toast(e.message, true); }
+});
+
 function fillSettings() {
+  fillSubPrefs();
   const f = $("#settingsForm");
   if (f.contains(document.activeElement) && document.activeElement.matches("input:not([type=checkbox]):not([type=radio]), textarea")) return;
   fillingSettings = true;
@@ -784,6 +835,15 @@ $("#nodeList").addEventListener("click", async (e) => {
     api("favorite", { node: id, on }).catch((err) => toast(err.message, true));
     return;
   }
+  const one = e.target.closest("[data-pingone]");
+  if (one) {
+    e.stopPropagation();
+    pings[one.dataset.pingone] = 0;
+    delete reasons[one.dataset.pingone];
+    renderPings();
+    api("ping/node", { profile: viewProfile, node: one.dataset.pingone }).catch((err) => toast(err.message, true));
+    return;
+  }
   const sh = e.target.closest("[data-share]");
   if (sh) {
     e.stopPropagation();
@@ -807,8 +867,21 @@ $("#nodeList").addEventListener("click", async (e) => {
   } catch (err) { toast(err.message, true); }
 });
 
+$("#probeStop").addEventListener("click", stopProbe);
+$("#refreshSub").addEventListener("click", async () => {
+  const p = snap && snap.profiles.find((x) => x.id === viewProfile);
+  const b = $("#refreshSub");
+  if (b.disabled) return;
+  b.disabled = true; b.classList.add("spin");
+  try {
+    if (p && p.kind === "subscription") { await api("profile/update", { id: p.id }); toast("Подписка обновлена"); }
+    else toast((await api("profile/update-all")).message || "Подписки обновлены");
+  } catch (e) { toast(e.message, true); }
+  finally { b.disabled = false; b.classList.remove("spin"); }
+});
 $("#pingAll").addEventListener("click", () => {
-  if (!viewProfile || probe) return;
+  if (probe) return stopProbe();
+  if (!viewProfile) return;
   const p = snap.profiles.find((x) => x.id === viewProfile);
   if (!p) return;
   p.nodes.forEach((n) => { pings[n.id] = 0; delete reasons[n.id]; });
@@ -820,6 +893,7 @@ $("#pingAll").addEventListener("click", () => {
 
 $("#sortToggle").addEventListener("click", () => {
   sortByPing = !sortByPing;
+  try { localStorage.setItem("vela-sort", sortByPing ? "ping" : ""); } catch (_) {}
   $("#sortToggle").setAttribute("aria-pressed", String(sortByPing));
   renderNodes();
 });

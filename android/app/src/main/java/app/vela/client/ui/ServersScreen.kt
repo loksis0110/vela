@@ -27,11 +27,14 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.QrCode2
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.StarBorder
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ButtonDefaults
@@ -86,12 +89,15 @@ fun ServersScreen(
     refreshing: Boolean,
     onFavorite: (nodeId: String, on: Boolean) -> Unit,
     onShare: (title: String, text: String) -> Unit,
+    onStopProbe: () -> Unit,
+    onPingOne: (profileId: String, nodeId: String) -> Unit,
+    onSort: (Boolean) -> Unit,
 ) {
     var viewId by rememberSaveable { mutableStateOf(app.active?.id ?: "") }
     val profile = app.profiles.firstOrNull { it.id == viewId } ?: app.active
     var confirmDelete by remember { mutableStateOf<Profile?>(null) }
     var renaming by remember { mutableStateOf<Profile?>(null) }
-    var fastestFirst by rememberSaveable { mutableStateOf(false) }
+    val fastestFirst = app.sortByPing
     var query by rememberSaveable { mutableStateOf("") }
     var onlyFav by rememberSaveable { mutableStateOf(false) }
     var onlyOk by rememberSaveable { mutableStateOf(false) }
@@ -120,8 +126,21 @@ fun ServersScreen(
         Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Назад") }
             Text("Серверы", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-            IconButton(onClick = { profile?.let { onPing(it.id) } }, enabled = profile != null && probe == null) {
-                Icon(Icons.Rounded.Speed, "Проверить все серверы", tint = Vela.Muted)
+            if (app.profiles.any { it.kind == "subscription" }) {
+                IconButton(
+                    onClick = { if (profile?.kind == "subscription") onRefresh(profile) else onRefreshAll() },
+                    enabled = !refreshing,
+                ) {
+                    if (refreshing) CircularProgressIndicator(Modifier.size(18.dp), color = Vela.Muted, strokeWidth = 2.dp)
+                    else Icon(Icons.Rounded.Refresh, "Обновить подписку", tint = Vela.Muted)
+                }
+            }
+            if (probe != null) {
+                IconButton(onClick = onStopProbe) { Icon(Icons.Rounded.Stop, "Остановить проверку", tint = Vela.Danger) }
+            } else {
+                IconButton(onClick = { profile?.let { onPing(it.id) } }, enabled = profile != null) {
+                    Icon(Icons.Rounded.Speed, "Проверить все серверы", tint = Vela.Muted)
+                }
             }
             Button(
                 onClick = onAdd,
@@ -166,7 +185,10 @@ fun ServersScreen(
         }
         probe?.let { (done, total) ->
             Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                Text("Проверяем серверы: $done из $total", color = Vela.Muted, fontSize = 13.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Проверяем серверы: $done из $total", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onStopProbe) { Text("Остановить", color = Vela.Star, fontSize = 13.sp) }
+                }
                 LinearProgressIndicator(
                     progress = { if (total == 0) 0f else done.toFloat() / total },
                     color = Vela.Star, trackColor = Vela.Hull, drawStopIndicator = {},
@@ -215,7 +237,7 @@ fun ServersScreen(
                         }
                     }
                 }
-                Chip("Сначала быстрые", fastestFirst) { fastestFirst = !fastestFirst }
+                Chip("Сначала быстрые", fastestFirst) { onSort(!fastestFirst) }
             }
         }
 
@@ -313,6 +335,7 @@ fun ServersScreen(
                     favorite = n.id in app.favorites,
                     onFavorite = { onFavorite(n.id, n.id !in app.favorites) },
                     onShare = { onShare(splitFlag(n.name).second, n.raw.optString("link")) },
+                    onPing = { onPingOne(profile.id, n.id) },
                 )
             }
         }
@@ -424,6 +447,7 @@ private fun NodeRow(
     onFavorite: (() -> Unit)? = null,
     onShare: (() -> Unit)? = null,
     meta2: String? = null,
+    onPing: (() -> Unit)? = null,
 ) {
     Row(
         Modifier
@@ -446,7 +470,18 @@ private fun NodeRow(
             }
             if (!reason.isNullOrBlank()) Text(reason, color = Vela.Danger, fontSize = 12.sp, maxLines = 2)
         }
-        ping?.let { Text(it.text, color = it.color, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp)) }
+        // tap the delay (or the gauge) to check only this server
+        when {
+            ping != null && onPing != null -> Text(
+                ping.text, color = ping.color, fontSize = 13.sp,
+                modifier = Modifier.padding(start = 4.dp).clip(RoundedCornerShape(8.dp))
+                    .clickable(onClickLabel = "Проверить сервер", onClick = onPing).padding(horizontal = 6.dp, vertical = 6.dp),
+            )
+            ping != null -> Text(ping.text, color = ping.color, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp))
+            onPing != null -> IconButton(onClick = onPing, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Rounded.Speed, "Проверить сервер", tint = Vela.Line, modifier = Modifier.size(18.dp))
+            }
+        }
         if (onFavorite != null) {
             IconButton(onClick = onFavorite, modifier = Modifier.size(36.dp)) {
                 Icon(

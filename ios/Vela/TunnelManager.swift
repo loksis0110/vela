@@ -159,6 +159,11 @@ final class TunnelManager: ObservableObject {
         m.protocolConfiguration = proto
         m.localizedDescription = "Vela"
         m.isEnabled = true
+        // «Постоянный VPN»: iOS brings the tunnel back after network changes and restarts
+        let connect = NEOnDemandRuleConnect()
+        connect.interfaceTypeMatch = .any
+        m.onDemandRules = [connect]
+        m.isOnDemandEnabled = Store.shared.state.alwaysOn
         // iOS asks the user to allow adding the VPN configuration here the first time.
         try await m.saveToPreferences()
         try await m.loadFromPreferences()
@@ -185,7 +190,26 @@ final class TunnelManager: ObservableObject {
     }
 
     func disconnect() {
-        manager?.connection.stopVPNTunnel()
+        guard let m = manager else { return }
+        if m.isOnDemandEnabled {
+            // otherwise iOS would connect again right away
+            m.isOnDemandEnabled = false
+            Task {
+                try? await m.saveToPreferences()
+                m.connection.stopVPNTunnel()
+            }
+        } else {
+            m.connection.stopVPNTunnel()
+        }
+    }
+
+    /// Applies «Постоянный VPN» to the saved VPN configuration.
+    func applyAlwaysOn() async {
+        guard let m = manager else { return }
+        let want = Store.shared.state.alwaysOn && state != .disconnected
+        guard m.isOnDemandEnabled != want else { return }
+        m.isOnDemandEnabled = want
+        try? await m.saveToPreferences()
     }
 
     /// Applies new settings or another profile without dropping the tunnel.
@@ -382,6 +406,31 @@ final class TunnelManager: ObservableObject {
     /// Real check of every server of a profile. While disconnected the app
     /// runs a temporary core and shows why each failing server fails; while
     /// connected the running core is asked through its controller.
+    /// Stops the server check in progress.
+    func stopProbe() {
+        Store.shared.stopRequested = true
+        VelacoreStopProbe()
+    }
+
+    /// Checks one server: through the running core when it's in use, otherwise
+    /// with a temporary core.
+    func pingOne(profile profileID: String, node nodeID: String) async {
+        let store = Store.shared
+        guard let p = store.state.profiles.first(where: { $0.id == profileID }),
+              let n = p.nodes.first(where: { $0.id == nodeID }) else { return }
+        if state == .connected, p.id == store.state.activeProfile {
+            store.pings[n.id] = 0
+            store.reasons[n.id] = nil
+            let r = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=8000", timeout: 11)
+            let ms = (r?["delay"] as? NSNumber)?.intValue ?? -1
+            store.pings[n.id] = ms > 0 ? ms : -1
+            if ms <= 0 { store.reasons[n.id] = "сервер не ответил" }
+            store.savePings()
+        } else {
+            await store.probeOne(n)
+        }
+    }
+
     func pingAll(_ profileID: String? = nil) async {
         let store = Store.shared
         guard let profile = store.state.profiles.first(where: { $0.id == (profileID ?? store.state.activeProfile) }) ?? store.state.active,
@@ -397,11 +446,12 @@ final class TunnelManager: ObservableObject {
         }
         for n in profile.nodes { store.pings[n.id] = 0; store.reasons[n.id] = nil }
         store.probe = (0, profile.nodes.count)
+        store.stopRequested = false
         await withTaskGroup(of: (String, Int).self) { group in
             var started = 0
             var iterator = profile.nodes.makeIterator()
             func addNext() {
-                guard let n = iterator.next() else { return }
+                guard !store.stopRequested, let n = iterator.next() else { return }
                 started += 1
                 group.addTask {
                     let path = "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=8000"
@@ -411,12 +461,14 @@ final class TunnelManager: ObservableObject {
             }
             for _ in 0 ..< 12 { addNext() }
             for await (id, ms) in group {
+                if ms <= 0, store.stopRequested { store.pings[id] = nil; continue }
                 store.pings[id] = ms > 0 ? ms : -1
                 if ms <= 0 { store.reasons[id] = "сервер не ответил" }
                 if let p = store.probe { store.probe = (p.done + 1, p.total) }
                 addNext()
             }
         }
+        for n in profile.nodes where store.pings[n.id] == 0 { store.pings[n.id] = nil }
         store.probe = nil
         store.savePings()
     }

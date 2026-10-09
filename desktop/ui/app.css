@@ -318,6 +318,8 @@ svg { display: block; }
 .icon-btn:disabled { opacity: .45; cursor: default; }
 
 .probe { padding: 0 16px 8px; font-size: 13px; color: var(--muted); }
+.probe-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.probe-head .link-btn { padding: 2px 6px; }
 .probe .bar { margin: 6px 0 0; }
 .probe .bar i { transition: width .3s ease; }
 
@@ -578,3 +580,9 @@ svg { display: block; }
   background: color-mix(in srgb, var(--sea) 12%, var(--deep));
   border-color: color-mix(in srgb, var(--sea) 40%, transparent);
 }
+
+/* ---------- refresh / stop ---------- */
+#refreshSub.spin svg { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#pingAll.stop { color: var(--danger); }
+#pingAll.stop svg rect { fill: currentColor; stroke: none; }

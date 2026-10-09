@@ -6,7 +6,9 @@ package velacore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/velaapp/vela/core"
@@ -79,10 +81,50 @@ func ProbeNodes(nodesJSON string, timeoutMs int32, parallel int32, handler Probe
 	if err := json.Unmarshal([]byte(nodesJSON), &nodes); err != nil {
 		return err
 	}
-	return core.ProbeNodes(context.Background(), nil, nodes, time.Duration(timeoutMs)*time.Millisecond, int(parallel),
+	ctx, cancel := context.WithCancel(context.Background())
+	probeMu.Lock()
+	probeSeq++
+	id := probeSeq
+	probeCancels[id] = cancel
+	probeMu.Unlock()
+	defer func() {
+		probeMu.Lock()
+		delete(probeCancels, id)
+		probeMu.Unlock()
+		cancel()
+	}()
+	err := core.ProbeNodes(ctx, nil, nodes, time.Duration(timeoutMs)*time.Millisecond, int(parallel),
 		func(r core.ProbeResult) {
 			handler.OnResult(r.ID, int32(r.Delay), r.Reason, r.Error)
 		})
+	if errors.Is(err, context.Canceled) {
+		return nil // stopped by the user
+	}
+	return err
+}
+
+var (
+	probeMu      sync.Mutex
+	probeSeq     int
+	probeCancels = map[int]context.CancelFunc{}
+)
+
+// StopProbe stops running ProbeNodes calls; servers not checked yet get no result.
+func StopProbe() {
+	probeMu.Lock()
+	for _, c := range probeCancels {
+		c()
+	}
+	probeMu.Unlock()
+}
+
+// SetSubscriptionOptions sets how subscriptions are downloaded. JSON of
+// core.FetchOptions: {userAgent, hwid, deviceOs, osVersion, deviceModel}.
+func SetSubscriptionOptions(optionsJSON string) {
+	var o core.FetchOptions
+	if json.Unmarshal([]byte(optionsJSON), &o) == nil {
+		core.SetFetchOptions(o)
+	}
 }
 
 // ExplainError turns a core error message into a short Russian explanation.

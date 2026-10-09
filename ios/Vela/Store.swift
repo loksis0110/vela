@@ -120,6 +120,24 @@ struct VelaSettings: Codable, Equatable {
     }
 }
 
+/// Subscription settings. Zero values are the defaults.
+struct SubPrefs: Codable, Equatable {
+    var noAutoUpdate = false
+    /// 0: as the provider says (12 h if it doesn't).
+    var updateHours = 0
+    var noHWID = false
+    var userAgent = ""
+
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        noAutoUpdate = try c.decodeIfPresent(Bool.self, forKey: .noAutoUpdate) ?? false
+        updateHours = try c.decodeIfPresent(Int.self, forKey: .updateHours) ?? 0
+        noHWID = try c.decodeIfPresent(Bool.self, forKey: .noHWID) ?? false
+        userAgent = try c.decodeIfPresent(String.self, forKey: .userAgent) ?? ""
+    }
+}
+
 struct AppState: Codable {
     var profiles: [Profile] = []
     var activeProfile = ""
@@ -129,6 +147,13 @@ struct AppState: Codable {
     var favorites: [String] = []
     /// "system", "light" or "dark".
     var theme = "system"
+    var sub = SubPrefs()
+    /// Random id of this installation, sent as HWID when enabled.
+    var hwid = ""
+    var connectOnLaunch = false
+    /// iOS reconnects the VPN by itself (On Demand) until it's turned off in Vela.
+    var alwaysOn = false
+    var sortByPing = false
 
     var active: Profile? { profiles.first { $0.id == activeProfile } ?? profiles.first }
 
@@ -142,12 +167,25 @@ struct AppState: Codable {
         settings = try c.decodeIfPresent(VelaSettings.self, forKey: .settings) ?? VelaSettings()
         favorites = try c.decodeIfPresent([String].self, forKey: .favorites) ?? []
         theme = try c.decodeIfPresent(String.self, forKey: .theme) ?? "system"
+        sub = try c.decodeIfPresent(SubPrefs.self, forKey: .sub) ?? SubPrefs()
+        hwid = try c.decodeIfPresent(String.self, forKey: .hwid) ?? ""
+        connectOnLaunch = try c.decodeIfPresent(Bool.self, forKey: .connectOnLaunch) ?? false
+        alwaysOn = try c.decodeIfPresent(Bool.self, forKey: .alwaysOn) ?? false
+        sortByPing = try c.decodeIfPresent(Bool.self, forKey: .sortByPing) ?? false
     }
 }
 
 struct CoreError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
+}
+
+/// Holds a result written from the core's thread.
+private final class ResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: (Int, String)?
+    func set(_ v: (Int, String)) { lock.lock(); value = v; lock.unlock() }
+    func get() -> (Int, String)? { lock.lock(); defer { lock.unlock() }; return value }
 }
 
 /// Bridges Go probe callbacks to Swift.
@@ -191,6 +229,11 @@ final class Store: ObservableObject {
             }
             state = st
         }
+        if state.hwid.isEmpty {
+            state.hwid = Self.randomID(16)
+            persist(state)
+        }
+        applyFetchOptions()
         if let data = try? Data(contentsOf: dataURL.appendingPathComponent("pings.json")),
            let saved = try? JSONDecoder().decode([String: Int].self, from: data) {
             pings = saved.filter { $0.value != 0 }
@@ -208,6 +251,10 @@ final class Store: ObservableObject {
         var next = state
         change(&next)
         state = next
+        persist(next)
+    }
+
+    private func persist(_ next: AppState) {
         if let data = try? JSONEncoder().encode(next) {
             // keys stay out of iCloud/iTunes backups
             try? data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
@@ -333,9 +380,11 @@ final class Store: ObservableObject {
     }
 
     func refreshDue() async {
+        if state.sub.noAutoUpdate { return }
         let now = Int64(Date().timeIntervalSince1970)
         for p in state.profiles where p.kind == "subscription" {
-            let interval = Int64(p.intervalHours > 0 ? p.intervalHours : 12)
+            let hours = state.sub.updateHours > 0 ? state.sub.updateHours : (p.intervalHours > 0 ? p.intervalHours : 12)
+            let interval = Int64(hours)
             if now - p.updatedAt > interval * 3600 { try? await refresh(p.id) }
         }
     }
@@ -396,6 +445,49 @@ final class Store: ObservableObject {
 
     func setTheme(_ theme: String) { update { $0.theme = theme } }
 
+    func setSubPrefs(_ p: SubPrefs) {
+        var p = p
+        p.userAgent = p.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        update { $0.sub = p }
+        applyFetchOptions()
+    }
+
+    func setConnectOnLaunch(_ on: Bool) { update { $0.connectOnLaunch = on } }
+    func setAlwaysOn(_ on: Bool) { update { $0.alwaysOn = on } }
+    func setSortByPing(_ on: Bool) { update { $0.sortByPing = on } }
+
+    /// Settings back to defaults; subscriptions, servers and favorites stay.
+    func resetSettings() {
+        update { st in
+            st.settings = VelaSettings()
+            st.theme = "system"
+            st.sub = SubPrefs()
+            st.connectOnLaunch = false
+            st.alwaysOn = false
+        }
+        applyFetchOptions()
+    }
+
+    /// Passes the subscription settings to the core.
+    private func applyFetchOptions() {
+        var o: [String: Any] = ["userAgent": state.sub.userAgent]
+        if !state.sub.noHWID {
+            var sys = utsname()
+            uname(&sys)
+            let model = withUnsafeBytes(of: &sys.machine) { raw in
+                String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            o["hwid"] = state.hwid
+            o["deviceOs"] = "iOS"
+            o["osVersion"] = ProcessInfo.processInfo.operatingSystemVersionString
+                .replacingOccurrences(of: "Version ", with: "").components(separatedBy: " ").first ?? ""
+            o["deviceModel"] = model
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: o), let text = String(data: data, encoding: .utf8) {
+            VelacoreSetSubscriptionOptions(text)
+        }
+    }
+
     // MARK: - Backup
 
     /// Everything needed to set Vela up on another device, as text for a QR code.
@@ -445,14 +537,19 @@ final class Store: ObservableObject {
 
     /// Real request through every server using a temporary core in the app.
     /// Call while the VPN is off; reasons for failures are reported.
+    /// Set by «Остановить»: failures that arrive after it are not real.
+    var stopRequested = false
+
     func probeOffline(_ profile: Profile) async {
         guard probe == nil else { return }
+        stopRequested = false
         for n in profile.nodes { pings[n.id] = 0; reasons[n.id] = nil }
         probe = (0, profile.nodes.count)
         let nodesJSON = "[" + profile.nodes.map(\.raw).joined(separator: ",") + "]"
         let callback = ProbeCallback { id, ms, reason in
             Task { @MainActor in
                 let s = Store.shared
+                if ms <= 0, s.stopRequested { return }
                 s.pings[id] = ms > 0 ? ms : -1
                 if ms <= 0, !reason.isEmpty { s.reasons[id] = reason }
                 if let p = s.probe { s.probe = (p.done + 1, p.total) }
@@ -463,7 +560,7 @@ final class Store: ObservableObject {
             let ok = VelacoreProbeNodes(nodesJSON, 9000, 12, callback, &err)
             return !ok || err != nil
         }.value
-        if failed {
+        if failed, !stopRequested {
             // temporary core unavailable: fall back to TCP reachability
             for n in profile.nodes where (pings[n.id] ?? 0) == 0 {
                 let ms = await Task.detached { Int(VelacoreTCPPing(n.server, Int32(n.port))) }.value
@@ -472,7 +569,29 @@ final class Store: ObservableObject {
             }
         }
         try? await Task.sleep(nanoseconds: 200_000_000)
+        // stopped: servers that weren't checked must not stay "measuring"
+        for n in profile.nodes where pings[n.id] == 0 { pings[n.id] = nil }
         probe = nil
+        savePings()
+    }
+
+    /// Checks one server with a temporary core (VPN off).
+    func probeOne(_ node: Node) async {
+        pings[node.id] = 0
+        reasons[node.id] = nil
+        let box = ResultBox()
+        let callback = ProbeCallback { _, ms, reason in box.set((ms, reason)) }
+        let json = "[" + node.raw + "]"
+        _ = await Task.detached(priority: .userInitiated) {
+            var err: NSError?
+            return VelacoreProbeNodes(json, 9000, 1, callback, &err)
+        }.value
+        guard let (ms, reason) = box.get() else {
+            pings[node.id] = nil // stopped
+            return
+        }
+        pings[node.id] = ms > 0 ? ms : -1
+        if ms <= 0, !reason.isEmpty { reasons[node.id] = reason }
         savePings()
     }
 

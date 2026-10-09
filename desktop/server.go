@@ -130,6 +130,33 @@ func (s *Server) Serve(l net.Listener) error {
 		go s.app.Ping(req.Profile)
 		reply(w, "", nil)
 	}))
+	mux.HandleFunc("/api/ping/stop", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		s.app.StopPing()
+		reply(w, "", nil)
+	}))
+	mux.HandleFunc("/api/ping/node", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Profile string `json:"profile"`
+			Node    string `json:"node"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		go s.app.PingNode(req.Profile, req.Node)
+		reply(w, "", nil)
+	}))
+	mux.HandleFunc("/api/subprefs", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req SubPrefs
+		if !readJSON(w, r, &req) {
+			return
+		}
+		s.app.SetSubPrefs(req)
+		reply(w, "", nil)
+	}))
+	mux.HandleFunc("/api/settings/reset", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		s.app.ResetSettings()
+		reply(w, "Настройки сброшены", nil)
+	}))
 	mux.HandleFunc("/api/settings", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Settings        core.Settings `json:"settings"`

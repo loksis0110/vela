@@ -12,12 +12,61 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // UserAgent is sent when downloading subscriptions. Most panels
 // (Marzban, 3x-ui, Remnawave) return plain share links for it.
-var UserAgent = "Vela/1.0 (v2rayN-compatible)"
+var UserAgent = "Vela/1.3 (v2rayN-compatible)"
+
+// FetchOptions change how subscriptions are requested.
+type FetchOptions struct {
+	// UserAgent replaces the default one when not empty (some providers
+	// only answer known clients).
+	UserAgent string `json:"userAgent,omitempty"`
+	// HWID identifies this installation to panels that limit the number of
+	// devices (Remnawave: x-hwid). Empty: not sent.
+	HWID        string `json:"hwid,omitempty"`
+	DeviceOS    string `json:"deviceOs,omitempty"`
+	OSVersion   string `json:"osVersion,omitempty"`
+	DeviceModel string `json:"deviceModel,omitempty"`
+}
+
+var (
+	fetchMu   sync.RWMutex
+	fetchOpts FetchOptions
+)
+
+// SetFetchOptions applies to all following subscription downloads.
+func SetFetchOptions(o FetchOptions) {
+	fetchMu.Lock()
+	fetchOpts = o
+	fetchMu.Unlock()
+}
+
+func applyFetchHeaders(h http.Header) {
+	fetchMu.RLock()
+	o := fetchOpts
+	fetchMu.RUnlock()
+	ua := strings.TrimSpace(o.UserAgent)
+	if ua == "" {
+		ua = UserAgent
+	}
+	h.Set("User-Agent", ua)
+	if o.HWID != "" {
+		h.Set("x-hwid", o.HWID)
+		if o.DeviceOS != "" {
+			h.Set("x-device-os", o.DeviceOS)
+		}
+		if o.OSVersion != "" {
+			h.Set("x-ver-os", o.OSVersion)
+		}
+		if o.DeviceModel != "" {
+			h.Set("x-device-model", o.DeviceModel)
+		}
+	}
+}
 
 // Subscription is the result of downloading a subscription URL.
 type Subscription struct {
@@ -48,7 +97,7 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", UserAgent)
+	applyFetchHeaders(req.Header)
 	req.Header.Set("Accept", "*/*")
 	client := &http.Client{Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -62,6 +111,12 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		switch resp.StatusCode {
+		case http.StatusForbidden, http.StatusUnauthorized:
+			return nil, fmt.Errorf("сервер подписки отказал (%d). Возможно, нужен HWID или превышен лимит устройств", resp.StatusCode)
+		case http.StatusNotFound:
+			return nil, fmt.Errorf("подписка не найдена (404). Проверьте ссылку")
+		}
 		return nil, fmt.Errorf("сервер подписки ответил %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))

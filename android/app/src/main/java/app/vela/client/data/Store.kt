@@ -158,6 +158,25 @@ data class Settings(
 private fun JSONArray?.strings(): List<String> =
     if (this == null) emptyList() else (0 until length()).map { getString(it) }
 
+/** Subscription settings. Defaults: auto update as the provider says, HWID on. */
+data class SubPrefs(
+    val noAutoUpdate: Boolean = false,
+    /** 0: as the provider says (12 h if it doesn't). */
+    val updateHours: Int = 0,
+    val noHwid: Boolean = false,
+    val userAgent: String = "",
+) {
+    fun toJson(): JSONObject = JSONObject().put("noAutoUpdate", noAutoUpdate).put("updateHours", updateHours)
+        .put("noHwid", noHwid).put("userAgent", userAgent)
+
+    companion object {
+        fun from(o: JSONObject?) = if (o == null) SubPrefs() else SubPrefs(
+            noAutoUpdate = o.optBoolean("noAutoUpdate"), updateHours = o.optInt("updateHours"),
+            noHwid = o.optBoolean("noHwid"), userAgent = o.optString("userAgent"),
+        )
+    }
+}
+
 data class AppState(
     val profiles: List<Profile> = emptyList(),
     val activeProfile: String = "",
@@ -168,6 +187,12 @@ data class AppState(
     val favorites: Set<String> = emptySet(),
     /** "system", "light" or "dark". */
     val theme: String = "system",
+    val sub: SubPrefs = SubPrefs(),
+    /** Random id of this installation, sent as HWID when enabled. */
+    val hwid: String = "",
+    val connectOnLaunch: Boolean = false,
+    /** Servers sorted by the last check. */
+    val sortByPing: Boolean = false,
 ) {
     val active: Profile? get() = profiles.firstOrNull { it.id == activeProfile } ?: profiles.firstOrNull()
 }
@@ -194,6 +219,35 @@ object Store {
         file = File(dataDir, "state.json")
         _state.value = load()
         loadPings()
+        if (_state.value.hwid.isEmpty()) update { it.copy(hwid = randomId(16)) }
+        applyFetchOptions()
+    }
+
+    /** Passes the subscription settings to the core. */
+    private fun applyFetchOptions() {
+        val st = _state.value
+        val o = JSONObject().put("userAgent", st.sub.userAgent)
+        if (!st.sub.noHwid) {
+            o.put("hwid", st.hwid).put("deviceOs", "Android")
+                .put("osVersion", android.os.Build.VERSION.RELEASE ?: "")
+                .put("deviceModel", android.os.Build.MODEL ?: "")
+        }
+        runCatching { Velacore.setSubscriptionOptions(o.toString()) }
+    }
+
+    fun setSubPrefs(p: SubPrefs) {
+        update { it.copy(sub = p.copy(userAgent = p.userAgent.trim(), updateHours = p.updateHours.coerceIn(0, 168))) }
+        applyFetchOptions()
+    }
+
+    fun setConnectOnLaunch(on: Boolean) = update { it.copy(connectOnLaunch = on) }
+
+    fun setSortByPing(on: Boolean) = update { it.copy(sortByPing = on) }
+
+    /** Settings back to defaults; subscriptions, servers and favorites stay. */
+    fun resetSettings() {
+        update { it.copy(settings = Settings(), theme = "system", sub = SubPrefs(), connectOnLaunch = false) }
+        applyFetchOptions()
     }
 
     /** Core log of the current connection (shown in Settings). */
@@ -211,6 +265,10 @@ object Store {
             wasConnected = o.optBoolean("wasConnected"),
             favorites = o.optJSONArray("favorites").strings().toSet(),
             theme = o.optString("theme", "system"),
+            sub = SubPrefs.from(o.optJSONObject("sub")),
+            hwid = o.optString("hwid"),
+            connectOnLaunch = o.optBoolean("connectOnLaunch"),
+            sortByPing = o.optBoolean("sortByPing"),
         )
     }.getOrDefault(AppState())
 
@@ -242,6 +300,10 @@ object Store {
             .put("wasConnected", next.wasConnected)
             .put("favorites", JSONArray(next.favorites.toList()))
             .put("theme", next.theme)
+            .put("sub", next.sub.toJson())
+            .put("hwid", next.hwid)
+            .put("connectOnLaunch", next.connectOnLaunch)
+            .put("sortByPing", next.sortByPing)
         val tmp = File(file.parentFile, "state.json.tmp")
         tmp.writeText(o.toString())
         tmp.renameTo(file)
@@ -388,9 +450,15 @@ object Store {
 
     /** Refreshes subscriptions whose update interval has passed. */
     suspend fun refreshDue() {
+        val prefs = _state.value.sub
+        if (prefs.noAutoUpdate) return
         val now = System.currentTimeMillis() / 1000
         for (p in _state.value.profiles.filter { it.kind == "subscription" }) {
-            val interval = if (p.intervalHours > 0) p.intervalHours else 12
+            val interval = when {
+                prefs.updateHours > 0 -> prefs.updateHours
+                p.intervalHours > 0 -> p.intervalHours
+                else -> 12
+            }
             if (now - p.updatedAt > interval * 3600L) runCatching { refresh(p.id) }
         }
     }

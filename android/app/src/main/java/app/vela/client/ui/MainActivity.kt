@@ -51,7 +51,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import app.vela.client.data.Store
@@ -78,7 +80,15 @@ class MainActivity : ComponentActivity() {
         // link or a widget's «connect»
         val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
         if (savedInstanceState == null && !fromHistory) handleIntent(intent)
-        lifecycleScope.launch { Store.refreshDue() }
+        // subscriptions are refreshed while the app is open, as often as set
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (true) {
+                    Store.refreshDue()
+                    kotlinx.coroutines.delay(10 * 60 * 1000L)
+                }
+            }
+        }
         setContent {
             val st by Store.state.collectAsState()
             VelaTheme(st.theme) { App(incoming, connectRequest) }
@@ -113,6 +123,10 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class Screen { Home, Servers, Settings }
+
+private object LaunchState {
+    var handled = false
+}
 
 @Composable
 private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStateFlow<Boolean>) {
@@ -166,6 +180,14 @@ private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStat
     fun reconnectIfNeeded() {
         // the running service rebuilds its config in place
         if (VpnManager.status.value.state == ConnState.Connected) VpnManager.restart(context)
+    }
+
+    // «Подключаться при запуске»: once per app start, not on every rotation
+    LaunchedEffect(Unit) {
+        if (!LaunchState.handled) {
+            LaunchState.handled = true
+            if (app.connectOnLaunch && app.profiles.isNotEmpty() && VpnManager.status.value.state == ConnState.Disconnected) connect()
+        }
     }
 
     LaunchedEffect(wantConnect) {
@@ -288,6 +310,9 @@ private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStat
                 onShare = { title, text ->
                     share = Triple(title, "Отсканируйте QR-код в Vela или другом клиенте на другом устройстве.", text)
                 },
+                onStopProbe = { VpnManager.stopProbe() },
+                onPingOne = { pid, nid -> scope.launch { VpnManager.pingOne(pid, nid) } },
+                onSort = { Store.setSortByPing(it) },
             )
             Screen.Settings -> SettingsScreen(
                 settings = app.settings,
@@ -311,6 +336,15 @@ private fun App(incoming: MutableStateFlow<String?>, connectRequest: MutableStat
                         .onFailure { toast(it.message ?: "Не удалось") }
                 },
                 onImport = { addText = ""; addOpen = true },
+                sub = app.sub,
+                onSub = { Store.setSubPrefs(it) },
+                connectOnLaunch = app.connectOnLaunch,
+                onConnectOnLaunch = { Store.setConnectOnLaunch(it) },
+                onReset = {
+                    Store.resetSettings()
+                    reconnectIfNeeded()
+                    toast("Настройки сброшены")
+                },
             )
         }
     }

@@ -19,6 +19,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -54,6 +55,7 @@ import androidx.compose.ui.unit.sp
 import app.vela.client.BuildConfig
 import app.vela.client.data.Rule
 import app.vela.client.data.Settings
+import app.vela.client.data.SubPrefs
 
 @Composable
 fun SettingsScreen(
@@ -66,7 +68,16 @@ fun SettingsScreen(
     onTheme: (String) -> Unit,
     onExport: () -> Unit,
     onImport: () -> Unit,
+    sub: SubPrefs,
+    onSub: (SubPrefs) -> Unit,
+    connectOnLaunch: Boolean,
+    onConnectOnLaunch: (Boolean) -> Unit,
+    onReset: () -> Unit,
 ) {
+    var ua by rememberSaveable { mutableStateOf(sub.userAgent) }
+    var confirmReset by remember { mutableStateOf(false) }
+    val latestSub by rememberUpdatedState(sub)
+    DisposableEffect(Unit) { onDispose { if (ua.trim() != latestSub.userAgent) onSub(latestSub.copy(userAgent = ua.trim())) } }
     val context = LocalContext.current
     var picking by remember { mutableStateOf(false) }
     var logs by remember { mutableStateOf(false) }
@@ -113,6 +124,8 @@ fun SettingsScreen(
         }
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp)) {
             Group("Подключение") {
+                SwitchRow("Подключаться при запуске", "Vela подключится сама, когда вы её откроете", connectOnLaunch, onConnectOnLaunch)
+                Divider()
                 SwitchRow(
                     "Автопереключение при сбое", "Если сервер перестал отвечать, Vela сама перейдёт на рабочий",
                     !settings.disableFailover,
@@ -148,6 +161,30 @@ fun SettingsScreen(
                         names.ifEmpty { "Ни одного не выбрано" },
                     ) { picking = true }
                 }
+            }
+            Group("Подписки") {
+                SwitchRow("Обновлять автоматически", "Списки серверов обновляются при открытии приложения", !sub.noAutoUpdate) {
+                    onSub(sub.copy(noAutoUpdate = !it))
+                }
+                if (!sub.noAutoUpdate) {
+                    Text("Как часто", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
+                    Segmented(
+                        listOf("0" to "Как у провайдера", "3" to "3 ч", "12" to "12 ч", "24" to "Сутки"),
+                        sub.updateHours.toString(), { onSub(sub.copy(updateHours = it.toInt())) },
+                        Modifier.padding(vertical = 8.dp),
+                    )
+                }
+                Divider()
+                SwitchRow(
+                    "Отправлять HWID",
+                    "Случайный номер этой установки, модель телефона и версия Android. Нужен провайдерам с лимитом устройств, личных данных нет",
+                    !sub.noHwid,
+                ) { onSub(sub.copy(noHwid = !it)) }
+                Field("User-Agent", ua, "по умолчанию Vela") { ua = it }
+                Text(
+                    "Меняйте, только если провайдер просит определённый клиент. Затем обновите подписку.",
+                    color = Vela.Muted, fontSize = 12.sp, modifier = Modifier.padding(bottom = 6.dp),
+                )
             }
             Group("Резервная копия") {
                 Text(
@@ -228,6 +265,7 @@ fun SettingsScreen(
                     color = Vela.Muted, fontSize = 13.5.sp, modifier = Modifier.padding(vertical = 8.dp),
                 )
                 TextButton(onClick = onPrivacy) { Text("Политика конфиденциальности", color = Vela.Star) }
+                TextButton(onClick = { confirmReset = true }) { Text("Сбросить настройки", color = Vela.Danger) }
             }
         }
     }
@@ -247,6 +285,16 @@ fun SettingsScreen(
         )
     }
     if (logs) LogsDialog { logs = false }
+    if (confirmReset) {
+        AlertDialog(
+            onDismissRequest = { confirmReset = false },
+            containerColor = Vela.Deep,
+            title = { Text("Сбросить настройки?") },
+            text = { Text("Все настройки вернутся по умолчанию. Подписки, серверы и избранное останутся.") },
+            confirmButton = { TextButton(onClick = { confirmReset = false; onReset() }) { Text("Сбросить", color = Vela.Danger) } },
+            dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Отмена") } },
+        )
+    }
 }
 
 @Composable
