@@ -23,8 +23,8 @@ android {
         applicationId = "app.vela.client"
         minSdk = 24
         targetSdk = 37
-        versionCode = 8
-        versionName = "1.3.2"
+        versionCode = 9
+        versionName = "1.4.0"
         base.archivesName.set("Vela-$versionName")
     }
 
@@ -47,6 +47,21 @@ android {
         }
     }
 
+    // full: APKs for direct download (current behavior).
+    // play: Google Play build; ad blocking is off because Play's VpnService
+    // policy doesn't allow apps to manipulate ads. Nothing else differs.
+    flavorDimensions += "store"
+    productFlavors {
+        create("full") {
+            dimension = "store"
+            buildConfigField("boolean", "PLAY", "false")
+        }
+        create("play") {
+            dimension = "store"
+            buildConfigField("boolean", "PLAY", "true")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -65,7 +80,9 @@ android {
 
     splits {
         abi {
-            isEnable = true
+            // per-ABI APKs for direct download; App Bundles split by ABI on their
+            // own and can't be built with APK splits on (build them separately)
+            isEnable = gradle.startParameter.taskNames.none { it.contains("bundle", ignoreCase = true) }
             isUniversalApk = true
             reset()
             include("arm64-v8a", "armeabi-v7a")

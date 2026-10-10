@@ -48,6 +48,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,13 +58,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.vela.client.R
 import app.vela.client.data.AppState
+import app.vela.client.data.Store
 import app.vela.client.data.Node
 import app.vela.client.data.Profile
 import app.vela.client.vpn.ConnState
@@ -124,22 +128,22 @@ fun ServersScreen(
 
     Column(Modifier.fillMaxSize().background(Vela.Ink).safeDrawingPadding()) {
         Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Назад") }
-            Text("Серверы", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, stringResource(R.string.back)) }
+            Text(stringResource(R.string.servers_title), style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
             if (app.profiles.any { it.kind == "subscription" }) {
                 IconButton(
                     onClick = { if (profile?.kind == "subscription") onRefresh(profile) else onRefreshAll() },
                     enabled = !refreshing,
                 ) {
                     if (refreshing) CircularProgressIndicator(Modifier.size(18.dp), color = Vela.Muted, strokeWidth = 2.dp)
-                    else Icon(Icons.Rounded.Refresh, "Обновить подписку", tint = Vela.Muted)
+                    else Icon(Icons.Rounded.Refresh, stringResource(R.string.refresh_subscription), tint = Vela.Muted)
                 }
             }
             if (probe != null) {
-                IconButton(onClick = onStopProbe) { Icon(Icons.Rounded.Stop, "Остановить проверку", tint = Vela.Danger) }
+                IconButton(onClick = onStopProbe) { Icon(Icons.Rounded.Stop, stringResource(R.string.probe_stop_desc), tint = Vela.Danger) }
             } else {
                 IconButton(onClick = { profile?.let { onPing(it.id) } }, enabled = profile != null) {
-                    Icon(Icons.Rounded.Speed, "Проверить все серверы", tint = Vela.Muted)
+                    Icon(Icons.Rounded.Speed, stringResource(R.string.probe_all_desc), tint = Vela.Muted)
                 }
             }
             Button(
@@ -147,7 +151,7 @@ fun ServersScreen(
                 shape = RoundedCornerShape(10.dp),
                 contentPadding = PaddingValues(horizontal = 14.dp),
                 modifier = Modifier.height(36.dp),
-            ) { Text("Добавить", fontSize = 14.sp) }
+            ) { Text(stringResource(R.string.add), fontSize = 14.sp) }
         }
 
         if (app.profiles.isNotEmpty()) {
@@ -171,7 +175,7 @@ fun ServersScreen(
                 }
                 item {
                     Text(
-                        "+ Подписка",
+                        stringResource(R.string.add_subscription_chip),
                         fontSize = 14.sp,
                         color = Vela.Star,
                         modifier = Modifier
@@ -186,8 +190,8 @@ fun ServersScreen(
         probe?.let { (done, total) ->
             Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Проверяем серверы: $done из $total", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                    TextButton(onClick = onStopProbe) { Text("Остановить", color = Vela.Star, fontSize = 13.sp) }
+                    Text(stringResource(R.string.probe_progress, done, total), color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onStopProbe) { Text(stringResource(R.string.stop), color = Vela.Star, fontSize = 13.sp) }
                 }
                 LinearProgressIndicator(
                     progress = { if (total == 0) 0f else done.toFloat() / total },
@@ -202,9 +206,9 @@ fun ServersScreen(
                 value = query, onValueChange = { query = it }, singleLine = true,
                 leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Vela.Muted) },
                 trailingIcon = {
-                    if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Rounded.Close, "Очистить", tint = Vela.Muted) }
+                    if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Rounded.Close, stringResource(R.string.clear), tint = Vela.Muted) }
                 },
-                placeholder = { Text("Поиск: страна, город, протокол", color = Vela.Muted) },
+                placeholder = { Text(stringResource(R.string.servers_search), color = Vela.Muted) },
                 shape = RoundedCornerShape(14.dp),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedBorderColor = Vela.Line, unfocusedBorderColor = Vela.Hull, cursorColor = Vela.Star,
@@ -215,29 +219,31 @@ fun ServersScreen(
             val protocols = profile.nodes.map { it.protocol }.filter { it.isNotBlank() }.distinct().sorted()
             val flags = profile.nodes.mapNotNull { splitFlag(it.name).first }.distinct().sortedBy { countryName(it) }
             ChipRow {
-                Chip("★ Избранные", onlyFav) { onlyFav = !onlyFav }
-                Chip("Рабочие", onlyOk) { onlyOk = !onlyOk }
+                Chip(stringResource(R.string.filter_favorites), onlyFav) { onlyFav = !onlyFav }
+                Chip(stringResource(R.string.filter_working), onlyOk) { onlyOk = !onlyOk }
                 if (protocols.size > 1 || proto.isNotEmpty()) {
+                    val allProtocols = stringResource(R.string.filter_all_protocols)
                     Box {
-                        Chip(proto.ifEmpty { "Все протоколы" } + " ▾", proto.isNotEmpty()) { protoMenu = true }
+                        Chip(proto.ifEmpty { allProtocols } + " ▾", proto.isNotEmpty()) { protoMenu = true }
                         DropdownMenu(protoMenu, { protoMenu = false }, containerColor = Vela.Deep) {
-                            DropdownMenuItem({ Text("Все протоколы") }, { proto = ""; protoMenu = false })
+                            DropdownMenuItem({ Text(allProtocols) }, { proto = ""; protoMenu = false })
                             protocols.forEach { p -> DropdownMenuItem({ Text(p) }, { proto = p; protoMenu = false }) }
                         }
                     }
                 }
                 if (flags.size > 1 || country.isNotEmpty()) {
                     Box {
-                        Chip(if (country.isEmpty()) "Все страны ▾" else "$country ${countryName(country)} ▾", country.isNotEmpty()) { countryMenu = true }
+                        val allCountries = stringResource(R.string.filter_all_countries)
+                        Chip(if (country.isEmpty()) "$allCountries ▾" else "$country ${countryName(country)} ▾", country.isNotEmpty()) { countryMenu = true }
                         DropdownMenu(countryMenu, { countryMenu = false }, containerColor = Vela.Deep) {
-                            DropdownMenuItem({ Text("Все страны") }, { country = ""; countryMenu = false })
+                            DropdownMenuItem({ Text(allCountries) }, { country = ""; countryMenu = false })
                             flags.forEach { f ->
                                 DropdownMenuItem({ Text("$f ${countryName(f)}  ${profile.nodes.count { splitFlag(it.name).first == f }}") }, { country = f; countryMenu = false })
                             }
                         }
                     }
                 }
-                Chip("Сначала быстрые", fastestFirst) { onSort(!fastestFirst) }
+                Chip(stringResource(R.string.filter_fastest), fastestFirst) { onSort(!fastestFirst) }
             }
         }
 
@@ -247,12 +253,12 @@ fun ServersScreen(
                     .border(1.dp, Vela.Line, RoundedCornerShape(22.dp)).padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Text("Серверов пока нет", style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.servers_empty), style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "Вставьте ссылку на подписку от вашего провайдера или ссылку на сервер.",
+                    stringResource(R.string.servers_empty_hint),
                     color = Vela.Muted, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 6.dp),
                 )
-                Button(onClick = onAdd, modifier = Modifier.padding(top = 14.dp)) { Text("Добавить серверы") }
+                Button(onClick = onAdd, modifier = Modifier.padding(top = 14.dp)) { Text(stringResource(R.string.add_servers)) }
             }
             return@Column
         }
@@ -261,7 +267,19 @@ fun ServersScreen(
         val autoSelected = isActive && (app.selectedNode == "auto" || profile.nodes.none { it.id == app.selectedNode })
         val connected = status.state == ConnState.Connected && isActive
 
+        val dismissed by Store.dismissedAnnounce.collectAsState()
+        val announce = Store.visibleAnnounce(profile, dismissed)
+        val autoTitle = stringResource(R.string.auto_select)
+        val autoLive = status.activeNode?.let { id -> profile.nodes.firstOrNull { it.id == id } }
+            ?.let { stringResource(R.string.now_using, splitFlag(it.name).second) }
+        val autoMeta = stringResource(R.string.auto_select_meta)
+        val onlyFavorites = stringResource(R.string.auto_only_favorites)
         LazyColumn(contentPadding = PaddingValues(start = 10.dp, end = 10.dp, bottom = 24.dp)) {
+            if (announce != null) {
+                item(key = "announce") {
+                    AnnounceBanner(announce, { Store.dismissAnnounce(profile.id, announce) }, Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
+                }
+            }
             if (profile.kind == "subscription") {
                 item {
                     SubscriptionCard(
@@ -273,13 +291,13 @@ fun ServersScreen(
                 }
             }
             item {
-                val live = if (autoSelected && connected) profile.nodes.firstOrNull { it.id == status.activeNode } else null
+                val live = if (autoSelected && connected) autoLive else null
                 NodeRow(
-                    badge = "✦", title = "Автовыбор",
-                    meta = live?.let { "Сейчас: " + splitFlag(it.name).second } ?: "Самый быстрый сервер, переключается при сбое",
+                    badge = "✦", title = autoTitle,
+                    meta = live ?: autoMeta,
                     ping = null, selected = autoSelected, inUse = false, reason = null,
                     onClick = { onSelect(profile.id, "auto") }, onDelete = null,
-                    meta2 = if (app.favorites.any { f -> profile.nodes.any { it.id == f } }) "только избранные" else null,
+                    meta2 = if (app.favorites.any { f -> profile.nodes.any { it.id == f } }) onlyFavorites else null,
                 )
             }
             val visible = profile.nodes.filter { matches(it) }
@@ -298,7 +316,7 @@ fun ServersScreen(
             if (visible.size != profile.nodes.size) {
                 item {
                     Text(
-                        "Показано ${visible.size} из ${profile.nodes.size}", color = Vela.Muted, fontSize = 12.sp,
+                        stringResource(R.string.servers_shown, visible.size, profile.nodes.size), color = Vela.Muted, fontSize = 12.sp,
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
                     )
                 }
@@ -311,9 +329,9 @@ fun ServersScreen(
                             .border(1.dp, Vela.Line, RoundedCornerShape(18.dp)).padding(20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        Text("Ничего не найдено", style = MaterialTheme.typography.titleMedium)
+                        Text(stringResource(R.string.nothing_found), style = MaterialTheme.typography.titleMedium)
                         Text(
-                            if (elsewhere.isEmpty()) "Измените поиск или фильтры." else "Есть совпадения в других подписках:",
+                            stringResource(if (elsewhere.isEmpty()) R.string.nothing_found_hint else R.string.found_elsewhere),
                             color = Vela.Muted, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 4.dp),
                         )
                         elsewhere.forEach { o ->
@@ -333,6 +351,7 @@ fun ServersScreen(
                     onClick = { onSelect(profile.id, n.id) },
                     onDelete = if (profile.kind == "manual") ({ onDeleteNode(profile, n) }) else null,
                     favorite = n.id in app.favorites,
+                    xray = n.engine == "xray",
                     onFavorite = { onFavorite(n.id, n.id !in app.favorites) },
                     onShare = { onShare(splitFlag(n.name).second, n.raw.optString("link")) },
                     onPing = { onPingOne(profile.id, n.id) },
@@ -345,10 +364,10 @@ fun ServersScreen(
         var text by remember(p.id) { mutableStateOf(p.customName.ifEmpty { p.name }) }
         AlertDialog(
             onDismissRequest = { renaming = null },
-            title = { Text("Название подписки") },
+            title = { Text(stringResource(R.string.rename_title)) },
             text = {
                 Column {
-                    Text("Пустое поле вернёт название от провайдера.", color = Vela.Muted, fontSize = 13.sp)
+                    Text(stringResource(R.string.rename_hint), color = Vela.Muted, fontSize = 13.sp)
                     OutlinedTextField(
                         value = text, onValueChange = { text = it.take(60) }, singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Vela.Star, unfocusedBorderColor = Vela.Line, cursorColor = Vela.Star),
@@ -356,8 +375,8 @@ fun ServersScreen(
                     )
                 }
             },
-            confirmButton = { TextButton(onClick = { onRename(p, text); renaming = null }) { Text("Сохранить") } },
-            dismissButton = { TextButton(onClick = { renaming = null }) { Text("Отмена", color = Vela.Muted) } },
+            confirmButton = { TextButton(onClick = { onRename(p, text); renaming = null }) { Text(stringResource(R.string.save)) } },
+            dismissButton = { TextButton(onClick = { renaming = null }) { Text(stringResource(R.string.cancel), color = Vela.Muted) } },
             containerColor = Vela.Deep,
         )
     }
@@ -365,12 +384,12 @@ fun ServersScreen(
     confirmDelete?.let { p ->
         AlertDialog(
             onDismissRequest = { confirmDelete = null },
-            title = { Text(if (p.kind == "manual") "Удалить серверы?" else "Удалить подписку?") },
-            text = { Text("«${p.name}» и все её серверы будут удалены с этого устройства.") },
+            title = { Text(stringResource(if (p.kind == "manual") R.string.delete_servers_title else R.string.delete_sub_title)) },
+            text = { Text(stringResource(R.string.delete_profile_text, p.name)) },
             confirmButton = {
-                TextButton(onClick = { confirmDelete = null; onDeleteProfile(p) }) { Text("Удалить", color = Vela.Danger) }
+                TextButton(onClick = { confirmDelete = null; onDeleteProfile(p) }) { Text(stringResource(R.string.delete), color = Vela.Danger) }
             },
-            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Отмена") } },
+            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text(stringResource(R.string.cancel)) } },
             containerColor = Vela.Deep,
         )
     }
@@ -396,7 +415,7 @@ private fun SubscriptionCard(
     ) {
         val used = p.upload + p.download
         if (p.total > 0) {
-            InfoRow("Трафик", "${formatBytes(used)} из ${formatBytes(p.total)}")
+            InfoRow(stringResource(R.string.sub_traffic), stringResource(R.string.sub_traffic_of, formatBytes(used), formatBytes(p.total)))
             val frac = (used.toFloat() / p.total).coerceIn(0f, 1f)
             LinearProgressIndicator(
                 progress = { frac },
@@ -406,20 +425,26 @@ private fun SubscriptionCard(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(4.dp).clip(RoundedCornerShape(4.dp)),
             )
         } else if (used > 0) {
-            InfoRow("Трафик", "${formatBytes(used)}, без лимита")
+            InfoRow(stringResource(R.string.sub_traffic), stringResource(R.string.sub_traffic_unlimited, formatBytes(used)))
         }
         if (p.expire > 0) {
             val days = ((p.expire * 1000 - System.currentTimeMillis()) / 86_400_000L).toInt()
-            InfoRow("Действует до", formatDate(p.expire) + if (days in 0..7) " (осталось дней: $days)" else "")
+            val expired = p.expire * 1000 <= System.currentTimeMillis()
+            InfoRow(
+                stringResource(if (expired) R.string.sub_expired else R.string.sub_valid_until),
+                formatDate(p.expire) + if (!expired && days in 0..7) " " + stringResource(R.string.sub_days_left, days) else "",
+            )
         }
-        if (p.updatedAt > 0) InfoRow("Обновлена", formatDateTime(p.updatedAt))
+        if (p.updatedAt > 0) InfoRow(stringResource(R.string.sub_updated), formatDateTime(p.updatedAt))
         FlowRow(Modifier.padding(top = 6.dp)) {
-            TextButton(onClick = onRefresh, enabled = !refreshing) { Text(if (refreshing) "Обновляем…" else "Обновить", color = Vela.Muted) }
-            if (several) TextButton(onClick = onRefreshAll, enabled = !refreshing) { Text("Обновить все", color = Vela.Muted) }
-            TextButton(onClick = onRename) { Text("Переименовать", color = Vela.Muted) }
-            TextButton(onClick = onShare) { Text("Поделиться", color = Vela.Muted) }
-            if (p.supportUrl.isNotBlank()) TextButton(onClick = { onOpenUrl(p.supportUrl) }) { Text("Поддержка", color = Vela.Muted) }
-            TextButton(onClick = onDelete) { Text("Удалить", color = Vela.Muted) }
+            TextButton(onClick = onRefresh, enabled = !refreshing) {
+                Text(stringResource(if (refreshing) R.string.refreshing else R.string.refresh), color = Vela.Muted)
+            }
+            if (several) TextButton(onClick = onRefreshAll, enabled = !refreshing) { Text(stringResource(R.string.refresh_all), color = Vela.Muted) }
+            TextButton(onClick = onRename) { Text(stringResource(R.string.rename), color = Vela.Muted) }
+            TextButton(onClick = onShare) { Text(stringResource(R.string.share), color = Vela.Muted) }
+            if (p.supportUrl.isNotBlank()) TextButton(onClick = { onOpenUrl(p.supportUrl) }) { Text(stringResource(R.string.support), color = Vela.Muted) }
+            TextButton(onClick = onDelete) { Text(stringResource(R.string.delete), color = Vela.Muted) }
         }
     }
 }
@@ -448,6 +473,7 @@ private fun NodeRow(
     onShare: (() -> Unit)? = null,
     meta2: String? = null,
     onPing: (() -> Unit)? = null,
+    xray: Boolean = false,
 ) {
     Row(
         Modifier
@@ -463,9 +489,10 @@ private fun NodeRow(
         Spacer(Modifier.size(12.dp))
         Column(Modifier.weight(1f)) {
             Text(title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Row {
-                Text(meta, color = Vela.Muted, fontSize = 12.sp, maxLines = 1)
-                if (inUse) Text("  ● используется", color = Vela.Sea, fontSize = 12.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(meta, color = Vela.Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, false))
+                if (xray) XrayBadge()
+                if (inUse) Text("  ● " + stringResource(R.string.in_use), color = Vela.Sea, fontSize = 12.sp, maxLines = 1)
                 if (meta2 != null) Text("  ★ $meta2", color = Vela.Flare, fontSize = 12.sp, maxLines = 1)
             }
             if (!reason.isNullOrBlank()) Text(reason, color = Vela.Danger, fontSize = 12.sp, maxLines = 2)
@@ -475,32 +502,43 @@ private fun NodeRow(
             ping != null && onPing != null -> Text(
                 ping.text, color = ping.color, fontSize = 13.sp,
                 modifier = Modifier.padding(start = 4.dp).clip(RoundedCornerShape(8.dp))
-                    .clickable(onClickLabel = "Проверить сервер", onClick = onPing).padding(horizontal = 6.dp, vertical = 6.dp),
+                    .clickable(onClickLabel = stringResource(R.string.check_server), onClick = onPing).padding(horizontal = 6.dp, vertical = 6.dp),
             )
             ping != null -> Text(ping.text, color = ping.color, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp))
             onPing != null -> IconButton(onClick = onPing, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Rounded.Speed, "Проверить сервер", tint = Vela.Line, modifier = Modifier.size(18.dp))
+                Icon(Icons.Rounded.Speed, stringResource(R.string.check_server), tint = Vela.Line, modifier = Modifier.size(18.dp))
             }
         }
         if (onFavorite != null) {
             IconButton(onClick = onFavorite, modifier = Modifier.size(36.dp)) {
                 Icon(
                     if (favorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
-                    if (favorite) "Убрать из избранного" else "В избранное",
+                    stringResource(if (favorite) R.string.favorite_remove else R.string.favorite_add),
                     tint = if (favorite) Vela.Flare else Vela.Line, modifier = Modifier.size(20.dp),
                 )
             }
         }
         if (onShare != null) {
             IconButton(onClick = onShare, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Rounded.QrCode2, "Поделиться", tint = Vela.Line, modifier = Modifier.size(18.dp))
+                Icon(Icons.Rounded.QrCode2, stringResource(R.string.share), tint = Vela.Line, modifier = Modifier.size(18.dp))
             }
         }
         if (onDelete != null) {
             IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
-                Icon(Icons.Rounded.Close, "Удалить сервер", tint = Vela.Muted, modifier = Modifier.size(18.dp))
+                Icon(Icons.Rounded.Close, stringResource(R.string.delete_server), tint = Vela.Muted, modifier = Modifier.size(18.dp))
             }
         }
-        if (selected) Icon(Icons.Rounded.Check, "Выбран", tint = Vela.Sea, modifier = Modifier.padding(start = 6.dp).size(20.dp))
+        if (selected) Icon(Icons.Rounded.Check, stringResource(R.string.selected), tint = Vela.Sea, modifier = Modifier.padding(start = 6.dp).size(20.dp))
     }
+}
+
+/** Servers run by the embedded Xray engine. */
+@Composable
+private fun XrayBadge() {
+    Text(
+        "Xray", color = Vela.Flare, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
+        modifier = Modifier.padding(start = 6.dp).clip(RoundedCornerShape(5.dp))
+            .border(1.dp, Vela.Flare.copy(alpha = 0.5f), RoundedCornerShape(5.dp))
+            .padding(horizontal = 5.dp, vertical = 0.dp),
+    )
 }
