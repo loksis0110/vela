@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,10 +28,34 @@ type Server struct {
 	app   *App
 	token string
 	addr  string
+	ipc   string
 }
 
 func NewServer(app *App) *Server {
-	return &Server{app: app, token: randomID() + randomID(), addr: fmt.Sprintf("127.0.0.1:%d", uiPort)}
+	token := randomID() + randomID()
+	// after an update the new Vela keeps the token, so the open window
+	// reconnects to it
+	if t := os.Getenv("VELA_UI_TOKEN"); len(t) >= 32 && len(t) <= 128 {
+		token = t
+	}
+	os.Unsetenv("VELA_UI_TOKEN")
+	return &Server{app: app, token: token, addr: fmt.Sprintf("127.0.0.1:%d", uiPort), ipc: ipcSecret(app.dataDir)}
+}
+
+// ipcSecret is a random secret in the data folder. Another launch of
+// Vela.exe (e.g. opening a vela:// link) proves with it that it may pass
+// the link to the running Vela.
+func ipcSecret(dataDir string) string {
+	path := filepath.Join(dataDir, "ipc.key")
+	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) >= 32 {
+		return strings.TrimSpace(string(data))
+	}
+	secret := randomID() + randomID() + randomID() + randomID()
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, []byte(secret), 0o600) == nil {
+		os.Rename(tmp, path)
+	}
+	return secret
 }
 
 func (s *Server) URL() string { return fmt.Sprintf("http://%s/#t=%s", s.addr, s.token) }
@@ -43,7 +69,26 @@ func (s *Server) Serve(l net.Listener) error {
 	mux.Handle("/", noCache(static))
 	mux.HandleFunc("/show", func(w http.ResponseWriter, r *http.Request) {
 		// another launch of Vela.exe asks us to bring the window back
-		openWindow(s.URL(), s.app.dataDir)
+		showWindow()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/ipc", func(w http.ResponseWriter, r *http.Request) {
+		// another launch of Vela.exe passes an app link or asks for the window
+		secret := r.Header.Get("X-Vela-IPC")
+		if r.Method != http.MethodPost || s.ipc == "" || subtle.ConstantTimeCompare([]byte(secret), []byte(s.ipc)) != 1 {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		var req struct {
+			Link string `json:"link"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		if req.Link != "" {
+			s.app.OfferLink(req.Link)
+		}
+		showWindow()
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/api/events", s.auth(s.events))
@@ -67,7 +112,7 @@ func (s *Server) Serve(l net.Listener) error {
 		if !readJSON(w, r, &req) {
 			return
 		}
-		reply(w, "Подписка обновлена", s.app.UpdateProfile(r.Context(), req.ID))
+		reply(w, tr("Подписка обновлена"), s.app.UpdateProfile(r.Context(), req.ID))
 	}))
 	mux.HandleFunc("/api/profile/update-all", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		msg, err := s.app.UpdateAll(r.Context())
@@ -81,7 +126,7 @@ func (s *Server) Serve(l net.Listener) error {
 		if !readJSON(w, r, &req) {
 			return
 		}
-		reply(w, "Название сохранено", s.app.RenameProfile(req.ID, req.Name))
+		reply(w, tr("Название сохранено"), s.app.RenameProfile(req.ID, req.Name))
 	}))
 	mux.HandleFunc("/api/profile/delete", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -90,7 +135,7 @@ func (s *Server) Serve(l net.Listener) error {
 		if !readJSON(w, r, &req) {
 			return
 		}
-		reply(w, "Удалено", s.app.DeleteProfile(req.ID))
+		reply(w, tr("Удалено"), s.app.DeleteProfile(req.ID))
 	}))
 	mux.HandleFunc("/api/node/delete", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -100,7 +145,7 @@ func (s *Server) Serve(l net.Listener) error {
 		if !readJSON(w, r, &req) {
 			return
 		}
-		reply(w, "Сервер удалён", s.app.DeleteNode(req.Profile, req.Node))
+		reply(w, tr("Сервер удалён"), s.app.DeleteNode(req.Profile, req.Node))
 	}))
 	mux.HandleFunc("/api/select", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -155,7 +200,7 @@ func (s *Server) Serve(l net.Listener) error {
 	}))
 	mux.HandleFunc("/api/settings/reset", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		s.app.ResetSettings()
-		reply(w, "Настройки сброшены", nil)
+		reply(w, tr("Настройки сброшены"), nil)
 	}))
 	mux.HandleFunc("/api/settings", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -254,7 +299,7 @@ func (s *Server) Serve(l net.Listener) error {
 		}
 		data, err := base64.StdEncoding.DecodeString(raw)
 		if err != nil {
-			reply(w, "", errors.New("не удалось прочитать картинку"))
+			reply(w, "", errors.New(tr("не удалось прочитать картинку")))
 			return
 		}
 		text, err := core.DecodeQR(data)
@@ -285,6 +330,94 @@ func (s *Server) Serve(l net.Listener) error {
 	mux.HandleFunc("/api/quit", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		reply(w, "", nil)
 		go quit(s.app)
+	}))
+	mux.HandleFunc("/api/prefs", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req AppPrefs
+		if !readJSON(w, r, &req) {
+			return
+		}
+		reply(w, "", s.app.SetPrefs(req))
+	}))
+	mux.HandleFunc("/api/hotkey", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Hotkey string `json:"hotkey"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		reply(w, "", s.app.SetHotkey(req.Hotkey))
+	}))
+	mux.HandleFunc("/api/update/check", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		version, err := s.app.CheckUpdate(true)
+		if err != nil {
+			reply(w, "", err)
+			return
+		}
+		msg := tr("У вас последняя версия")
+		if version != "" {
+			msg = fmt.Sprintf(tr("Доступна версия %s"), version)
+		}
+		writeJSON(w, map[string]string{"message": msg, "version": version})
+	}))
+	mux.HandleFunc("/api/update/install", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		reply(w, "", s.app.InstallUpdate())
+	}))
+	mux.HandleFunc("/api/clipboard", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"offer": s.app.CheckClipboard()})
+	}))
+	mux.HandleFunc("/api/offer/accept", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		msg, err := s.app.AcceptOffer(r.Context(), req.ID)
+		reply(w, msg, err)
+	}))
+	mux.HandleFunc("/api/offer/dismiss", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		s.app.DismissOffer(req.ID)
+		reply(w, "", nil)
+	}))
+	mux.HandleFunc("/api/dismiss", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Key string `json:"key"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		s.app.Dismiss(req.Key)
+		reply(w, "", nil)
+	}))
+	mux.HandleFunc("/api/connections", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		connected, list, err := s.app.Connections()
+		out := map[string]any{"connected": connected, "connections": list}
+		if err != nil {
+			out["error"] = tr("Не удалось получить список соединений")
+		}
+		writeJSON(w, out)
+	}))
+	mux.HandleFunc("/api/connections/close", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		if err := s.app.CloseConnection(req.ID); err != nil {
+			reply(w, "", errors.New(tr("Не удалось закрыть соединение")))
+			return
+		}
+		reply(w, "", nil)
+	}))
+	mux.HandleFunc("/api/traffic", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, s.app.TrafficSummary())
 	}))
 	srv := &http.Server{Handler: s.guard(mux), ReadHeaderTimeout: 10 * time.Second}
 	return srv.Serve(l)
