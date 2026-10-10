@@ -47,7 +47,7 @@ struct ServersView: View {
                 if let probe = store.probe {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Text("Проверяем серверы: \(probe.done) из \(probe.total)").font(.footnote).foregroundStyle(Palette.muted)
+                            Text(LF("Проверяем серверы: %@ из %@", "\(probe.done)", "\(probe.total)")).font(.footnote).foregroundStyle(Palette.muted)
                             Spacer()
                             Button("Остановить") { tunnel.stopProbe() }.font(.footnote).buttonStyle(.borderless)
                         }
@@ -93,7 +93,7 @@ struct ServersView: View {
                     Button("Добавить") { showAdd = true }
                 }
             }
-            .alert(confirmDelete?.kind == "manual" ? "Удалить серверы?" : "Удалить подписку?", isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } })) {
+            .alert(confirmDelete?.kind == "manual" ? L("Удалить серверы?") : L("Удалить подписку?"), isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } })) {
                 Button("Удалить", role: .destructive) {
                     if let p = confirmDelete {
                         if p.id == store.state.activeProfile, tunnel.state != .disconnected { tunnel.disconnect() }
@@ -102,7 +102,8 @@ struct ServersView: View {
                 }
                 Button("Отмена", role: .cancel) {}
             } message: {
-                Text("«\(confirmDelete?.name ?? "")» и все её серверы будут удалены с этого устройства.")
+                Text(confirmDelete?.kind == "manual" ? L("Все ваши серверы будут удалены с этого устройства.")
+                    : LF("«%@» и все её серверы будут удалены с этого устройства.", confirmDelete?.displayName ?? ""))
             }
             .alert("Название подписки", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
                 TextField("Название", text: $renameText)
@@ -128,7 +129,7 @@ struct ServersView: View {
             HStack(spacing: 6) {
                 ForEach(store.state.profiles) { p in
                     let sel = p.id == profile?.id
-                    Button((p.id == store.state.activeProfile ? "● " : "") + p.name + "  \(p.nodes.count)") { viewID = p.id }
+                    Button((p.id == store.state.activeProfile ? "● " : "") + p.displayName + "  \(p.nodes.count)") { viewID = p.id }
                         .font(.system(size: 14))
                         .foregroundStyle(sel ? Palette.text : Palette.muted)
                         .padding(.horizontal, 14).padding(.vertical, 7)
@@ -148,19 +149,32 @@ struct ServersView: View {
     private func subscriptionCard(_ p: Profile) -> some View {
         let used = p.upload + p.download
         return VStack(alignment: .leading, spacing: 6) {
+            if let a = p.announce, !a.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "megaphone").foregroundStyle(Palette.flare).font(.system(size: 13))
+                    Text(a).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                }
+                .padding(.bottom, 2)
+            }
             if p.total > 0 {
-                info("Трафик", "\(Fmt.bytes(used)) из \(Fmt.bytes(p.total))")
+                info(L("Трафик"), LF("%@ из %@", Fmt.bytes(used), Fmt.bytes(p.total)))
                 let frac = min(1, Double(used) / Double(p.total))
-                ProgressView(value: frac).tint(frac > 0.85 ? Palette.flare : Palette.star)
+                ProgressView(value: frac).tint(frac >= 0.9 ? Palette.danger : (frac > 0.85 ? Palette.flare : Palette.star))
             } else if used > 0 {
-                info("Трафик", "\(Fmt.bytes(used)), без лимита")
+                info(L("Трафик"), LF("%@, без лимита", Fmt.bytes(used)))
             }
             if p.expire > 0 {
-                let days = Int((Double(p.expire) - Date().timeIntervalSince1970) / 86400)
-                info("Действует до", Fmt.date(p.expire) + ((0 ... 7).contains(days) ? " (осталось дней: \(days))" : ""))
+                let left = Double(p.expire) - Date().timeIntervalSince1970
+                let days = Int(left / 86400)
+                if left <= 0 {
+                    info(L("Закончилась"), Fmt.date(p.expire), color: Palette.danger)
+                } else {
+                    info(L("Действует до"), Fmt.date(p.expire) + ((0 ... 7).contains(days) ? ", " + LF("осталось дней: %@", "\(days)") : ""),
+                         color: days < 3 ? Palette.flare : nil)
+                }
             }
             HStack(spacing: 14) {
-                Button(refreshing ? "Обновляем…" : "Обновить") { Task { await refresh() } }.disabled(refreshing)
+                Button(refreshing ? L("Обновляем…") : L("Обновить")) { Task { await refresh() } }.disabled(refreshing)
                 if store.state.profiles.filter({ $0.kind == "subscription" }).count > 1 {
                     Button("Все") { Task { await refreshAll() } }.disabled(refreshing)
                 }
@@ -182,17 +196,17 @@ struct ServersView: View {
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Palette.hull))
     }
 
-    private func info(_ label: String, _ value: String) -> some View {
+    private func info(_ label: String, _ value: String, color: Color? = nil) -> some View {
         HStack {
             Text(label).foregroundStyle(Palette.muted)
             Spacer()
-            Text(value).fontWeight(.semibold)
+            Text(value).fontWeight(.semibold).foregroundStyle(color ?? Palette.text)
         }
         .font(.system(size: 13))
     }
 
     private func share(_ title: String, _ text: String) {
-        sharing = ShareItem(title: title, hint: "Отсканируйте QR-код в Vela или другом клиенте на другом устройстве.", text: text)
+        sharing = ShareItem(title: title, hint: L("Отсканируйте QR-код в Vela или другом клиенте на другом устройстве."), text: text)
     }
 
     private func filters(_ p: Profile) -> some View {
@@ -200,14 +214,14 @@ struct ServersView: View {
         let flags = Array(Set(p.nodes.compactMap { Fmt.splitFlag($0.name).flag })).sorted { Fmt.country($0) < Fmt.country($1) }
         return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                Chip(text: "★ Избранные", on: onlyFav) { onlyFav.toggle() }
-                Chip(text: "Рабочие", on: onlyOK) { onlyOK.toggle() }
+                Chip(text: L("★ Избранные"), on: onlyFav) { onlyFav.toggle() }
+                Chip(text: L("Рабочие"), on: onlyOK) { onlyOK.toggle() }
                 if protocols.count > 1 || !proto.isEmpty {
                     Menu {
                         Button("Все протоколы") { proto = "" }
                         ForEach(protocols, id: \.self) { v in Button(v) { proto = v } }
                     } label: {
-                        Chip(text: (proto.isEmpty ? "Все протоколы" : proto) + " ▾", on: !proto.isEmpty) {}.allowsHitTesting(false)
+                        Chip(text: (proto.isEmpty ? L("Все протоколы") : proto) + " ▾", on: !proto.isEmpty) {}.allowsHitTesting(false)
                     }
                 }
                 if flags.count > 1 || !country.isEmpty {
@@ -217,10 +231,10 @@ struct ServersView: View {
                             Button("\(f) \(Fmt.country(f))  \(p.nodes.filter { Fmt.splitFlag($0.name).flag == f }.count)") { country = f }
                         }
                     } label: {
-                        Chip(text: (country.isEmpty ? "Все страны" : "\(country) \(Fmt.country(country))") + " ▾", on: !country.isEmpty) {}.allowsHitTesting(false)
+                        Chip(text: (country.isEmpty ? L("Все страны") : country + " " + Fmt.country(country)) + " ▾", on: !country.isEmpty) {}.allowsHitTesting(false)
                     }
                 }
-                Chip(text: "Сначала быстрые", on: fastestFirst) { store.setSortByPing(!fastestFirst) }
+                Chip(text: L("Сначала быстрые"), on: fastestFirst) { store.setSortByPing(!fastestFirst) }
             }
             .padding(.horizontal, 16).padding(.vertical, 4)
         }
@@ -235,9 +249,9 @@ struct ServersView: View {
 
         let favs = Set(store.state.favorites)
         let hasFavs = p.nodes.contains { favs.contains($0.id) }
-        row(badge: "✦", title: "Автовыбор",
-            meta: live.map { "Сейчас: " + Fmt.splitFlag($0.name).rest }
-                ?? (hasFavs ? "Среди избранных, переключается при сбое" : "Самый быстрый сервер, переключается при сбое"),
+        row(badge: "✦", title: L("Автовыбор"),
+            meta: live.map { LF("Сейчас: %@", Fmt.splitFlag($0.name).rest) }
+                ?? (hasFavs ? L("Среди избранных, переключается при сбое") : L("Самый быстрый сервер, переключается при сбое")),
             ping: nil, selected: autoSelected, inUse: false, reason: nil) { choose(p, "auto") }
 
         let visible = p.nodes.filter(matches)
@@ -245,16 +259,16 @@ struct ServersView: View {
             ? visible.sorted { rank(store.pings[$0.id]) < rank(store.pings[$1.id]) }
             : visible.filter { favs.contains($0.id) } + visible.filter { !favs.contains($0.id) }
         if visible.count != p.nodes.count {
-            Text("Показано \(visible.count) из \(p.nodes.count)").font(.caption).foregroundStyle(Palette.muted).listRowBackground(Color.clear)
+            Text(LF("Показано %@ из %@", "\(visible.count)", "\(p.nodes.count)")).font(.caption).foregroundStyle(Palette.muted).listRowBackground(Color.clear)
         }
         if visible.isEmpty {
             let elsewhere = query.isEmpty ? [] : store.state.profiles.filter { $0.id != p.id && $0.nodes.contains(where: matches) }
             VStack(spacing: 6) {
                 Text("Ничего не найдено").font(.headline)
-                Text(elsewhere.isEmpty ? "Измените поиск или фильтры." : "Есть совпадения в других подписках:")
+                Text(elsewhere.isEmpty ? L("Измените поиск или фильтры.") : L("Есть совпадения в других подписках:"))
                     .foregroundStyle(Palette.muted)
                 ForEach(elsewhere) { o in
-                    Button("\(o.name) · \(o.nodes.filter(matches).count)") { viewID = o.id }
+                    Button(o.displayName + " · \(o.nodes.filter(matches).count)") { viewID = o.id }
                 }
             }
             .frame(maxWidth: .infinity).padding(20)
@@ -263,7 +277,7 @@ struct ServersView: View {
         ForEach(ordered) { n in
             let tags = [n.proto, n.security, (!n.network.isEmpty && n.network != "tcp") ? n.network.uppercased() : ""]
                 .filter { !$0.isEmpty }.joined(separator: " ")
-            row(badge: Fmt.badge(n.name), title: Fmt.splitFlag(n.name).rest, meta: tags,
+            row(badge: Fmt.badge(n.name), title: Fmt.splitFlag(n.name).rest, meta: tags, xray: n.isXray,
                 ping: Fmt.ping(store.pings[n.id]), selected: isActive && sel == n.id,
                 inUse: connected && tunnel.activeNode == n.id,
                 reason: (store.pings[n.id] ?? 0) < 0 ? store.reasons[n.id] : nil,
@@ -277,7 +291,7 @@ struct ServersView: View {
                 }
                 .contextMenu {
                     Button { store.setFavorite(n.id, !favs.contains(n.id)) } label: {
-                        Label(favs.contains(n.id) ? "Убрать из избранного" : "В избранное", systemImage: favs.contains(n.id) ? "star.slash" : "star")
+                        Label(favs.contains(n.id) ? L("Убрать из избранного") : L("В избранное"), systemImage: favs.contains(n.id) ? "star.slash" : "star")
                     }
                     Button { share(Fmt.splitFlag(n.name).rest, n.link) } label: { Label("Поделиться", systemImage: "qrcode") }
                     Button { Task { await tunnel.pingOne(profile: p.id, node: n.id) } } label: { Label("Проверить сервер", systemImage: "speedometer") }
@@ -295,7 +309,7 @@ struct ServersView: View {
         guard let p = profile else { return }
         await tunnel.pingAll(p.id)
         let ok = p.nodes.filter { (store.pings[$0.id] ?? 0) > 0 }.count
-        message = "Работают \(ok) из \(p.nodes.count)"
+        message = LF("Работают %@ из %@", "\(ok)", "\(p.nodes.count)")
     }
 
     private func refreshAll() async {
@@ -304,7 +318,7 @@ struct ServersView: View {
         do { message = try await store.refreshAll() } catch { message = error.localizedDescription }
     }
 
-    private func row(badge: String, title: String, meta: String, ping: (String, Color)?, selected: Bool, inUse: Bool, reason: String?,
+    private func row(badge: String, title: String, meta: String, xray: Bool = false, ping: (String, Color)?, selected: Bool, inUse: Bool, reason: String?,
                      favorite: Bool = false, onFavorite: (() -> Void)? = nil, onPing: (() -> Void)? = nil,
                      action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -313,6 +327,7 @@ struct ServersView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).fontWeight(.semibold).lineLimit(1)
                     HStack(spacing: 6) {
+                        if xray { MiniTag(text: "Xray") }
                         Text(meta).font(.caption).foregroundStyle(Palette.muted).lineLimit(1)
                         if inUse { Text("● используется").font(.caption).foregroundStyle(Palette.sea) }
                     }
@@ -343,7 +358,7 @@ struct ServersView: View {
                             .frame(width: 32, height: 32)
                     }
                     .buttonStyle(.borderless)
-                    .accessibilityLabel(favorite ? "Убрать из избранного" : "В избранное")
+                    .accessibilityLabel(favorite ? L("Убрать из избранного") : L("В избранное"))
                 }
                 if selected { Image(systemName: "checkmark").foregroundStyle(Palette.sea).fontWeight(.semibold) }
             }

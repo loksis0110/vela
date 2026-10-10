@@ -27,9 +27,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }()
 
     private static let dataPlaceholder = "__VELA_DATA__"
+    /// Traffic statistics (read by the app through "vela:stats").
+    private var trafficURL: URL { dataURL.appendingPathComponent("traffic.json") }
+    private var recording = false
 
     override func startTunnel(options: [String: NSObject]?) async throws {
-        var step = "подготовка"
+        // the app's language, remembered for starts by iOS (On Demand)
+        if let lang = options?["lang"] as? String { UserDefaults.standard.set(lang, forKey: "lang") }
+        var step = tr("подготовка")
         do {
             try await start(options: options, step: &step)
             note("ok: tunnel started")
@@ -38,7 +43,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // The app can't see the extension's errors by itself: keep the
             // reason in a file (read through the App Group when it exists)
             // and show it to the user directly.
-            let text = "Vela не подключилась (\(step)): \(error.localizedDescription)"
+            let text = String(format: tr("Vela не подключилась (%@): %@"), step, error.localizedDescription)
             note("ERROR: " + text)
             log.error("\(text, privacy: .public)")
             displayMessage(text) { _ in }
@@ -48,17 +53,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func start(options: [String: NSObject]?, step: inout String) async throws {
         let base = dataURL
-        step = "папки"
+        step = tr("папки")
         let working = base.appendingPathComponent("core", isDirectory: true)
         try? FileManager.default.createDirectory(at: working, withIntermediateDirectories: true)
         try? Data().write(to: base.appendingPathComponent("start.log"))
         note("start, data: \(base.path), app group: \(hasAppGroup)")
-        step = "правила маршрутизации"
+        step = tr("правила маршрутизации")
         try installRules(into: base.appendingPathComponent("rules", isDirectory: true))
 
         // The app passes the config; when the system starts the tunnel by itself
         // (Connect On Demand, Settings) the last config saved here is used.
-        step = "конфигурация"
+        step = tr("конфигурация")
         let snapshot = base.appendingPathComponent("tunnel-config.json")
         if let config = options?["configContent"] as? String {
             configContent = config
@@ -67,13 +72,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             configContent = try? String(contentsOf: snapshot, encoding: .utf8)
         }
         guard let config = configContent else {
-            throw TunnelError("откройте Vela и подключитесь из приложения")
+            throw TunnelError(tr("откройте Vela и подключитесь из приложения"))
         }
         note("config: \(config.utf8.count) bytes, memory: \(memoryMB()) MB")
         // a fresh log for every connection
         try? Data().write(to: base.appendingPathComponent("core.log"))
 
-        step = "запуск ядра"
+        step = tr("запуск ядра")
         let setup = LibboxSetupOptions()
         setup.basePath = base.path
         setup.workingPath = working.path
@@ -89,11 +94,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         LibboxSetup(setup, &error)
         if let error { throw error }
 
-        step = "служба управления"
+        step = tr("служба управления")
         commandServer = LibboxNewCommandServer(platform, platform, &error)
         if let error { throw error }
         try commandServer!.start()
-        step = "подключение к серверу"
+        step = tr("подключение к серверу")
         try startService()
         note("service started, memory: \(memoryMB()) MB")
     }
@@ -128,13 +133,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return kr == KERN_SUCCESS ? Int(info.phys_footprint / 1_048_576) : -1
     }
 
-    /// Rule sets for the "smart" mode ship inside the extension bundle.
+    /// Rule sets of the routing modes ship inside the extension bundle
+    /// (core/rules): every .srs file there is copied, so new lists need no
+    /// change here.
     private func installRules(into dir: URL) throws {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let names = ["geoip-ru.srs", "geosite-category-ru.srs", "geosite-category-ads-all.srs"]
-        for name in names {
-            let target = dir.appendingPathComponent(name)
-            guard let source = Bundle.main.url(forResource: name, withExtension: nil) else { continue }
+        var sources = Bundle.main.urls(forResourcesWithExtension: "srs", subdirectory: nil) ?? []
+        sources += Bundle.main.urls(forResourcesWithExtension: "srs", subdirectory: "rules") ?? []
+        for source in sources {
+            let target = dir.appendingPathComponent(source.lastPathComponent)
             let srcSize = (try? FileManager.default.attributesOfItem(atPath: source.path)[.size] as? Int) ?? -1
             let dstSize = (try? FileManager.default.attributesOfItem(atPath: target.path)[.size] as? Int) ?? -2
             if srcSize == dstSize { continue }
@@ -146,16 +153,49 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     func startService() throws {
         guard let raw = configContent, let commandServer else { return }
         let config = raw.replacingOccurrences(of: Self.dataPlaceholder, with: dataURL.path)
+        // the running core's numbers are saved before it is replaced
+        stopRecorder()
         do {
             try commandServer.startOrReloadService(config, options: LibboxOverrideOptions())
         } catch {
-            throw TunnelError("Не удалось подключиться: \(error.localizedDescription)")
+            throw TunnelError(String(format: tr("Не удалось подключиться: %@"), error.localizedDescription))
         }
+        startRecorder(config)
     }
 
     func stopService() {
+        stopRecorder()
         try? commandServer?.closeService()
         platform.reset()
+    }
+
+    /// Counts traffic through the core's local controller (port and secret
+    /// come from the config the app built).
+    private func startRecorder(_ config: String) {
+        guard let api = Self.controller(in: config) else { return }
+        VelaextStartTrafficRecorder(Int32(api.port), api.secret, trafficURL.path)
+        recording = true
+    }
+
+    /// Saves the last numbers; the core must still be running.
+    private func stopRecorder() {
+        guard recording else { return }
+        recording = false
+        VelaextStopTrafficRecorder()
+    }
+
+    /// Port and secret of clash_api in the sing-box config, found without
+    /// parsing the whole (possibly large) JSON.
+    static func controller(in config: String) -> (port: Int, secret: String)? {
+        func first(_ pattern: String) -> String? {
+            guard let re = try? NSRegularExpression(pattern: pattern),
+                  let m = re.firstMatch(in: config, range: NSRange(config.startIndex..., in: config)),
+                  m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: config) else { return nil }
+            return String(config[r])
+        }
+        guard let port = first(#""external_controller"\s*:\s*"[^"]*:(\d+)""#).flatMap({ Int($0) }), port > 0 else { return nil }
+        let secret = first(#""clash_api"\s*:\s*\{[^}]*"secret"\s*:\s*"([^"]*)""#) ?? ""
+        return (port, secret)
     }
 
     override func stopTunnel(with reason: NEProviderStopReason) async {
@@ -176,6 +216,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return tailLog()
         }
         if config == "vela:memory" { return Data("\(memoryMB())".utf8) }
+        if config == "vela:stats" { return Data(VelaextTrafficSummary(trafficURL.path).utf8) }
         trimLog()
         let previous = configContent
         configContent = config
@@ -222,6 +263,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func wake() {
         commandServer?.wake()
     }
+}
+
+/// Localized text of the extension, in the app's language when the app
+/// passed it (the extension has its own settings, so it can't see the
+/// app's per-app language).
+func tr(_ key: String) -> String {
+    let lang = UserDefaults.standard.string(forKey: "lang") ?? ""
+    if !lang.isEmpty, let path = Bundle.main.path(forResource: lang, ofType: "lproj"), let bundle = Bundle(path: path) {
+        return bundle.localizedString(forKey: key, value: key, table: nil)
+    }
+    return NSLocalizedString(key, comment: "")
 }
 
 struct TunnelError: LocalizedError {

@@ -4,6 +4,7 @@ struct SettingsView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var tunnel: TunnelManager
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
     @State private var s = VelaSettings()
     @State private var direct = ""
     @State private var proxy = ""
@@ -15,6 +16,8 @@ struct SettingsView: View {
     @State private var message: String?
     @State private var sub = SubPrefs()
     @State private var confirmReset = false
+    @State private var language = Lang.choice
+    @State private var notifyDenied = false
 
     var body: some View {
         NavigationStack {
@@ -43,6 +46,26 @@ struct SettingsView: View {
                         }
                     }
                 }
+                Section {
+                    ForEach(RoutingMode.all) { m in
+                        Button { s.routing = m.id } label: {
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(m.title).foregroundStyle(Palette.text)
+                                    Text(m.detail).font(.caption).foregroundStyle(Palette.muted)
+                                }
+                                Spacer()
+                                if s.routing == m.id {
+                                    Image(systemName: "checkmark").foregroundStyle(Palette.sea).fontWeight(.semibold)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .accessibilityAddTraits(s.routing == m.id ? .isSelected : [])
+                    }
+                } header: { Text("Маршрутизация") } footer: {
+                    Text("Списки «Всегда напрямую», «Всегда через VPN» и свои правила ниже проверяются раньше.")
+                }
                 Section("Оформление") {
                     Picker("Тема", selection: Binding(get: { store.state.theme }, set: { store.setTheme($0) })) {
                         Text("Как в системе").tag("system")
@@ -50,6 +73,16 @@ struct SettingsView: View {
                         Text("Тёмная").tag("dark")
                     }
                     .pickerStyle(.segmented)
+                    Picker("Язык", selection: Binding(get: { language }, set: { v in
+                        guard v != language else { return }
+                        language = v
+                        Lang.choice = v
+                        message = L("Язык сменится после перезапуска: закройте Vela в переключателе приложений и откройте снова.")
+                    })) {
+                        Text("Системный").tag("system")
+                        Text(verbatim: "Русский").tag("ru")
+                        Text(verbatim: "English").tag("en")
+                    }
                 }
                 Section {
                     Toggle(isOn: Binding(get: { !sub.noAutoUpdate }, set: { sub.noAutoUpdate = !$0; store.setSubPrefs(sub) })) {
@@ -61,6 +94,30 @@ struct SettingsView: View {
                             Text("Каждые 3 часа").tag(3)
                             Text("Каждые 12 часов").tag(12)
                             Text("Раз в сутки").tag(24)
+                        }
+                    }
+                    Toggle(isOn: Binding(get: { store.state.reminders }, set: { on in
+                        store.setReminders(on)
+                        guard on else { return }
+                        Task {
+                            if await Reminders.shared.ensurePermission() == nil { notifyDenied = true }
+                            Reminders.shared.sync()
+                        }
+                    })) {
+                        VStack(alignment: .leading) {
+                            Text("Напоминания о подписке")
+                            Text(L("За 3 дня и за день до окончания, в день окончания и когда израсходовано 90% трафика"))
+                                .font(.caption).foregroundStyle(Palette.muted)
+                        }
+                    }
+                    Toggle(isOn: Binding(get: { store.state.clipboardCheck }, set: { on in
+                        store.setClipboardCheck(on)
+                        if !on { Pickup.shared.hint = false }
+                    })) {
+                        VStack(alignment: .leading) {
+                            Text("Ссылки из буфера обмена")
+                            Text("Предлагать добавить скопированную подписку, когда вы открываете Vela")
+                                .font(.caption).foregroundStyle(Palette.muted)
                         }
                     }
                     Toggle(isOn: Binding(get: { !sub.noHWID }, set: { sub.noHWID = !$0; store.setSubPrefs(sub) })) {
@@ -81,8 +138,8 @@ struct SettingsView: View {
                 Section {
                     Button("Экспортировать") {
                         do {
-                            sharing = ShareItem(title: "Резервная копия",
-                                                hint: "Отсканируйте QR-код в Vela на другом устройстве или отправьте текст и вставьте его в окно «Добавить».",
+                            sharing = ShareItem(title: L("Резервная копия"),
+                                                hint: L("Отсканируйте QR-код в Vela на другом устройстве или отправьте текст и вставьте его в окно «Добавить»."),
                                                 text: try store.exportBackup())
                         } catch { message = error.localizedDescription }
                     }
@@ -90,64 +147,68 @@ struct SettingsView: View {
                 } header: { Text("Резервная копия") } footer: {
                     Text("Подписки, свои серверы, избранное и настройки одним текстом или QR-кодом.")
                 }
-                Section("Фильтры") {
-                    Toggle(isOn: $s.blockAds) {
-                        VStack(alignment: .leading) {
-                            Text("Блокировать рекламу")
-                            Text("Рекламные и следящие домены не загружаются").font(.caption).foregroundStyle(Palette.muted)
-                        }
-                    }
-                    Toggle(isOn: $s.ipv6) {
-                        VStack(alignment: .leading) {
-                            Text("IPv6")
-                            Text("Выключите, если сайты открываются медленно").font(.caption).foregroundStyle(Palette.muted)
-                        }
-                    }
-                }
-                Section {
-                    TextField("gosuslugi.ru, sberbank.ru", text: $direct, axis: .vertical).textInputAutocapitalization(.never).autocorrectionDisabled()
-                } header: { Text("Всегда напрямую") }
-                Section {
-                    TextField("youtube.com, chatgpt.com", text: $proxy, axis: .vertical).textInputAutocapitalization(.never).autocorrectionDisabled()
-                } header: { Text("Всегда через VPN") }
-                Section("Для опытных") {
-                    LabeledContent("DNS через VPN") {
-                        TextField("", text: $s.remoteDNS).multilineTextAlignment(.trailing).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    }
-                    LabeledContent("DNS для прямых") {
-                        TextField("", text: $s.directDNS).multilineTextAlignment(.trailing).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    }
-                    Picker("Фрагментация TLS", selection: $s.tlsFragment) {
-                        Text("Выключена").tag("")
-                        Text("Лёгкая").tag("record")
-                        Text("Сильная").tag("full")
-                    }
-                    Button("Журнал ядра") { showLogs = true }
-                    Button("Диагностика подключения") { showDiag = true }
-                }
-                Section {
-                    ForEach($s.rules) { $rule in
-                        HStack {
-                            TextField("example.com", text: $rule.match).textInputAutocapitalization(.never).autocorrectionDisabled()
-                            Picker("", selection: $rule.action) {
-                                Text("Напрямую").tag("direct")
-                                Text("Через VPN").tag("proxy")
-                                Text("Блокировать").tag("block")
+                // ViewBuilder takes at most 10 views on iOS 16
+                Group {
+                    Section("Фильтры") {
+                        Toggle(isOn: $s.blockAds) {
+                            VStack(alignment: .leading) {
+                                Text("Блокировать рекламу")
+                                Text("Рекламные и следящие домены не загружаются").font(.caption).foregroundStyle(Palette.muted)
                             }
-                            .labelsHidden()
-                            .fixedSize()
+                        }
+                        Toggle(isOn: $s.ipv6) {
+                            VStack(alignment: .leading) {
+                                Text("IPv6")
+                                Text("Выключите, если сайты открываются медленно").font(.caption).foregroundStyle(Palette.muted)
+                            }
                         }
                     }
-                    .onDelete { s.rules.remove(atOffsets: $0) }
-                    Button("Добавить правило") { s.rules.append(RoutingRule(match: "")) }
-                } header: { Text("Свои правила") } footer: {
-                    Text("Домен (example.com — вместе с поддоменами), слово в звёздочках (*ads*) или IP/подсеть. Проверяются первыми. Смахните влево, чтобы удалить.")
-                }
-                Section("О программе") {
-                    Text("Vela \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""). Открытый исходный код под лицензией GPL-3.0. Vela не собирает статистику и не передаёт данные о вашем трафике.")
-                        .font(.footnote).foregroundStyle(Palette.muted)
-                    Button("Политика конфиденциальности") { showPrivacy = true }
-                    Button("Сбросить настройки", role: .destructive) { confirmReset = true }
+                    Section {
+                        TextField("gosuslugi.ru, sberbank.ru", text: $direct, axis: .vertical).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    } header: { Text("Всегда напрямую") }
+                    Section {
+                        TextField("youtube.com, chatgpt.com", text: $proxy, axis: .vertical).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    } header: { Text("Всегда через VPN") }
+                    Section("Для опытных") {
+                        LabeledContent("DNS через VPN") {
+                            TextField("", text: $s.remoteDNS).multilineTextAlignment(.trailing).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        }
+                        LabeledContent("DNS для прямых") {
+                            TextField("", text: $s.directDNS).multilineTextAlignment(.trailing).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        }
+                        Picker("Фрагментация TLS", selection: $s.tlsFragment) {
+                            Text("Выключена").tag("")
+                            Text("Лёгкая").tag("record")
+                            Text("Сильная").tag("full")
+                        }
+                        Button("Журнал ядра") { showLogs = true }
+                        Button("Диагностика подключения") { showDiag = true }
+                    }
+                    Section {
+                        ForEach($s.rules) { $rule in
+                            HStack {
+                                TextField("example.com", text: $rule.match).textInputAutocapitalization(.never).autocorrectionDisabled()
+                                Picker("", selection: $rule.action) {
+                                    Text("Напрямую").tag("direct")
+                                    Text("Через VPN").tag("proxy")
+                                    Text("Блокировать").tag("block")
+                                }
+                                .labelsHidden()
+                                .fixedSize()
+                            }
+                        }
+                        .onDelete { s.rules.remove(atOffsets: $0) }
+                        Button("Добавить правило") { s.rules.append(RoutingRule(match: "")) }
+                    } header: { Text("Свои правила") } footer: {
+                        Text("Домен (example.com — вместе с поддоменами), слово в звёздочках (*ads*) или IP/подсеть. Проверяются первыми. Смахните влево, чтобы удалить.")
+                    }
+                    Section("О программе") {
+                        Text(LF("Vela %@. Открытый исходный код под лицензией GPL-3.0. Vela не собирает аналитику и никому не передаёт данные о вашем трафике: статистика хранится только на этом устройстве.",
+                                Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
+                            .font(.footnote).foregroundStyle(Palette.muted)
+                        Button("Политика конфиденциальности") { showPrivacy = true }
+                        Button("Сбросить настройки", role: .destructive) { confirmReset = true }
+                    }
                 }
             }
             .scrollContentBackground(.hidden)
@@ -172,6 +233,14 @@ struct SettingsView: View {
             .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
                 Button("OK", role: .cancel) {}
             }
+            .alert("Уведомления выключены", isPresented: $notifyDenied) {
+                Button("Открыть настройки") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+                }
+                Button("Отмена", role: .cancel) {}
+            } message: {
+                Text("Разрешите уведомления для Vela в Настройках iPhone, чтобы получать напоминания о подписке.")
+            }
             .confirmationDialog("Сбросить настройки?", isPresented: $confirmReset, titleVisibility: .visible) {
                 Button("Сбросить", role: .destructive) {
                     store.resetSettings()
@@ -191,7 +260,7 @@ struct SettingsView: View {
             .alert("Конфиденциальность", isPresented: $showPrivacy) {
                 Button("Понятно", role: .cancel) {}
             } message: {
-                Text("Vela хранит серверы и настройки только на этом устройстве и исключает их из резервных копий. Приложение не собирает аналитику, не показывает рекламу и не отправляет данные о посещаемых сайтах ни нам, ни третьим лицам. Трафик идёт на сервер, который вы добавили сами.")
+                Text("Vela хранит серверы, настройки и статистику трафика только на этом устройстве и исключает их из резервных копий. Приложение не собирает аналитику, не показывает рекламу и не отправляет данные о посещаемых сайтах ни нам, ни третьим лицам. Трафик идёт на сервер, который вы добавили сами.")
             }
         }
         .tint(Palette.star)
