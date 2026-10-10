@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.widget.RemoteViews
+import app.vela.client.Lang
 import app.vela.client.R
 import app.vela.client.data.Store
 import app.vela.client.ui.MainActivity
@@ -30,17 +31,19 @@ class VelaWidget : AppWidgetProvider() {
             if (ids.isNotEmpty()) render(context, manager, ids)
         }
 
-        private fun render(context: Context, manager: AppWidgetManager, ids: IntArray) {
+        private fun render(base: Context, manager: AppWidgetManager, ids: IntArray) {
+            val context = Lang.localized(base)
             val status = VpnManager.status.value
             val st = Store.state.value
             val profile = st.active
             val on = status.state == ConnState.Connected
             val busy = status.state == ConnState.Connecting || status.state == ConnState.Disconnecting
             val server = when {
-                profile == null -> "Добавьте сервер в приложении"
+                profile == null -> context.getString(R.string.widget_add_server)
                 st.selectedNode == "auto" || profile.nodes.none { it.id == st.selectedNode } -> {
                     val live = profile.nodes.firstOrNull { it.id == status.activeNode }
-                    if (on && live != null) "Автовыбор: " + live.name else "Автовыбор · " + profile.name
+                    if (on && live != null) context.getString(R.string.widget_auto_live, live.name)
+                    else context.getString(R.string.widget_auto_profile, profile.name)
                 }
                 else -> profile.nodes.first { it.id == st.selectedNode }.let { (splitFlag(it.name).first?.let { f -> "$f " } ?: "") + splitFlag(it.name).second }
             }

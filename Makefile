@@ -1,7 +1,7 @@
 TAGS := with_gvisor,with_quic,with_utls,with_clash_api
-VERSION := 1.3.2
+VERSION := 1.4.0
 
-.PHONY: core test windows android-lib ios-lib android icons
+.PHONY: core rules test windows android-lib ios-lib android icons
 
 core:
 	./scripts/prepare-core.sh
@@ -10,8 +10,12 @@ core:
 test: core
 	go test -tags "$(TAGS)" ./core/
 
+# Fresh "blocked in Russia" lists for release builds
+rules: core
+	./scripts/update-rules.sh
+
 # Windows client: dist/Vela.exe (single file, no installer needed)
-windows: core
+windows: core rules
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -tags "$(TAGS)" \
 		-ldflags "-s -w -H windowsgui -X main.Version=$(VERSION)" -o dist/Vela.exe ./desktop
 

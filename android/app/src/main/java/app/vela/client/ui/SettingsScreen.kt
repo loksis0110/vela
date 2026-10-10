@@ -48,11 +48,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.vela.client.BuildConfig
+import app.vela.client.R
 import app.vela.client.data.Rule
 import app.vela.client.data.Settings
 import app.vela.client.data.SubPrefs
@@ -73,6 +75,12 @@ fun SettingsScreen(
     connectOnLaunch: Boolean,
     onConnectOnLaunch: (Boolean) -> Unit,
     onReset: () -> Unit,
+    language: String,
+    onLanguage: (String) -> Unit,
+    clipboard: Boolean,
+    onClipboard: (Boolean) -> Unit,
+    reminders: Boolean,
+    onReminders: (Boolean) -> Unit,
 ) {
     var ua by rememberSaveable { mutableStateOf(sub.userAgent) }
     var confirmReset by remember { mutableStateOf(false) }
@@ -119,27 +127,57 @@ fun SettingsScreen(
 
     Column(Modifier.fillMaxSize().background(Vela.Ink).safeDrawingPadding()) {
         Row(Modifier.fillMaxWidth().padding(start = 4.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Назад") }
-            Text("Настройки", style = MaterialTheme.typography.titleLarge)
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, stringResource(R.string.back)) }
+            Text(stringResource(R.string.settings_title), style = MaterialTheme.typography.titleLarge)
         }
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp)) {
-            Group("Подключение") {
-                SwitchRow("Подключаться при запуске", "Vela подключится сама, когда вы её откроете", connectOnLaunch, onConnectOnLaunch)
+            Group(stringResource(R.string.set_routing)) {
+                routingModes.forEach { m ->
+                    Row(
+                        Modifier.fillMaxWidth().clickable(role = Role.RadioButton) {
+                            if (m.value != settings.routing) onChange(settings.copy(routing = m.value))
+                        }.padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(settings.routing == m.value, null, colors = RadioButtonDefaults.colors(selectedColor = Vela.Star))
+                        Column(Modifier.padding(start = 8.dp)) {
+                            Text(stringResource(m.title), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Text(stringResource(m.hint), color = Vela.Muted, fontSize = 12.5.sp)
+                        }
+                    }
+                }
+            }
+            Group(stringResource(R.string.set_connection)) {
+                SwitchRow(stringResource(R.string.set_connect_on_launch), stringResource(R.string.set_connect_on_launch_hint), connectOnLaunch, onConnectOnLaunch)
                 Divider()
                 SwitchRow(
-                    "Автопереключение при сбое", "Если сервер перестал отвечать, Vela сама перейдёт на рабочий",
+                    stringResource(R.string.set_failover), stringResource(R.string.set_failover_hint),
                     !settings.disableFailover,
                 ) { onChange(settings.copy(disableFailover = !it)) }
             }
-            Group("Оформление") {
+            Group(stringResource(R.string.set_appearance)) {
                 Segmented(
-                    listOf("system" to "Как в системе", "light" to "Светлая", "dark" to "Тёмная"), theme, onTheme,
-                    Modifier.padding(vertical = 8.dp),
+                    listOf(
+                        "system" to stringResource(R.string.theme_system),
+                        "light" to stringResource(R.string.theme_light),
+                        "dark" to stringResource(R.string.theme_dark),
+                    ),
+                    theme, onTheme, Modifier.padding(vertical = 8.dp),
+                )
+                Text(stringResource(R.string.set_language), color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
+                Segmented(
+                    // language names are shown in their own language
+                    listOf("system" to stringResource(R.string.lang_system), "ru" to "Русский", "en" to "English"),
+                    language, onLanguage, Modifier.padding(vertical = 8.dp),
                 )
             }
-            Group("Раздельное туннелирование") {
-                Text("Какие приложения идут через VPN", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
-                listOf("" to "Все приложения", "exclude" to "Все, кроме выбранных", "only" to "Только выбранные").forEach { (v, l) ->
+            Group(stringResource(R.string.set_split)) {
+                Text(stringResource(R.string.set_split_hint), color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
+                listOf(
+                    "" to stringResource(R.string.split_all),
+                    "exclude" to stringResource(R.string.split_exclude),
+                    "only" to stringResource(R.string.split_only),
+                ).forEach { (v, l) ->
                     Row(
                         Modifier.fillMaxWidth().clickable(role = Role.RadioButton) {
                             if (v != settings.appMode) {
@@ -155,68 +193,83 @@ fun SettingsScreen(
                 }
                 if (settings.appMode.isNotEmpty()) {
                     val names = settings.apps.take(4).joinToString(", ") { appLabel(context, it) } +
-                        if (settings.apps.size > 4) " и ещё ${settings.apps.size - 4}" else ""
+                        if (settings.apps.size > 4) " " + stringResource(R.string.split_more, settings.apps.size - 4) else ""
                     ActionRow(
-                        if (settings.apps.isEmpty()) "Выбрать приложения" else "Приложения: ${settings.apps.size}",
-                        names.ifEmpty { "Ни одного не выбрано" },
+                        if (settings.apps.isEmpty()) stringResource(R.string.split_choose) else stringResource(R.string.split_count, settings.apps.size),
+                        names.ifEmpty { stringResource(R.string.split_none) },
                     ) { picking = true }
                 }
             }
-            Group("Подписки") {
-                SwitchRow("Обновлять автоматически", "Списки серверов обновляются при открытии приложения", !sub.noAutoUpdate) {
+            Group(stringResource(R.string.set_subscriptions)) {
+                SwitchRow(stringResource(R.string.set_auto_update), stringResource(R.string.set_auto_update_hint), !sub.noAutoUpdate) {
                     onSub(sub.copy(noAutoUpdate = !it))
                 }
                 if (!sub.noAutoUpdate) {
-                    Text("Как часто", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
+                    Text(stringResource(R.string.set_how_often), color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
                     Segmented(
-                        listOf("0" to "Как у провайдера", "3" to "3 ч", "12" to "12 ч", "24" to "Сутки"),
+                        listOf(
+                            "0" to stringResource(R.string.interval_provider),
+                            "3" to stringResource(R.string.interval_3h),
+                            "12" to stringResource(R.string.interval_12h),
+                            "24" to stringResource(R.string.interval_day),
+                        ),
                         sub.updateHours.toString(), { onSub(sub.copy(updateHours = it.toInt())) },
                         Modifier.padding(vertical = 8.dp),
                     )
                 }
                 Divider()
+                SwitchRow(stringResource(R.string.set_reminders), stringResource(R.string.set_reminders_hint), reminders, onReminders)
+                Divider()
+                SwitchRow(stringResource(R.string.set_clipboard), stringResource(R.string.set_clipboard_hint), clipboard, onClipboard)
+                Divider()
                 SwitchRow(
-                    "Отправлять HWID",
-                    "Случайный номер этой установки, модель телефона и версия Android. Нужен провайдерам с лимитом устройств, личных данных нет",
+                    stringResource(R.string.set_hwid),
+                    stringResource(R.string.set_hwid_hint),
                     !sub.noHwid,
                 ) { onSub(sub.copy(noHwid = !it)) }
-                Field("User-Agent", ua, "по умолчанию Vela") { ua = it }
+                Field("User-Agent", ua, stringResource(R.string.set_ua_placeholder)) { ua = it }
                 Text(
-                    "Меняйте, только если провайдер просит определённый клиент. Затем обновите подписку.",
+                    stringResource(R.string.set_ua_hint),
                     color = Vela.Muted, fontSize = 12.sp, modifier = Modifier.padding(bottom = 6.dp),
                 )
             }
-            Group("Резервная копия") {
+            Group(stringResource(R.string.set_backup)) {
                 Text(
-                    "Подписки, свои серверы, избранное и настройки одним текстом или QR-кодом.",
+                    stringResource(R.string.set_backup_hint),
                     color = Vela.Muted, fontSize = 12.5.sp, modifier = Modifier.padding(top = 8.dp),
                 )
                 Row {
-                    TextButton(onClick = onExport) { Text("Экспортировать", color = Vela.Star) }
-                    TextButton(onClick = onImport) { Text("Импортировать", color = Vela.Star) }
+                    TextButton(onClick = onExport) { Text(stringResource(R.string.export), color = Vela.Star) }
+                    TextButton(onClick = onImport) { Text(stringResource(R.string.import_action), color = Vela.Star) }
                 }
             }
-            Group("Фильтры") {
-                SwitchRow("Блокировать рекламу", "Рекламные и следящие домены не загружаются", settings.blockAds) {
-                    onChange(settings.copy(blockAds = it))
+            Group(stringResource(R.string.set_filters)) {
+                if (!BuildConfig.PLAY) {
+                    SwitchRow(stringResource(R.string.set_block_ads), stringResource(R.string.set_block_ads_hint), settings.blockAds) {
+                        onChange(settings.copy(blockAds = it))
+                    }
+                    Divider()
                 }
+                SwitchRow("IPv6", stringResource(R.string.set_ipv6_hint), settings.ipv6) { onChange(settings.copy(ipv6 = it)) }
                 Divider()
-                SwitchRow("IPv6", "Выключите, если сайты открываются медленно", settings.ipv6) { onChange(settings.copy(ipv6 = it)) }
-                Divider()
-                Field("Всегда напрямую", direct, "gosuslugi.ru, sberbank.ru") { direct = it; dirty = true }
-                Field("Всегда через VPN", proxy, "youtube.com, chatgpt.com") { proxy = it; dirty = true }
+                Field(stringResource(R.string.set_always_direct), direct, "gosuslugi.ru, sberbank.ru") { direct = it; dirty = true }
+                Field(stringResource(R.string.set_always_proxy), proxy, "youtube.com, chatgpt.com") { proxy = it; dirty = true }
             }
-            Group("Система") {
-                ActionRow("Постоянный VPN", "Включите «Постоянная VPN» и «Блокировать соединения без VPN» в настройках Android", onSystemVpnSettings)
+            Group(stringResource(R.string.set_system)) {
+                ActionRow(stringResource(R.string.set_always_on), stringResource(R.string.set_always_on_hint), onSystemVpnSettings)
             }
-            Group("Для опытных") {
+            Group(stringResource(R.string.set_advanced)) {
                 if (!advanced) {
-                    TextButton(onClick = { advanced = true }) { Text("Показать", color = Vela.Muted) }
+                    TextButton(onClick = { advanced = true }) { Text(stringResource(R.string.show), color = Vela.Muted) }
                 } else {
-                    Field("DNS через VPN", remoteDns, "https://1.1.1.1/dns-query") { remoteDns = it; dirty = true }
-                    Field("DNS для прямых сайтов", directDns, "77.88.8.8") { directDns = it; dirty = true }
-                    Text("Сетевой стек", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 10.dp))
-                    listOf("mixed" to "Смешанный (рекомендуется)", "system" to "Системный (быстрее)", "gvisor" to "gVisor (совместимее)").forEach { (v, l) ->
+                    Field(stringResource(R.string.set_remote_dns), remoteDns, "https://1.1.1.1/dns-query") { remoteDns = it; dirty = true }
+                    Field(stringResource(R.string.set_direct_dns), directDns, "77.88.8.8") { directDns = it; dirty = true }
+                    Text(stringResource(R.string.set_stack), color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 10.dp))
+                    listOf(
+                        "mixed" to stringResource(R.string.stack_mixed),
+                        "system" to stringResource(R.string.stack_system),
+                        "gvisor" to stringResource(R.string.stack_gvisor),
+                    ).forEach { (v, l) ->
                         Row(
                             Modifier.fillMaxWidth().clickable(role = Role.RadioButton) { onChange(settings.copy(stack = v)) }.padding(vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -226,12 +279,13 @@ fun SettingsScreen(
                         }
                     }
                     Divider()
-                    Text("Фрагментация TLS", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 10.dp))
-                    Text(
-                        "Разбивает начало TLS-соединения, чтобы обойти простую блокировку. Включайте, только если без неё не работает.",
-                        color = Vela.Muted, fontSize = 12.sp,
-                    )
-                    listOf("" to "Выключена", "record" to "Лёгкая", "full" to "Сильная (медленнее)").forEach { (v, l) ->
+                    Text(stringResource(R.string.set_fragment), color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 10.dp))
+                    Text(stringResource(R.string.set_fragment_hint), color = Vela.Muted, fontSize = 12.sp)
+                    listOf(
+                        "" to stringResource(R.string.fragment_off),
+                        "record" to stringResource(R.string.fragment_light),
+                        "full" to stringResource(R.string.fragment_full),
+                    ).forEach { (v, l) ->
                         Row(
                             Modifier.fillMaxWidth().clickable(role = Role.RadioButton) { onChange(settings.copy(tlsFragment = v)) }.padding(vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -241,11 +295,8 @@ fun SettingsScreen(
                         }
                     }
                     Divider()
-                    Text("Свои правила", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 10.dp))
-                    Text(
-                        "Домен (example.com — вместе с поддоменами), слово в звёздочках (*ads*) или IP/подсеть. Проверяются первыми.",
-                        color = Vela.Muted, fontSize = 12.sp,
-                    )
+                    Text(stringResource(R.string.set_rules), color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 10.dp))
+                    Text(stringResource(R.string.set_rules_hint), color = Vela.Muted, fontSize = 12.sp)
                     rules.forEachIndexed { i, r ->
                         RuleRow(
                             r,
@@ -253,19 +304,18 @@ fun SettingsScreen(
                             onDelete = { rules = rules.toMutableList().also { it.removeAt(i) }; dirty = true },
                         )
                     }
-                    TextButton(onClick = { rules = rules + Rule("", "direct"); dirty = true }) { Text("+ Добавить правило", color = Vela.Star) }
+                    TextButton(onClick = { rules = rules + Rule("", "direct"); dirty = true }) { Text(stringResource(R.string.add_rule), color = Vela.Star) }
                     Divider()
-                    ActionRow("Журнал ядра", "Что происходит с подключением. Пригодится, если что-то не работает") { logs = true }
+                    ActionRow(stringResource(R.string.log_title), stringResource(R.string.set_log_hint)) { logs = true }
                 }
             }
-            Group("О программе") {
+            Group(stringResource(R.string.set_about)) {
                 Text(
-                    "Vela ${BuildConfig.VERSION_NAME}. Открытый исходный код под лицензией GPL-3.0. " +
-                        "Vela не собирает статистику и не передаёт данные о вашем трафике.",
+                    stringResource(R.string.set_about_text, BuildConfig.VERSION_NAME),
                     color = Vela.Muted, fontSize = 13.5.sp, modifier = Modifier.padding(vertical = 8.dp),
                 )
-                TextButton(onClick = onPrivacy) { Text("Политика конфиденциальности", color = Vela.Star) }
-                TextButton(onClick = { confirmReset = true }) { Text("Сбросить настройки", color = Vela.Danger) }
+                TextButton(onClick = onPrivacy) { Text(stringResource(R.string.privacy_policy), color = Vela.Star) }
+                TextButton(onClick = { confirmReset = true }) { Text(stringResource(R.string.reset_settings), color = Vela.Danger) }
             }
         }
     }
@@ -289,10 +339,10 @@ fun SettingsScreen(
         AlertDialog(
             onDismissRequest = { confirmReset = false },
             containerColor = Vela.Deep,
-            title = { Text("Сбросить настройки?") },
-            text = { Text("Все настройки вернутся по умолчанию. Подписки, серверы и избранное останутся.") },
-            confirmButton = { TextButton(onClick = { confirmReset = false; onReset() }) { Text("Сбросить", color = Vela.Danger) } },
-            dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Отмена") } },
+            title = { Text(stringResource(R.string.reset_title)) },
+            text = { Text(stringResource(R.string.reset_text)) },
+            confirmButton = { TextButton(onClick = { confirmReset = false; onReset() }) { Text(stringResource(R.string.reset), color = Vela.Danger) } },
+            dismissButton = { TextButton(onClick = { confirmReset = false }) { Text(stringResource(R.string.cancel)) } },
         )
     }
 }
@@ -300,7 +350,11 @@ fun SettingsScreen(
 @Composable
 private fun RuleRow(rule: Rule, onChange: (Rule) -> Unit, onDelete: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
-    val actions = listOf("direct" to "Напрямую", "proxy" to "Через VPN", "block" to "Блокировать")
+    val actions = listOf(
+        "direct" to stringResource(R.string.rule_direct),
+        "proxy" to stringResource(R.string.rule_proxy),
+        "block" to stringResource(R.string.rule_block),
+    )
     Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         OutlinedTextField(
             value = rule.match, onValueChange = { onChange(rule.copy(match = it)) }, singleLine = true,
@@ -311,14 +365,14 @@ private fun RuleRow(rule: Rule, onChange: (Rule) -> Unit, onDelete: () -> Unit) 
         )
         Box {
             TextButton(onClick = { menu = true }) {
-                Text(actions.firstOrNull { it.first == rule.action }?.second ?: "Напрямую", color = Vela.Text, fontSize = 13.sp)
+                Text(actions.firstOrNull { it.first == rule.action }?.second ?: actions[0].second, color = Vela.Text, fontSize = 13.sp)
             }
             DropdownMenu(menu, { menu = false }, containerColor = Vela.Deep) {
                 actions.forEach { (v, l) -> DropdownMenuItem({ Text(l) }, { onChange(rule.copy(action = v)); menu = false }) }
             }
         }
         IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
-            Icon(Icons.Rounded.Close, "Удалить правило", tint = Vela.Muted, modifier = Modifier.size(18.dp))
+            Icon(Icons.Rounded.Close, stringResource(R.string.delete_rule), tint = Vela.Muted, modifier = Modifier.size(18.dp))
         }
     }
 }

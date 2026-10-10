@@ -18,7 +18,7 @@ import (
 
 // UserAgent is sent when downloading subscriptions. Most panels
 // (Marzban, 3x-ui, Remnawave) return plain share links for it.
-var UserAgent = "Vela/1.3 (v2rayN-compatible)"
+var UserAgent = "Vela/1.4 (v2rayN-compatible)"
 
 // FetchOptions change how subscriptions are requested.
 type FetchOptions struct {
@@ -45,7 +45,9 @@ func SetFetchOptions(o FetchOptions) {
 	fetchMu.Unlock()
 }
 
-func applyFetchHeaders(h http.Header) {
+// applyFetchHeaders sets the User-Agent and, over HTTPS only, the device
+// headers: the HWID never travels unencrypted.
+func applyFetchHeaders(h http.Header, secure bool) {
 	fetchMu.RLock()
 	o := fetchOpts
 	fetchMu.RUnlock()
@@ -54,7 +56,7 @@ func applyFetchHeaders(h http.Header) {
 		ua = UserAgent
 	}
 	h.Set("User-Agent", ua)
-	if o.HWID != "" {
+	if o.HWID != "" && secure {
 		h.Set("x-hwid", o.HWID)
 		if o.DeviceOS != "" {
 			h.Set("x-device-os", o.DeviceOS)
@@ -81,7 +83,10 @@ type Subscription struct {
 	UpdateInterval int      `json:"updateIntervalHours"`
 	SupportURL     string   `json:"supportUrl,omitempty"`
 	WebPageURL     string   `json:"webPageUrl,omitempty"`
-	UpdatedAt      int64    `json:"updatedAt"`
+	// Announce is a message from the provider (the "announce" header or an
+	// "#announce:" line), shown as a banner.
+	Announce  string `json:"announce,omitempty"`
+	UpdatedAt int64  `json:"updatedAt"`
 }
 
 // FetchSubscription downloads and parses a subscription.
@@ -89,7 +94,7 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 	rawURL = strings.TrimSpace(rawURL)
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("это не ссылка на подписку")
+		return nil, errorf("это не ссылка на подписку")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -97,51 +102,73 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 	if err != nil {
 		return nil, err
 	}
-	applyFetchHeaders(req.Header)
+	applyFetchHeaders(req.Header, u.Scheme == "https")
 	req.Header.Set("Accept", "*/*")
 	client := &http.Client{Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Second,
+	}, CheckRedirect: func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errorf("слишком много перенаправлений")
+		}
+		if next.URL.Scheme != "https" {
+			for _, k := range []string{"x-hwid", "x-device-os", "x-ver-os", "x-device-model"} {
+				next.Header.Del(k)
+			}
+		}
+		return nil
 	}}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("не удалось загрузить подписку: %w", err)
+		return nil, errorf("не удалось загрузить подписку: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		switch resp.StatusCode {
 		case http.StatusForbidden, http.StatusUnauthorized:
-			return nil, fmt.Errorf("сервер подписки отказал (%d). Возможно, нужен HWID или превышен лимит устройств", resp.StatusCode)
+			return nil, errorf("сервер подписки отказал (%d). Возможно, нужен HWID или превышен лимит устройств", resp.StatusCode)
 		case http.StatusNotFound:
-			return nil, fmt.Errorf("подписка не найдена (404). Проверьте ссылку")
+			return nil, errorf("подписка не найдена (404). Проверьте ссылку")
 		}
-		return nil, fmt.Errorf("сервер подписки ответил %d", resp.StatusCode)
+		return nil, errorf("сервер подписки ответил %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, err
 	}
-	parsed := ParseText(string(body))
+	text, directives := extractDirectives(string(body))
+	parsed := ParseText(text)
 	if len(parsed.Nodes) == 0 {
-		msg := "в подписке нет поддерживаемых серверов"
+		msg := T("в подписке нет поддерживаемых серверов")
 		if len(parsed.Errors) > 0 {
 			msg += ": " + parsed.Errors[0]
 		}
 		return nil, fmt.Errorf("%s", msg)
 	}
+	// headers win over "#key: value" lines in the body
+	header := func(key string) string {
+		if v := strings.TrimSpace(resp.Header.Get(key)); v != "" {
+			return v
+		}
+		return directives[key]
+	}
 	sub := &Subscription{URL: rawURL, Nodes: parsed.Nodes, Errors: parsed.Errors, UpdatedAt: time.Now().Unix()}
-	sub.Title = decodeHeaderText(resp.Header.Get("profile-title"))
+	sub.Title = decodeHeaderText(header("profile-title"))
 	if sub.Title == "" {
 		sub.Title = u.Hostname()
 	}
-	if v := resp.Header.Get("profile-update-interval"); v != "" {
+	if v := header("profile-update-interval"); v != "" {
 		sub.UpdateInterval, _ = strconv.Atoi(strings.TrimSpace(v))
 	}
-	sub.SupportURL = resp.Header.Get("support-url")
-	sub.WebPageURL = resp.Header.Get("profile-web-page-url")
-	for _, part := range strings.Split(resp.Header.Get("subscription-userinfo"), ";") {
+	sub.SupportURL = header("support-url")
+	sub.WebPageURL = header("profile-web-page-url")
+	sub.Announce = decodeHeaderText(header("announce"))
+	if len([]rune(sub.Announce)) > 500 {
+		sub.Announce = string([]rune(sub.Announce)[:500]) + "…"
+	}
+	for _, part := range strings.Split(header("subscription-userinfo"), ";") {
 		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if !ok {
 			continue
@@ -163,6 +190,45 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 		sub.Nodes[i].ID = shortHash(rawURL + "|" + sub.Nodes[i].Link)
 	}
 	return sub, nil
+}
+
+// extractDirectives takes "#key: value" lines (Happ-style subscription
+// metadata for providers that can't set headers) out of a plain or base64
+// body.
+func extractDirectives(body string) (string, map[string]string) {
+	directives := map[string]string{}
+	take := func(text string) (string, bool) {
+		var rest []string
+		found := false
+		for _, line := range strings.Split(text, "\n") {
+			l := strings.TrimSpace(line)
+			if strings.HasPrefix(l, "#") {
+				k, v, ok := strings.Cut(strings.TrimPrefix(l, "#"), ":")
+				k = strings.ToLower(strings.TrimSpace(k))
+				if ok && k != "" && !strings.Contains(k, " ") {
+					directives[k] = strings.TrimSpace(v)
+					found = true
+				}
+				continue
+			}
+			rest = append(rest, line)
+		}
+		return strings.Join(rest, "\n"), found
+	}
+	trimmed := strings.TrimSpace(strings.TrimPrefix(body, "\ufeff"))
+	if !strings.Contains(trimmed, "://") && !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		if decoded, ok := tryBase64(trimmed); ok && strings.Contains(decoded, "://") {
+			if rest, found := take(decoded); found {
+				return rest, directives
+			}
+			return body, directives
+		}
+	}
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") || looksLikeClash(trimmed) {
+		return body, directives
+	}
+	rest, _ := take(body)
+	return rest, directives
 }
 
 func decodeHeaderText(v string) string {

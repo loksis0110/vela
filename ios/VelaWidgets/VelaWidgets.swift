@@ -88,11 +88,11 @@ struct VPNEntry: TimelineEntry {
     var busy: Bool { status == .connecting || status == .reasserting || status == .disconnecting }
     var text: String {
         switch status {
-        case .connected: "Защищено"
-        case .connecting, .reasserting: "Подключение…"
-        case .disconnecting: "Отключение…"
-        case .invalid: "Не настроено"
-        default: "Не подключено"
+        case .connected: NSLocalizedString("Защищено", comment: "")
+        case .connecting, .reasserting: NSLocalizedString("Подключение…", comment: "")
+        case .disconnecting: NSLocalizedString("Отключение…", comment: "")
+        case .invalid: NSLocalizedString("Не настроено", comment: "")
+        default: NSLocalizedString("Не подключено", comment: "")
         }
     }
 }
@@ -120,7 +120,7 @@ struct VPNWidgetView: View {
 
     var body: some View {
         let button = Button(intent: ToggleVPNIntent(value: !(entry.on || entry.busy))) {
-            Text(entry.on || entry.busy ? "Отключить" : "Подключить")
+            Text(entry.on || entry.busy ? NSLocalizedString("Отключить", comment: "") : NSLocalizedString("Подключить", comment: ""))
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(entry.on ? Colors.onSea : Colors.onStar)
                 .frame(maxWidth: family == .systemSmall ? .infinity : nil)
@@ -148,7 +148,7 @@ struct VPNWidgetView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Image(systemName: "sailboat.fill").foregroundStyle(Colors.star)
-                Text("Vela").font(.system(size: 15, weight: .semibold)).foregroundStyle(Colors.star)
+                Text(verbatim: "Vela").font(.system(size: 15, weight: .semibold)).foregroundStyle(Colors.star)
             }
             HStack(spacing: 6) {
                 Circle().fill(entry.on ? Colors.sea : Colors.muted).frame(width: 8, height: 8)
@@ -183,7 +183,8 @@ struct VelaControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: "app.vela.client.control", provider: VPNValueProvider()) { on in
             ControlWidgetToggle("Vela", isOn: on, action: ToggleVPNIntent()) { isOn in
-                Label(isOn ? "Подключено" : "Выключено", systemImage: isOn ? "sailboat.fill" : "sailboat")
+                Label(isOn ? NSLocalizedString("Подключено", comment: "") : NSLocalizedString("Выключено", comment: ""),
+                      systemImage: isOn ? "sailboat.fill" : "sailboat")
             }
         }
         .displayName("Vela VPN")

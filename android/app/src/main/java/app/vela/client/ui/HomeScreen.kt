@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,7 +28,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.outlined.BarChart
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.rounded.Campaign
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -36,6 +42,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -43,6 +50,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -76,6 +85,10 @@ fun HomeScreen(
     speed: SpeedState,
     onIp: () -> Unit,
     onSpeed: () -> Unit,
+    announce: String?,
+    onDismissAnnounce: () -> Unit,
+    onStats: () -> Unit,
+    onConnections: () -> Unit,
 ) {
     var now by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
     LaunchedEffect(status.state) {
@@ -105,18 +118,23 @@ fun HomeScreen(
             Image(painterResource(R.drawable.logo), null, Modifier.size(30.dp).clip(RoundedCornerShape(8.dp)))
             Spacer(Modifier.size(10.dp))
             Text("Vela", color = Vela.Star, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            IconButton(onClick = onStats) {
+                Icon(Icons.Outlined.BarChart, contentDescription = stringResource(R.string.stats_title), tint = Vela.Muted)
+            }
             IconButton(onClick = onSettings) {
-                Icon(Icons.Outlined.Settings, contentDescription = "Настройки", tint = Vela.Muted)
+                Icon(Icons.Outlined.Settings, contentDescription = stringResource(R.string.settings_title), tint = Vela.Muted)
             }
         }
 
         // ---- constellation control
-        val label = when (status.state) {
-            ConnState.Connected -> "Отключить"
-            ConnState.Connecting -> "Отмена"
-            ConnState.Disconnecting -> "Отключение"
-            ConnState.Disconnected -> "Подключить"
-        }
+        val label = stringResource(
+            when (status.state) {
+                ConnState.Connected -> R.string.disconnect
+                ConnState.Connecting -> R.string.cancel
+                ConnState.Disconnecting -> R.string.disconnecting_short
+                ConnState.Disconnected -> R.string.connect
+            },
+        )
         Box(
             Modifier
                 .padding(top = 8.dp)
@@ -148,17 +166,17 @@ fun HomeScreen(
             )
         }
 
-        val (statusText, statusColor) = when (status.state) {
-            ConnState.Connected -> "Защищено" to Vela.Sea
-            ConnState.Connecting -> "Подключение…" to Vela.Flare
-            ConnState.Disconnecting -> "Отключение…" to Vela.Text
-            ConnState.Disconnected -> "Не подключено" to Vela.Text
+        val (statusRes, statusColor) = when (status.state) {
+            ConnState.Connected -> R.string.status_protected to Vela.Sea
+            ConnState.Connecting -> R.string.status_connecting to Vela.Flare
+            ConnState.Disconnecting -> R.string.status_disconnecting to Vela.Text
+            ConnState.Disconnected -> R.string.status_off to Vela.Text
         }
-        Text(statusText, style = MaterialTheme.typography.headlineSmall, color = statusColor, modifier = Modifier.padding(top = 10.dp))
+        Text(stringResource(statusRes), style = MaterialTheme.typography.headlineSmall, color = statusColor, modifier = Modifier.padding(top = 10.dp))
         val sub = when {
             status.state == ConnState.Connected && status.since > 0 ->
-                formatDuration(now - status.since) + ", передано " + formatBytes(status.upTotal + status.downTotal)
-            app.profiles.isEmpty() -> "Добавьте сервер, чтобы начать"
+                stringResource(R.string.home_session, formatDuration(now - status.since), formatBytes(status.upTotal + status.downTotal))
+            app.profiles.isEmpty() -> stringResource(R.string.home_add_server_hint)
             else -> ""
         }
         Text(sub, color = Vela.Muted, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 4.dp).height(20.dp))
@@ -168,7 +186,14 @@ fun HomeScreen(
                 SpeedLabel("↑", formatSpeed(status.up))
             }
             TrafficGraph(history, Modifier.padding(top = 12.dp).fillMaxWidth())
+            TextButton(onClick = onConnections, modifier = Modifier.padding(top = 2.dp)) {
+                Icon(Icons.Rounded.SwapVert, null, tint = Vela.Muted, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.size(6.dp))
+                Text(stringResource(R.string.connections_title), color = Vela.Muted, fontSize = 13.sp)
+            }
         }
+
+        announce?.let { AnnounceBanner(it, onDismissAnnounce, Modifier.padding(top = 16.dp)) }
 
         status.notice?.let { msg ->
             Row(
@@ -182,7 +207,7 @@ fun HomeScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(msg, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(vertical = 8.dp))
-                TextButton(onClick = onDismissNotice) { Text("Понятно", color = Vela.Muted) }
+                TextButton(onClick = onDismissNotice) { Text(stringResource(R.string.ok_got_it), color = Vela.Muted) }
             }
         }
 
@@ -198,7 +223,7 @@ fun HomeScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(err, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(vertical = 8.dp))
-                TextButton(onClick = onDismissError) { Text("Скрыть", color = Vela.Muted) }
+                TextButton(onClick = onDismissError) { Text(stringResource(R.string.hide), color = Vela.Muted) }
             }
         }
 
@@ -208,9 +233,9 @@ fun HomeScreen(
     Column(Modifier.padding(top = 24.dp, bottom = 16.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             val (ipValue, ipMeta) = ipTexts(ip, ipBusy, ipError)
-            ToolCard("Мой IP", ipValue, ipMeta, ipBusy, Modifier.weight(1f), onIp)
+            ToolCard(stringResource(R.string.tool_ip), ipValue, ipMeta, ipBusy, Modifier.weight(1f), onIp)
             val (spValue, spMeta) = speedTexts(speed)
-            ToolCard("Скорость", spValue, spMeta, speed.running, Modifier.weight(1f), onSpeed)
+            ToolCard(stringResource(R.string.tool_speed), spValue, spMeta, speed.running, Modifier.weight(1f), onSpeed)
         }
         Spacer(Modifier.height(10.dp))
         CurrentServer(app, status, pings, onServers)
@@ -233,21 +258,24 @@ private fun SpeedLabel(arrow: String, value: String) {
 @Composable
 private fun CurrentServer(app: AppState, status: VpnStatus, pings: Map<String, Int>, onClick: () -> Unit) {
     val profile = app.active
+    val auto = stringResource(R.string.auto_select)
     val (badge, title, meta) = when {
-        profile == null || profile.nodes.isEmpty() -> Triple("+", "Добавить сервер", "Ссылка на подписку или vless://, hy2://…")
+        profile == null || profile.nodes.isEmpty() ->
+            Triple("+", stringResource(R.string.home_add_server), stringResource(R.string.home_add_server_meta))
         app.selectedNode == "auto" || profile.nodes.none { it.id == app.selectedNode } -> {
             val live = profile.nodes.firstOrNull { it.id == status.activeNode }
             if (live != null) {
-                val ping = pings[live.id]?.takeIf { it > 0 }?.let { ", $it мс" } ?: ""
-                Triple(badgeFor(live.name), "Автовыбор", "Сейчас: " + splitFlag(live.name).second + ping)
+                val ping = pings[live.id]?.takeIf { it > 0 }?.let { ", " + formatMs(it) } ?: ""
+                Triple(badgeFor(live.name), auto, stringResource(R.string.now_using, splitFlag(live.name).second) + ping)
             } else {
-                Triple("✦", "Автовыбор", "${profile.name}, серверов: ${profile.nodes.size}")
+                Triple("✦", auto, stringResource(R.string.home_auto_meta, profile.name, profile.nodes.size))
             }
         }
         else -> {
             val n = profile.nodes.first { it.id == app.selectedNode }
-            val parts = listOf(n.protocol, n.security, profile.name).filter { it.isNotBlank() }.toMutableList()
-            pings[n.id]?.takeIf { it > 0 }?.let { parts += "$it мс" }
+            val parts = listOf(n.protocol, if (n.engine == "xray") "Xray" else "", n.security, profile.name)
+                .filter { it.isNotBlank() }.toMutableList()
+            pings[n.id]?.takeIf { it > 0 }?.let { parts += formatMs(it) }
             Triple(badgeFor(n.name), splitFlag(n.name).second, parts.joinToString(", "))
         }
     }
@@ -281,33 +309,80 @@ fun Badge(text: String, size: Int) {
     }
 }
 
+/** Routing modes: value, short title for the quick switch, full title, one-line explanation. */
+data class RoutingMode(val value: String, val short: Int, val title: Int, val hint: Int)
+
+val routingModes = listOf(
+    RoutingMode("smart", R.string.routing_smart_short, R.string.routing_smart, R.string.routing_smart_hint),
+    RoutingMode("blocked", R.string.routing_blocked_short, R.string.routing_blocked, R.string.routing_blocked_hint),
+    RoutingMode("global", R.string.routing_global_short, R.string.routing_global, R.string.routing_global_hint),
+)
+
 @Composable
 private fun RoutingSwitch(value: String, onChange: (String) -> Unit) {
-    Row(
+    val current = routingModes.firstOrNull { it.value == value } ?: routingModes[0]
+    Column(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(22.dp))
             .background(Vela.Deep)
             .border(1.dp, Vela.Hull, RoundedCornerShape(22.dp))
             .padding(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        RoutingOption("Умный режим", "Российские сайты напрямую", value == "smart", Modifier.weight(1f)) { onChange("smart") }
-        RoutingOption("Весь трафик", "Всё через сервер", value == "global", Modifier.weight(1f)) { onChange("global") }
+        Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            routingModes.forEach { m ->
+                RoutingOption(stringResource(m.short), m.value == current.value, Modifier.weight(1f).fillMaxHeight()) { onChange(m.value) }
+            }
+        }
+        Text(
+            stringResource(current.hint), color = Vela.Muted, fontSize = 12.sp, textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+        )
     }
 }
 
 @Composable
-private fun RoutingOption(title: String, sub: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    Column(
+private fun RoutingOption(title: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    Box(
         modifier
             .clip(RoundedCornerShape(18.dp))
             .background(if (selected) Vela.Hull else Color.Transparent)
             .clickable(role = Role.RadioButton, onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(horizontal = 6.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center,
     ) {
-        Text(title, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = if (selected) Vela.Star else Vela.Text)
-        Text(sub, color = Vela.Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            title, fontWeight = FontWeight.SemiBold, fontSize = 13.5.sp, lineHeight = 17.sp, textAlign = TextAlign.Center,
+            color = if (selected) Vela.Star else Vela.Text, maxLines = 2, overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** Message from the subscription provider; hidden until the text changes. */
+@Composable
+fun AnnounceBanner(text: String, onDismiss: () -> Unit, modifier: Modifier = Modifier) {
+    var expanded by remember(text) { mutableStateOf(false) }
+    Row(
+        modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Vela.Flare.copy(alpha = 0.10f))
+            .border(1.dp, Vela.Flare.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+            .clickable { expanded = !expanded }
+            .padding(start = 12.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Rounded.Campaign, null, tint = Vela.Flare, modifier = Modifier.size(20.dp))
+        Column(Modifier.weight(1f).padding(start = 10.dp, top = 6.dp, bottom = 6.dp)) {
+            Text(stringResource(R.string.announce_from_provider), color = Vela.Flare, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                text, style = MaterialTheme.typography.bodyMedium,
+                maxLines = if (expanded) 20 else 3, overflow = TextOverflow.Ellipsis,
+            )
+        }
+        IconButton(onClick = onDismiss, modifier = Modifier.size(40.dp)) {
+            Icon(Icons.Rounded.Close, stringResource(R.string.hide), tint = Vela.Muted, modifier = Modifier.size(18.dp))
+        }
     }
 }
 

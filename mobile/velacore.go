@@ -206,3 +206,81 @@ func TidyLog(text string) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// SetLanguage switches core messages: "ru" or "en".
+func SetLanguage(lang string) {
+	core.SetLanguage(lang)
+}
+
+// ParseDeepLink reads an "add subscription" link from a provider's site
+// (vela://, happ://, v2rayng://, hiddify://, sing-box://, clash://, ...).
+// Returns JSON of core.ImportRequest:
+// {"subscriptions":[...],"links":"...","linkCount":n,"name":"..."}.
+func ParseDeepLink(raw string) (string, error) {
+	req, err := core.ParseDeepLink(raw)
+	if err != nil {
+		return "", err
+	}
+	data, _ := json.Marshal(normalizeImport(req))
+	return string(data), nil
+}
+
+// DetectImport checks text (the clipboard) for subscriptions, share links or
+// app links. Returns JSON of core.ImportRequest; both lists empty when there
+// is nothing to add.
+func DetectImport(text string) string {
+	data, _ := json.Marshal(normalizeImport(core.DetectImport(text)))
+	return string(data)
+}
+
+func normalizeImport(r core.ImportRequest) core.ImportRequest {
+	if r.Subscriptions == nil {
+		r.Subscriptions = []string{}
+	}
+	return r
+}
+
+// ListConnections returns JSON array of core.Connection of the running core
+// (controller port and secret from BuildRequest).
+func ListConnections(port int32, secret string) (string, error) {
+	list, err := core.ListConnections(int(port), secret)
+	if err != nil {
+		return "", err
+	}
+	data, _ := json.Marshal(list)
+	return string(data), nil
+}
+
+// CloseConnection closes one connection, or all when id is "".
+func CloseConnection(port int32, secret, id string) error {
+	return core.CloseConnection(int(port), secret, id)
+}
+
+var (
+	recorderMu sync.Mutex
+	recorder   *core.TrafficRecorder
+)
+
+// StartTrafficRecorder counts the traffic of the running core into the
+// statistics file at path (call after the core started).
+func StartTrafficRecorder(port int32, secret, path string) {
+	recorderMu.Lock()
+	defer recorderMu.Unlock()
+	recorder.Stop()
+	recorder = core.StartTrafficRecorder(int(port), secret, path)
+}
+
+// StopTrafficRecorder saves the last numbers (call before stopping the core).
+func StopTrafficRecorder() {
+	recorderMu.Lock()
+	defer recorderMu.Unlock()
+	recorder.Stop()
+	recorder = nil
+}
+
+// TrafficSummary returns JSON of core.TrafficSummary for the statistics
+// screen: last 31 days, last 12 months, today, this month, total.
+func TrafficSummary(path string) string {
+	data, _ := json.Marshal(core.LoadTrafficSummary(path, time.Now()))
+	return string(data)
+}

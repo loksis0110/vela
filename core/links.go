@@ -16,13 +16,15 @@ import (
 
 // Node is one server parsed from a share link.
 type Node struct {
-	ID       string         `json:"id"`
-	Name     string         `json:"name"`
-	Protocol string         `json:"protocol"`
-	Server   string         `json:"server"`
-	Port     int            `json:"port"`
-	Security string         `json:"security,omitempty"`
-	Network  string         `json:"network,omitempty"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	Server   string `json:"server"`
+	Port     int    `json:"port"`
+	Security string `json:"security,omitempty"`
+	Network  string `json:"network,omitempty"`
+	// Engine is "xray" for servers run by the embedded Xray core.
+	Engine   string         `json:"engine,omitempty"`
 	Link     string         `json:"link"`
 	Outbound map[string]any `json:"outbound"`
 }
@@ -37,24 +39,41 @@ type ParseResult struct {
 // lines, or a base64-encoded subscription body.
 func ParseText(text string) ParseResult {
 	text = strings.TrimSpace(strings.TrimPrefix(text, "\ufeff"))
+	if res, ok := parseStructured(text); ok {
+		return finishParse(res)
+	}
 	if !strings.Contains(text, "://") {
 		if decoded, ok := tryBase64(text); ok && strings.Contains(decoded, "://") {
 			text = strings.TrimPrefix(strings.TrimSpace(decoded), "\ufeff")
 		}
 	}
 	var res ParseResult
+	for _, row := range strings.FieldsFunc(text, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		row = strings.TrimSpace(row)
+		if row == "" || strings.HasPrefix(row, "#") || strings.HasPrefix(row, "//") {
+			continue
+		}
+		for _, line := range strings.Fields(row) {
+			if !strings.Contains(line, "://") {
+				continue
+			}
+			node, err := ParseLink(line)
+			if err != nil {
+				res.Errors = append(res.Errors, err.Error())
+				continue
+			}
+			res.Nodes = append(res.Nodes, node)
+		}
+	}
+	return finishParse(res)
+}
+
+// finishParse drops duplicate servers and keeps names unique.
+func finishParse(in ParseResult) ParseResult {
+	res := ParseResult{Errors: in.Errors}
 	seen := map[string]int{}
 	seenLink := map[string]bool{}
-	for _, line := range strings.FieldsFunc(text, func(r rune) bool { return r == '\n' || r == '\r' || r == ' ' }) {
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.Contains(line, "://") {
-			continue
-		}
-		node, err := ParseLink(line)
-		if err != nil {
-			res.Errors = append(res.Errors, err.Error())
-			continue
-		}
+	for _, node := range in.Nodes {
 		// the same link twice would give two servers with one id
 		if seenLink[node.ID] {
 			continue
@@ -82,7 +101,7 @@ func ParseText(text string) ParseResult {
 func ParseLink(link string) (Node, error) {
 	scheme, _, ok := strings.Cut(link, "://")
 	if !ok {
-		return Node{}, fmt.Errorf("не ссылка: %s", short(link))
+		return Node{}, errorf("не ссылка: %s", short(link))
 	}
 	var (
 		node Node
@@ -101,8 +120,10 @@ func ParseLink(link string) (Node, error) {
 		node, err = parseHysteria2(link)
 	case "tuic":
 		node, err = parseTUIC(link)
+	case jsonLinkScheme:
+		node, err = parseJSONLink(link)
 	default:
-		return Node{}, fmt.Errorf("протокол %s не поддерживается", scheme)
+		return Node{}, errorf("протокол %s не поддерживается", scheme)
 	}
 	if err != nil {
 		return Node{}, fmt.Errorf("%s: %w", short(link), err)
@@ -122,11 +143,11 @@ func parseURL(link string) (*url.URL, string, int, error) {
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil, "", 0, fmt.Errorf("нет адреса сервера")
+		return nil, "", 0, errorf("нет адреса сервера")
 	}
 	port, err := strconv.Atoi(u.Port())
 	if err != nil || port <= 0 || port > 65535 {
-		return nil, "", 0, fmt.Errorf("неверный порт")
+		return nil, "", 0, errorf("неверный порт")
 	}
 	return u, host, port, nil
 }
@@ -164,7 +185,7 @@ func tlsOptions(q url.Values, security, host string) (map[string]any, error) {
 		return nil, nil
 	case "tls", "xtls", "reality":
 	default:
-		return nil, fmt.Errorf("security=%s не поддерживается", security)
+		return nil, errorf("security=%s не поддерживается", security)
 	}
 	sni := firstNonEmpty(q.Get("sni"), q.Get("peer"), q.Get("host"))
 	if sni == "" && net.ParseIP(host) == nil {
@@ -187,7 +208,7 @@ func tlsOptions(q url.Values, security, host string) (map[string]any, error) {
 	if security == "reality" {
 		pbk := q.Get("pbk")
 		if pbk == "" {
-			return nil, fmt.Errorf("в ссылке Reality нет pbk")
+			return nil, errorf("в ссылке Reality нет pbk")
 		}
 		r := map[string]any{"enabled": true, "public_key": pbk}
 		if sid := q.Get("sid"); sid != "" {
@@ -268,11 +289,11 @@ func transportOptions(q url.Values, network string) (map[string]any, error) {
 	case "quic":
 		return map[string]any{"type": "quic"}, nil
 	case "xhttp", "splithttp":
-		return nil, fmt.Errorf("транспорт XHTTP пока не поддерживается ядром")
+		return nil, errorf("транспорт XHTTP пока не поддерживается ядром")
 	case "kcp", "mkcp":
-		return nil, fmt.Errorf("транспорт mKCP не поддерживается")
+		return nil, errorf("транспорт mKCP не поддерживается")
 	}
-	return nil, fmt.Errorf("транспорт %s не поддерживается", network)
+	return nil, errorf("транспорт %s не поддерживается", network)
 }
 
 func parseVLESS(link string) (Node, error) {
@@ -283,15 +304,18 @@ func parseVLESS(link string) (Node, error) {
 	q := u.Query()
 	uuid := u.User.Username()
 	if uuid == "" {
-		return Node{}, fmt.Errorf("нет UUID")
+		return Node{}, errorf("нет UUID")
 	}
 	security := strings.ToLower(q.Get("security"))
 	network := strings.ToLower(firstNonEmpty(q.Get("type"), "tcp"))
+	if needsXray(network, q.Get("encryption")) {
+		return xrayVLESS(u, host, port, q, network, security)
+	}
 	out := map[string]any{"type": "vless", "server": host, "server_port": port, "uuid": uuid}
 	if flow := q.Get("flow"); flow != "" {
 		flow = strings.TrimSuffix(flow, "-udp443")
 		if flow != "xtls-rprx-vision" {
-			return Node{}, fmt.Errorf("flow %s не поддерживается", flow)
+			return Node{}, errorf("flow %s не поддерживается", flow)
 		}
 		out["flow"] = flow
 	}
@@ -342,15 +366,15 @@ func parseVMess(link string) (Node, error) {
 	body, _, _ = strings.Cut(body, "#")
 	decoded, ok := tryBase64(body)
 	if !ok {
-		return Node{}, fmt.Errorf("не удалось декодировать vmess")
+		return Node{}, errorf("не удалось декодировать vmess")
 	}
 	var v vmessJSON
 	if err := json.Unmarshal([]byte(decoded), &v); err != nil {
-		return Node{}, fmt.Errorf("неверный vmess JSON")
+		return Node{}, errorf("неверный vmess JSON")
 	}
 	port := rawNumber(v.Port)
 	if v.Add == "" || port <= 0 || v.ID == "" {
-		return Node{}, fmt.Errorf("в vmess нет адреса, порта или id")
+		return Node{}, errorf("в vmess нет адреса, порта или id")
 	}
 	q := url.Values{}
 	q.Set("path", v.Path)
@@ -363,6 +387,11 @@ func parseVMess(link string) (Node, error) {
 		q.Set("serviceName", v.Path)
 	}
 	security := strings.ToLower(v.TLS)
+	if needsXray(strings.ToLower(v.Net), "") {
+		q.Set("mode", v.Type)
+		q.Del("headerType")
+		return xrayVMess(v, port, q, strings.ToLower(v.Net), security)
+	}
 	out := map[string]any{"type": "vmess", "server": v.Add, "server_port": port, "uuid": v.ID,
 		"security": firstNonEmpty(v.Scy, "auto"), "alter_id": rawNumber(v.Aid), "packet_encoding": "xudp"}
 	tls, err := tlsOptions(q, security, v.Add)
@@ -392,10 +421,13 @@ func parseTrojan(link string) (Node, error) {
 	q := u.Query()
 	password, _ := url.PathUnescape(u.User.Username())
 	if password == "" {
-		return Node{}, fmt.Errorf("нет пароля")
+		return Node{}, errorf("нет пароля")
 	}
 	security := strings.ToLower(firstNonEmpty(q.Get("security"), "tls"))
 	network := strings.ToLower(firstNonEmpty(q.Get("type"), "tcp"))
+	if needsXray(network, "") {
+		return xrayTrojan(u, host, port, password, q, network, security)
+	}
 	out := map[string]any{"type": "trojan", "server": host, "server_port": port, "password": password}
 	tls, err := tlsOptions(q, security, host)
 	if err != nil {
@@ -424,13 +456,13 @@ func parseShadowsocks(link string) (Node, error) {
 		// SIP002 legacy: base64(method:password@host:port)
 		decoded, ok := tryBase64(rest)
 		if !ok {
-			return Node{}, fmt.Errorf("неверная ss-ссылка")
+			return Node{}, errorf("неверная ss-ссылка")
 		}
 		rest = decoded
 	}
 	at := strings.LastIndex(rest, "@")
 	if at < 0 {
-		return Node{}, fmt.Errorf("неверная ss-ссылка")
+		return Node{}, errorf("неверная ss-ссылка")
 	}
 	userinfo, hostport := rest[:at], rest[at+1:]
 	// base64 is often percent-encoded too ("...%3D")
@@ -442,19 +474,19 @@ func parseShadowsocks(link string) (Node, error) {
 	}
 	method, password, ok := strings.Cut(userinfo, ":")
 	if !ok {
-		return Node{}, fmt.Errorf("нет метода или пароля")
+		return Node{}, errorf("нет метода или пароля")
 	}
 	host, portStr, err := net.SplitHostPort(strings.TrimRight(hostport, "/"))
 	if err != nil {
-		return Node{}, fmt.Errorf("неверный адрес")
+		return Node{}, errorf("неверный адрес")
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port <= 0 || port > 65535 {
-		return Node{}, fmt.Errorf("неверный порт")
+		return Node{}, errorf("неверный порт")
 	}
 	q, _ := url.ParseQuery(rawQuery)
 	if plugin := q.Get("plugin"); plugin != "" && !strings.HasPrefix(plugin, "none") {
-		return Node{}, fmt.Errorf("плагины Shadowsocks не поддерживаются")
+		return Node{}, errorf("плагины Shadowsocks не поддерживаются")
 	}
 	out := map[string]any{"type": "shadowsocks", "server": host, "server_port": port,
 		"method": method, "password": password}
@@ -522,7 +554,7 @@ func parseTUIC(link string) (Node, error) {
 	uuid := u.User.Username()
 	password, _ := u.User.Password()
 	if uuid == "" {
-		return Node{}, fmt.Errorf("нет UUID")
+		return Node{}, errorf("нет UUID")
 	}
 	out := map[string]any{"type": "tuic", "server": host, "server_port": port, "uuid": uuid, "password": password}
 	if cc := q.Get("congestion_control"); cc != "" {

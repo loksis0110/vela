@@ -1,16 +1,26 @@
 import PhotosUI
 import SwiftUI
+import UserNotifications
+import Velacore
 
 @main
 struct VelaApp: App {
     @StateObject private var store = Store.shared
     @StateObject private var tunnel = TunnelManager.shared
+    @StateObject private var pickup = Pickup.shared
+
+    init() {
+        // messages of the core (errors, server check reasons) in the app's language
+        VelacoreSetLanguage(Lang.code)
+        UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
+    }
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(store)
                 .environmentObject(tunnel)
+                .environmentObject(pickup)
                 .tint(Palette.star)
                 .onAppear { applyTheme(store.state.theme) }
                 .onChange(of: store.state.theme) { applyTheme($0) }
@@ -35,15 +45,21 @@ private enum LaunchState {
 struct RootView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var tunnel: TunnelManager
+    @EnvironmentObject var pickup: Pickup
     @Environment(\.scenePhase) private var phase
     @State private var showServers = false
     @State private var showSettings = false
     @State private var showAdd = false
     @State private var addText = ""
     @State private var toast: String?
+    @State private var toastID = UUID()
+    /// Subscription or servers from an app link or the clipboard, waiting
+    /// for the user's «Добавить».
+    @State private var offer: ImportOffer?
+    @State private var alertText: String?
 
     var body: some View {
-        HomeView(showServers: $showServers, showSettings: $showSettings, showAdd: $showAdd)
+        HomeView(showServers: $showServers, showSettings: $showSettings, showAdd: $showAdd, onPaste: pasted)
             .sheet(isPresented: $showServers) {
                 ServersView(showAdd: $showAdd)
                     .sheet(isPresented: $showAdd) { AddSheet(initial: addText, onDone: done) }
@@ -66,22 +82,92 @@ struct RootView: View {
             .animation(.easeOut(duration: 0.2), value: toast)
             .task { await launchWork() }
             .onChange(of: phase) { p in
-                if p == .active { Task { await tunnel.load() } }
-            }
-            .onOpenURL { url in
-                // vela://import/<encoded link> or a raw vless://, hy2:// … link
-                var text = url.absoluteString
-                if text.hasPrefix("vela://import/") {
-                    text = String(text.dropFirst("vela://import/".count)).removingPercentEncoding ?? ""
+                if p == .active {
+                    Task { await tunnel.load() }
+                    pickup.check()
                 }
-                addText = text
-                showAdd = true
             }
+            .onOpenURL { url in openLink(url.absoluteString) }
+            .alert(offer?.title ?? "", isPresented: Binding(get: { offer != nil }, set: { if !$0 { offer = nil } }), presenting: offer) { o in
+                Button(L("Добавить")) { add(o) }
+                Button(L("Отмена"), role: .cancel) {}
+            } message: { o in
+                Text(o.summary)
+            }
+            .alert(alertText ?? "", isPresented: Binding(get: { alertText != nil }, set: { if !$0 { alertText = nil } })) {
+                Button("OK", role: .cancel) {}
+            }
+    }
+
+    /// Links from a provider's site (vela://, happ://, v2rayng://, sub:// …)
+    /// or a raw vless://, hy2:// … link: confirm, then import.
+    private func openLink(_ raw: String) {
+        var err: NSError?
+        let json = VelacoreParseDeepLink(raw, &err)
+        if let err {
+            alertText = err.localizedDescription
+            return
+        }
+        guard let found = ImportOffer(json: json) else {
+            alertText = L("В ссылке нет подписки или серверов")
+            return
+        }
+        present(found)
+    }
+
+    /// Shows the confirmation; sheets are closed first, since an alert
+    /// can't appear over them.
+    private func present(_ found: ImportOffer) {
+        let covered = showServers || showSettings || showAdd
+        showServers = false
+        showSettings = false
+        showAdd = false
+        if covered {
+            Task {
+                try? await Task.sleep(nanoseconds: 650_000_000)
+                offer = found
+            }
+        } else {
+            offer = found
+        }
+    }
+
+    /// Text pasted on the clipboard banner.
+    private func pasted(_ text: String) {
+        switch pickup.handle(text) {
+        case let .offer(found): present(found)
+        case let .message(m): show(m)
+        }
+    }
+
+    private func add(_ o: ImportOffer) {
+        show(o.subscriptions.isEmpty ? L("Добавляем…") : L("Загружаем подписку…"), seconds: 30)
+        Task {
+            do {
+                done(try await store.importOffer(o))
+            } catch {
+                toast = nil
+                alertText = error.localizedDescription
+            }
+        }
+    }
+
+    private func show(_ text: String, seconds: Double = 2.6) {
+        let id = UUID()
+        toastID = id
+        toast = text
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            if toastID == id { toast = nil }
+        }
     }
 
     @MainActor
     private func launchWork() async {
         await tunnel.load()
+        pickup.check()
+        Reminders.shared.sync()
+        await tunnel.loadSummary()
         // «Подключаться при запуске»: once per app start
         if !LaunchState.handled {
             LaunchState.handled = true
@@ -99,14 +185,10 @@ struct RootView: View {
     private func done(_ message: String?) {
         addText = ""
         guard let message else { return }
-        toast = message
+        show(message)
         Task {
             await tunnel.pingAll()
             if tunnel.state == .connected { await tunnel.reload() }
-        }
-        Task {
-            try? await Task.sleep(nanoseconds: 2_600_000_000)
-            toast = nil
         }
     }
 }
@@ -143,10 +225,15 @@ struct AddSheet: View {
                     .background(Palette.ink, in: RoundedRectangle(cornerRadius: 10))
                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(error == nil ? Palette.line : Palette.danger))
                 if let error { Text(error).font(.footnote).foregroundStyle(Palette.danger) }
-                Button {
-                    if let s = UIPasteboard.general.string, !s.isEmpty { text = s.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    else { error = "Буфер обмена пуст" }
-                } label: { Label("Вставить из буфера", systemImage: "doc.on.clipboard") }
+                // the system Paste button reads the clipboard without the iOS prompt
+                PasteButton(payloadType: String.self) { items in
+                    let s = items.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                    Task { @MainActor in
+                        if s.isEmpty { error = L("Буфер обмена пуст") } else { text = s; error = nil }
+                    }
+                }
+                .buttonBorderShape(.capsule)
+                .tint(Color(hex: 0x148A6D))
                 HStack(spacing: 18) {
                     Button { scanning = true } label: { Label("Сканировать QR", systemImage: "qrcode.viewfinder") }
                     PhotosPicker(selection: $photo, matching: .images) { Label("QR из фото", systemImage: "photo") }
@@ -160,7 +247,7 @@ struct AddSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Отмена") { onDone(nil); dismiss() }.disabled(busy) }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(busy ? "Загружаем…" : "Добавить") { submit() }
+                    Button(busy ? L("Загружаем…") : L("Добавить")) { submit() }
                         .disabled(busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
@@ -176,7 +263,7 @@ struct AddSheet: View {
             Task {
                 let data = try? await item.loadTransferable(type: Data.self)
                 photo = nil
-                if let data, let code = QR.decode(data) { append(code) } else { error = "На картинке не нашли QR-код" }
+                if let data, let code = QR.decode(data) { append(code) } else { error = L("На картинке не нашли QR-код") }
             }
         }
     }

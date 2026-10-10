@@ -1,0 +1,26 @@
+--- a/include/registry.go	2026-10-09 20:41:57.624477955 +0000
++++ b/include/registry.go	2026-10-09 20:41:57.639036431 +0000
+@@ -103,6 +103,7 @@
+ 
+ 	registerQUICOutbounds(registry)
+ 	registerStubForRemovedOutbounds(registry)
++	registerExtraOutbounds(registry)
+ 
+ 	return registry
+ }
+--- a/include/extra.go	1970-01-01 00:00:00.000000000 +0000
++++ b/include/extra.go	2026-10-09 20:41:57.639168010 +0000
+@@ -0,0 +1,13 @@
++package include
++
++import "github.com/sagernet/sing-box/adapter/outbound"
++
++// ExtraOutbounds lets programs embedding sing-box add their own outbound
++// types (Vela: the "xray" outbound). Fill it from an init function.
++var ExtraOutbounds []func(registry *outbound.Registry)
++
++func registerExtraOutbounds(registry *outbound.Registry) {
++	for _, register := range ExtraOutbounds {
++		register(registry)
++	}
++}

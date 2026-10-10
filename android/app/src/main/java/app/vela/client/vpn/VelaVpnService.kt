@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.NetworkCapabilities
@@ -15,8 +16,10 @@ import android.system.OsConstants
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import app.vela.client.Lang
 import app.vela.client.R
 import app.vela.client.data.Store
+import app.vela.client.data.VelaError
 import app.vela.client.ui.MainActivity
 import app.vela.libbox.BridgeOptions
 import app.vela.libbox.BridgeSession
@@ -36,6 +39,7 @@ import app.vela.libbox.StringIterator
 import app.vela.libbox.SystemProxyStatus
 import app.vela.libbox.TunOptions
 import app.vela.libbox.WIFIState
+import app.vela.velacore.Velacore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -72,6 +76,10 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     private var watchJob: Job? = null
 
     // ------------------------------------------------------------- lifecycle
+
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(Lang.wrap(base))
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -120,6 +128,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 commandServer = it
             }
             server.startOrReloadService(config, OverrideOptions())
+            startRecorder(port, secret)
             Store.setWasConnected(true)
             VpnManager.status.value = VpnStatus(state = ConnState.Connected, since = System.currentTimeMillis() / 1000)
             showNotification(getString(R.string.notif_connected))
@@ -148,7 +157,11 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             val secret = VpnManager.controllerSecret.ifEmpty { Store.randomId(16) }
             VpnManager.controllerPort = port
             VpnManager.controllerSecret = secret
-            server.startOrReloadService(Store.buildConfig(port, secret), OverrideOptions())
+            val config = Store.buildConfig(port, secret)
+            // the reloaded core starts counting from zero: save what the old one carried
+            runCatching { Velacore.stopTrafficRecorder() }
+            server.startOrReloadService(config, OverrideOptions())
+            startRecorder(port, secret)
             VpnManager.status.value = VpnManager.status.value.copy(error = null, notice = null, activeNode = null)
             showNotification(getString(R.string.notif_connected))
             startWatchdog()
@@ -176,11 +189,19 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         statsJob = null
         watchJob?.cancel()
         watchJob = null
+        // the last numbers are read from the core, so before it stops
+        runCatching { Velacore.stopTrafficRecorder() }
         runCatching { commandServer?.closeService() }
         runCatching { tunFd?.close() }
         tunFd = null
         DefaultNetworkMonitor.stop()
         VpnManager.controllerPort = 0
+    }
+
+    /** Traffic statistics (Statistics screen) of the running core. */
+    private fun startRecorder(port: Int, secret: String) {
+        runCatching { Velacore.startTrafficRecorder(port, secret, Store.trafficFile.absolutePath) }
+            .onFailure { Log.w(TAG, "traffic recorder", it) }
     }
 
     private fun startStats() {
@@ -266,7 +287,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         val s = VpnManager.status.value
         if (st.settings.disableFailover || !manual) {
             if (manual && justConnected) {
-                VpnManager.status.value = s.copy(error = "Выбранный сервер не отвечает. Выберите другой сервер или «Автовыбор»")
+                VpnManager.status.value = s.copy(error = getString(R.string.error_server_silent_auto))
             } else if (!manual) {
                 VpnManager.retestAuto()
             }
@@ -275,25 +296,25 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         val name = profile.nodes.first { it.id == selected }.name
         // remembered as failed, so automatic selection skips it next time
         Store.pings.update { it + (selected to -1) }
-        Store.reasons.update { it + (selected to "перестал отвечать во время работы") }
+        Store.reasons.update { it + (selected to getString(R.string.reason_stopped_answering)) }
         Store.savePings()
         if (VpnManager.switchTo("auto")) {
             Store.select(profile.id, "auto")
             VpnManager.status.value = VpnManager.status.value.copy(
                 error = null,
-                notice = "«${name}» не отвечает. Vela переключилась на автовыбор",
+                notice = getString(R.string.notice_switched_auto, name),
             )
         } else if (justConnected) {
-            VpnManager.status.value = s.copy(error = "Выбранный сервер не отвечает. Выберите другой сервер")
+            VpnManager.status.value = s.copy(error = getString(R.string.error_server_silent))
         }
     }
 
     private fun humanize(e: Exception): String {
         val msg = e.message ?: e.toString()
         return when {
-            "missing vpn permission" in msg -> "Нет разрешения на VPN. Нажмите «Подключить» ещё раз"
-            "Сначала" in msg || "серверов" in msg -> msg
-            else -> "Не удалось подключиться: $msg"
+            "missing vpn permission" in msg -> getString(R.string.error_vpn_permission)
+            e is VelaError -> msg
+            else -> getString(R.string.error_connect, msg)
         }
     }
 
@@ -303,9 +324,10 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     private fun showNotification(text: String) {
         val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHANNEL) == null) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            // also renames the channel after a language change
             nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, getString(R.string.notif_channel), NotificationManager.IMPORTANCE_LOW).apply {
+                NotificationChannel(CHANNEL, Lang.str(R.string.notif_channel), NotificationManager.IMPORTANCE_LOW).apply {
                     setShowBadge(false)
                 },
             )
@@ -344,7 +366,12 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         scope.launch {
             val port = VpnManager.controllerPort.takeIf { it != 0 } ?: freePort()
             val secret = VpnManager.controllerSecret.ifEmpty { Store.randomId(16) }
-            runCatching { commandServer?.startOrReloadService(Store.buildConfig(port, secret), OverrideOptions()) }
+            runCatching {
+                val config = Store.buildConfig(port, secret)
+                runCatching { Velacore.stopTrafficRecorder() }
+                commandServer?.startOrReloadService(config, OverrideOptions())
+                startRecorder(port, secret)
+            }
         }
     }
 

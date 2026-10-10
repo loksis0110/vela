@@ -13,6 +13,7 @@ LDFLAGS="-s -w -buildid= -checklinkname=0"
 
 ./scripts/prepare-core.sh
 go mod tidy
+./scripts/update-rules.sh
 go install "github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}"
 go install "github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}"
 export PATH="$PATH:$(go env GOPATH)/bin"
@@ -30,11 +31,13 @@ case "${1:-}" in
     ;;
   ios)
     mkdir -p ios/Frameworks
-    # Network Extension: the core (memory-limited build)
+    # Network Extension: the core (memory-limited build) + the Xray engine
+    # and traffic statistics (velaext)
     gomobile bind -trimpath -target ios,iossimulator -iosversion=16.0 -libname=box \
       -tags "$TAGS,with_low_memory" -ldflags "$LDFLAGS" \
       -o ios/Frameworks/Libbox.xcframework \
-      github.com/sagernet/sing-box/experimental/libbox
+      github.com/sagernet/sing-box/experimental/libbox \
+      github.com/velaapp/vela/mobile/ext
     # App: link parsing and config generation only (small)
     gomobile bind -trimpath -target ios,iossimulator -iosversion=16.0 -libname=velacore \
       -tags "$TAGS" -ldflags "$LDFLAGS" \

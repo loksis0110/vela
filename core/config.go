@@ -31,6 +31,8 @@ type Settings struct {
 	Mode string `json:"mode"`
 	// "smart": Russian sites go direct, everything else through the server.
 	// "global": everything through the server.
+	// "blocked": only sites blocked in Russia (or blocking Russia) go
+	// through the server, everything else direct.
 	Routing string `json:"routing"`
 	// Block ads and trackers with a DNS + routing rule set.
 	BlockAds bool `json:"blockAds"`
@@ -159,7 +161,7 @@ func InstallRules(dir string) error {
 // BuildConfig generates a sing-box JSON configuration.
 func BuildConfig(req BuildRequest) (string, error) {
 	if len(req.Nodes) == 0 {
-		return "", fmt.Errorf("нет серверов для подключения")
+		return "", errorf("нет серверов для подключения")
 	}
 	s := req.Settings
 	def := DefaultSettings()
@@ -229,7 +231,7 @@ func BuildConfig(req BuildRequest) (string, error) {
 		}
 	}
 	if len(nodeTags) == 0 {
-		return "", fmt.Errorf("нет серверов для подключения")
+		return "", errorf("нет серверов для подключения")
 	}
 	selectorItems := append([]string{TagAuto}, nodeTags...)
 	if selected == "" {
@@ -289,9 +291,15 @@ func BuildConfig(req BuildRequest) (string, error) {
 		})
 	}
 	smart := s.Routing == "smart"
+	blocked := s.Routing == "blocked"
 	if smart {
 		addRuleSet("geosite-ru", "geosite-category-ru.srs")
 		addRuleSet("geoip-ru", "geoip-ru.srs")
+	}
+	if blocked {
+		addRuleSet("ru-blocked", "geosite-ru-blocked.srs")
+		addRuleSet("ru-blocked-ip", "geoip-ru-blocked.srs")
+		addRuleSet("ru-inside", "ru-inside.srs")
 	}
 	if s.BlockAds {
 		addRuleSet("ads", "geosite-category-ads-all.srs")
@@ -321,6 +329,12 @@ func BuildConfig(req BuildRequest) (string, error) {
 		dnsRules = append(dnsRules, map[string]any{"rule_set": []string{"geosite-ru"}, "server": "dns-direct"})
 	}
 	dnsFinal := "dns-remote"
+	if blocked {
+		// blocked sites are resolved through the tunnel (providers' DNS may
+		// return stub addresses for them), everything else locally
+		dnsRules = append(dnsRules, map[string]any{"rule_set": []string{"ru-blocked", "ru-inside"}, "server": "dns-remote"})
+		dnsFinal = "dns-direct"
+	}
 	desktopApps := req.Platform != PlatformAndroid && req.Platform != PlatformIOS && len(s.Apps) > 0 && s.Mode == "tun"
 	if desktopApps {
 		switch s.AppMode {
@@ -425,6 +439,12 @@ func BuildConfig(req BuildRequest) (string, error) {
 	}
 	if smart {
 		rules = append(rules, map[string]any{"rule_set": []string{"geosite-ru", "geoip-ru"}, "outbound": TagDirect})
+	}
+	if blocked {
+		rules = append(rules, map[string]any{"rule_set": []string{"ru-blocked", "ru-blocked-ip", "ru-inside"}, "outbound": TagSelector})
+		if final == TagSelector {
+			final = TagDirect
+		}
 	}
 	// QUIC from browsers often gets throttled; force fallback to TCP
 	// only for blocked targets would be ideal, keep it simple: allow.

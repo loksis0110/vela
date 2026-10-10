@@ -1,6 +1,6 @@
 module github.com/velaapp/vela
 
-go 1.25.5
+go 1.26
 
 require (
 	github.com/makiuchi-d/gozxing v0.1.1
@@ -10,6 +10,8 @@ require (
 	github.com/sagernet/gomobile v0.1.13
 	github.com/sagernet/sing-box v1.14.2
 	golang.org/x/sys v0.47.0
+	github.com/xtls/xray-core v1.260327.1-0.20260728075948-5ca6f4b7d4dc
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 // Patched core, created by scripts/prepare-core.sh (run automatically by make and CI).

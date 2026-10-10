@@ -122,7 +122,7 @@ func (a *App) watchdog(stop chan struct{}) {
 			// remembered as failed, so automatic selection skips it next time
 			a.pingsMu.Lock()
 			a.pings[selected] = -1
-			a.reasons[selected] = "перестал отвечать во время работы"
+			a.reasons[selected] = tr("перестал отвечать во время работы")
 			a.pingsMu.Unlock()
 			a.savePings()
 			if err := a.controller("PUT", "/proxies/"+core.TagSelector, map[string]string{"name": core.TagAuto}, nil); err == nil {
@@ -130,7 +130,7 @@ func (a *App) watchdog(stop chan struct{}) {
 				a.state.SelectedNode = "auto"
 				a.saveLocked()
 				a.status.Error, a.status.ErrorCode = "", ""
-				a.status.Notice = fmt.Sprintf("«%s» перестал отвечать. Vela переключилась на автовыбор", name)
+				a.status.Notice = fmt.Sprintf(tr("«%s» перестал отвечать. Vela переключилась на автовыбор"), name)
 				a.mu.Unlock()
 				a.pushState()
 				a.pushStatus()
@@ -155,7 +155,7 @@ func (a *App) nodeName(id string) string {
 			return n.Name
 		}
 	}
-	return "Сервер"
+	return tr("Сервер")
 }
 
 // routeDialer returns the dialer that carries traffic now (nil = direct).
@@ -181,7 +181,7 @@ func (a *App) MyIP(ctx context.Context) (*core.IPInfo, error) {
 // SpeedTest runs in the background and streams progress as "speed" events.
 func (a *App) SpeedTest() error {
 	if !a.speeding.CompareAndSwap(false, true) {
-		return errors.New("тест скорости уже идёт")
+		return errors.New(tr("тест скорости уже идёт"))
 	}
 	dialer := a.routeDialer()
 	go func() {
@@ -199,7 +199,7 @@ func (a *App) SpeedTest() error {
 func (a *App) QRDataURL(text string) (string, error) {
 	png, err := core.EncodeQR(text, 520)
 	if err != nil {
-		return "", errors.New("слишком много данных для QR-кода")
+		return "", errors.New(tr("слишком много данных для QR-кода"))
 	}
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), nil
 }
@@ -307,11 +307,11 @@ func (a *App) importBackup(ctx context.Context, b core.Backup) (string, error) {
 	}
 	switch {
 	case importErr != nil:
-		msg = "Настройки восстановлены. Подписки не загрузились: " + importErr.Error()
+		msg = tr("Настройки восстановлены. Подписки не загрузились: ") + importErr.Error()
 	case msg == "":
-		msg = "Настройки восстановлены"
+		msg = tr("Настройки восстановлены")
 	default:
-		msg = "Восстановлено. " + msg
+		msg = tr("Восстановлено. ") + msg
 	}
 	return msg, nil
 }
@@ -340,12 +340,12 @@ func (a *App) PingNode(profileID, nodeID string) error {
 	p := a.findProfile(profileID)
 	if p == nil {
 		a.mu.Unlock()
-		return errors.New("профиль не найден")
+		return errors.New(tr("профиль не найден"))
 	}
 	n := a.findNode(p, nodeID)
 	if n == nil {
 		a.mu.Unlock()
-		return errors.New("сервер не найден")
+		return errors.New(tr("сервер не найден"))
 	}
 	node := *n
 	instance := a.instance

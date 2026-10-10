@@ -30,7 +30,7 @@ var sampleLinks = []string{
 }
 
 func TestParse(t *testing.T) {
-	res := ParseText(strings.Join(sampleLinks, "\n") + "\nvless://x@h:1?type=xhttp#bad\n")
+	res := ParseText(strings.Join(sampleLinks, "\n") + "\nvless://x@h:1?type=quantum#bad\n")
 	if len(res.Nodes) != len(sampleLinks) {
 		t.Fatalf("parsed %d nodes, errors: %v", len(res.Nodes), res.Errors)
 	}
@@ -65,7 +65,7 @@ func TestBuildConfigs(t *testing.T) {
 	res := ParseText(strings.Join(sampleLinks, "\n"))
 	dir := t.TempDir()
 	for _, platform := range []string{PlatformWindows, PlatformAndroid, PlatformIOS, PlatformLinux} {
-		for _, routing := range []string{"smart", "global"} {
+		for _, routing := range []string{"smart", "global", "blocked"} {
 			for _, mode := range []string{"tun", "proxy"} {
 				s := DefaultSettings()
 				s.Routing = routing

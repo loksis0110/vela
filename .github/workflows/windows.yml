@@ -4,7 +4,29 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths:
+      - "desktop/**"
+      - "core/**"
+      - "mobile/**"
+      - "xrayout/**"
+      - "go.mod"
+      - "patches/**"
+      - "scripts/**"
+      - "tools/rules/**"
+      - "Makefile"
+      - ".github/workflows/windows.yml"
   pull_request:
+    paths:
+      - "desktop/**"
+      - "core/**"
+      - "mobile/**"
+      - "xrayout/**"
+      - "go.mod"
+      - "patches/**"
+      - "scripts/**"
+      - "tools/rules/**"
+      - "Makefile"
+      - ".github/workflows/windows.yml"
   workflow_dispatch:
 
 permissions:
@@ -29,10 +51,26 @@ jobs:
         with:
           go-version: "1.26"
       - run: make windows
+      # version.json tells installed copies of Vela about this build
+      # (desktop/update.go): version, SHA-256 and size of Vela.exe, notes
+      - name: Describe the build for auto-update
+        env:
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION=$(sed -n 's/^VERSION := *//p' Makefile)
+          test -n "$VERSION"
+          SHA=$(sha256sum dist/Vela.exe | cut -d' ' -f1)
+          SIZE=$(stat -c %s dist/Vela.exe)
+          NOTES=$(printf '%s' "$NOTES" | head -n 1 | cut -c1-300)
+          jq -n --arg v "$VERSION" --arg sha "$SHA" --argjson size "$SIZE" --arg notes "$NOTES" \
+            '{version: $v, sha256: $sha, size: $size, notes: $notes}' > dist/version.json
+          cat dist/version.json
       - uses: actions/upload-artifact@v4
         with:
           name: Vela-windows
-          path: dist/Vela.exe
+          path: |
+            dist/Vela.exe
+            dist/version.json
 
       - name: Publish to the "latest" release
         if: github.event_name != 'pull_request'
@@ -40,4 +78,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create latest --title "Vela (последняя сборка)" --notes "Готовые сборки Vela. Android: файл .apk. iPhone: Vela-unsigned.ipa, подпишите своим сертификатом." --prerelease 2>/dev/null || true
+          # the exe first: version.json must never point to a file that isn't there yet
           gh release upload latest dist/Vela.exe --clobber
+          gh release upload latest dist/version.json --clobber

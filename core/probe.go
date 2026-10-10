@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	_ "github.com/velaapp/vela/xrayout"
 	"os"
 	"runtime"
 	"strings"
@@ -130,7 +131,7 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 		outbound, ok := instance.Outbound().Outbound(NodeTag(n))
 		if !ok {
 			res.Error = "outbound not found"
-			res.Reason = "сервер не удалось разобрать"
+			res.Reason = T("сервер не удалось разобрать")
 			return res
 		}
 		gate := hostGate(n.Server)
@@ -225,25 +226,25 @@ func ExplainError(e string) string {
 	s := strings.ToLower(e)
 	switch {
 	case strings.Contains(s, "no such host"):
-		return "не удалось найти адрес сервера"
+		return T("не удалось найти адрес сервера")
 	case strings.Contains(s, "unrecognized remote public key"):
-		return "отпечаток сертификата сервера не совпал со ссылкой"
+		return T("отпечаток сертификата сервера не совпал со ссылкой")
 	case strings.Contains(s, "reality verification failed"), strings.Contains(s, "reality: "):
-		return "Reality: сервер не принял ключ (pbk/sid) или SNI"
+		return T("Reality: сервер не принял ключ (pbk/sid) или SNI")
 	case strings.Contains(s, "x509"), strings.Contains(s, "certificate"):
-		return "сертификат сервера не прошёл проверку"
+		return T("сертификат сервера не прошёл проверку")
 	case strings.Contains(s, "connection refused"):
-		return "порт сервера закрыт"
+		return T("порт сервера закрыт")
 	case strings.Contains(s, "no route to host"), strings.Contains(s, "network is unreachable"):
-		return "сервер недоступен из этой сети"
+		return T("сервер недоступен из этой сети")
 	case strings.Contains(s, "authentication failed"), strings.Contains(s, "invalid user"), strings.Contains(s, "unauthorized"):
-		return "сервер отклонил ключ доступа (UUID/пароль)"
+		return T("сервер отклонил ключ доступа (UUID/пароль)")
 	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline exceeded"):
-		return "сервер не ответил вовремя"
+		return T("сервер не ответил вовремя")
 	case strings.Contains(s, "eof"), strings.Contains(s, "reset by peer"), strings.Contains(s, "closed pipe"), strings.Contains(s, "forcibly closed"):
-		return "сервер разорвал соединение"
+		return T("сервер разорвал соединение")
 	}
-	return "ошибка соединения"
+	return T("ошибка соединения")
 }
 
 // WriteReport saves a plain-text diagnostics report.
@@ -255,15 +256,15 @@ func WriteReport(path string, nodes []Node, results map[string]ProbeResult) erro
 			ok++
 		}
 	}
-	fmt.Fprintf(&b, "Vela: проверка серверов %s\nработают: %d из %d\n\n", time.Now().Format("2006-01-02 15:04:05"), ok, len(nodes))
+	fmt.Fprintf(&b, T("Vela: проверка серверов %s\nработают: %d из %d\n\n"), time.Now().Format("2006-01-02 15:04:05"), ok, len(nodes))
 	for _, n := range nodes {
 		r, found := results[n.ID]
-		status := "не проверен"
+		status := T("не проверен")
 		if found {
 			if r.Delay > 0 {
-				status = fmt.Sprintf("OK %d мс", r.Delay)
+				status = fmt.Sprintf(T("OK %d мс"), r.Delay)
 			} else {
-				status = "ОШИБКА: " + r.Reason + " | " + r.Error
+				status = T("ОШИБКА: ") + r.Reason + " | " + r.Error
 			}
 		}
 		fmt.Fprintf(&b, "%-48s %-10s %-8s %-6s %s\n", n.Name, n.Protocol, n.Security, n.Network, status)

@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Puts a patched copy of sing-box into third_party/sing-box.
-# The patch lets the core verify servers by certificate fingerprint (`pcs`
-# in Xray share links), which many subscriptions use for gRPC/TLS servers.
+# The patches let the core verify servers by certificate fingerprint (`pcs`
+# in Xray share links) and let Vela add its own outbound types (the Xray
+# engine for XHTTP and other Xray-only transports).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION=v1.14.2
 DEST=third_party/sing-box
-STAMP="$DEST/.vela-patched-$VERSION"
+PATCHES_HASH=$(cat patches/sing-box-*.patch | sha256sum | cut -c1-12)
+STAMP="$DEST/.vela-patched-$VERSION-$PATCHES_HASH"
 
 if [ -f "$STAMP" ]; then
   exit 0
