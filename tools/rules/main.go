@@ -1,7 +1,8 @@
-// Command rules compiles plain domain and CIDR lists into a sing-box binary
-// rule set (.srs). Used by scripts/update-rules.sh.
+// Command rules compiles plain domain and CIDR lists and merges existing
+// .srs rule sets into one sing-box binary rule set. Used by
+// scripts/update-rules.sh.
 //
-//	go run ./tools/rules -out core/rules/ru-inside.srs -domains a.lst -cidrs b.lst,c.lst
+//	go run ./tools/rules -out core/rules/ru-inside.srs -srs a.srs,b.srs -domains x.lst -cidrs y.lst
 package main
 
 import (
@@ -47,6 +48,7 @@ func main() {
 	out := flag.String("out", "", "output .srs file")
 	domains := flag.String("domains", "", "comma-separated domain list files")
 	cidrs := flag.String("cidrs", "", "comma-separated CIDR list files")
+	merge := flag.String("srs", "", "comma-separated .srs files to merge")
 	flag.Parse()
 	if *out == "" {
 		flag.Usage()
@@ -81,6 +83,28 @@ func main() {
 		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{
 			IPCIDR: badoption.Listable[string](prefixes)}})
 	}
+	for _, path := range strings.Split(*merge, ",") {
+		if path == "" {
+			continue
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		compat, err := srs.Read(in, true)
+		in.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, path, err)
+			os.Exit(1)
+		}
+		plain, err := compat.Upgrade()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, path, err)
+			os.Exit(1)
+		}
+		rules = append(rules, plain.Rules...)
+	}
 	f, err := os.Create(*out)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -91,5 +115,5 @@ func main() {
 		os.Exit(1)
 	}
 	f.Close()
-	fmt.Printf("%s: %d domains, %d networks\n", *out, len(suffixes), len(prefixes))
+	fmt.Printf("%s: %d rules (%d domains, %d networks from lists)\n", *out, len(rules), len(suffixes), len(prefixes))
 }

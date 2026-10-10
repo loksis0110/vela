@@ -103,13 +103,18 @@ func TestFetchHeaders(t *testing.T) {
 	SetFetchOptions(FetchOptions{UserAgent: "Test/1", HWID: "abc", DeviceOS: "Android", OSVersion: "15", DeviceModel: "Pixel"})
 	defer SetFetchOptions(FetchOptions{})
 	h := http.Header{}
-	applyFetchHeaders(h)
+	applyFetchHeaders(h, true)
 	if h.Get("User-Agent") != "Test/1" || h.Get("x-hwid") != "abc" || h.Get("x-device-model") != "Pixel" {
 		t.Fatal(h)
 	}
+	h = http.Header{}
+	applyFetchHeaders(h, false)
+	if h.Get("x-hwid") != "" || h.Get("x-device-model") != "" {
+		t.Fatal("HWID sent over plain HTTP", h)
+	}
 	SetFetchOptions(FetchOptions{})
 	h = http.Header{}
-	applyFetchHeaders(h)
+	applyFetchHeaders(h, true)
 	if h.Get("User-Agent") != UserAgent || h.Get("x-hwid") != "" {
 		t.Fatal(h)
 	}

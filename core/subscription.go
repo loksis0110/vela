@@ -45,7 +45,9 @@ func SetFetchOptions(o FetchOptions) {
 	fetchMu.Unlock()
 }
 
-func applyFetchHeaders(h http.Header) {
+// applyFetchHeaders sets the User-Agent and, over HTTPS only, the device
+// headers: the HWID never travels unencrypted.
+func applyFetchHeaders(h http.Header, secure bool) {
 	fetchMu.RLock()
 	o := fetchOpts
 	fetchMu.RUnlock()
@@ -54,7 +56,7 @@ func applyFetchHeaders(h http.Header) {
 		ua = UserAgent
 	}
 	h.Set("User-Agent", ua)
-	if o.HWID != "" {
+	if o.HWID != "" && secure {
 		h.Set("x-hwid", o.HWID)
 		if o.DeviceOS != "" {
 			h.Set("x-device-os", o.DeviceOS)
@@ -100,13 +102,23 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 	if err != nil {
 		return nil, err
 	}
-	applyFetchHeaders(req.Header)
+	applyFetchHeaders(req.Header, u.Scheme == "https")
 	req.Header.Set("Accept", "*/*")
 	client := &http.Client{Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Second,
+	}, CheckRedirect: func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errorf("слишком много перенаправлений")
+		}
+		if next.URL.Scheme != "https" {
+			for _, k := range []string{"x-hwid", "x-device-os", "x-ver-os", "x-device-model"} {
+				next.Header.Del(k)
+			}
+		}
+		return nil
 	}}
 	resp, err := client.Do(req)
 	if err != nil {

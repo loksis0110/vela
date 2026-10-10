@@ -86,6 +86,7 @@ var english = map[string]string{
 	"протокол %s не поддерживается":                 "protocol %s is not supported",
 	"резервная копия повреждена":                    "the backup is damaged",
 	"сервер %v: цепочки (detour) не поддерживаются": "server %v: chains (detour) are not supported",
+	"слишком много перенаправлений":                 "too many redirects",
 	"сервер не ответил вовремя":                     "the server did not answer in time",
 	"сервер не отвечает: ":                          "the server does not answer: ",
 	"сервер не удалось разобрать":                   "the server could not be parsed",
