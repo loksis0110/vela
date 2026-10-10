@@ -2,18 +2,22 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"fyne.io/systray"
 )
 
-var Version = "1.3.2"
+var Version = "1.4.0"
 
 //go:embed assets/tray-off.ico
 var trayOff []byte
@@ -24,108 +28,122 @@ var trayOn []byte
 var (
 	theApp     *App
 	theServer  *Server
-	trayReady  bool
-	trayMu     sync.Mutex
-	mToggle    *systray.MenuItem
 	quitOnce   sync.Once
 	hiddenFlag = flag.Bool("hidden", false, "start minimized to tray")
 	connectArg = flag.Bool("connect", false, "connect right after start")
+	restartArg = flag.Bool("restarted", false, "started by the updater")
+	fromArg    = flag.String("from", "", "version before the update")
 )
 
 func main() {
 	flag.Parse()
 	dataDir := appDataDir()
 	os.MkdirAll(dataDir, 0o755)
+	link := linkArg(flag.Args())
 
 	theApp = NewApp(dataDir)
 	theServer = NewServer(theApp)
 	listener, err := theServer.Listen()
-	if err != nil && *connectArg {
-		// relaunched with admin rights: the previous instance is exiting
-		for i := 0; i < 40 && err != nil; i++ {
+	if err != nil && (*connectArg || *restartArg) {
+		// relaunched with admin rights or after an update: the previous
+		// instance is exiting
+		for i := 0; i < 150 && err != nil; i++ {
 			time.Sleep(150 * time.Millisecond)
 			listener, err = theServer.Listen()
 		}
 	}
 	if err != nil {
-		// already running: ask it to show its window
-		client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil}}
-		if resp, err := client.Get("http://127.0.0.1:47390/show"); err == nil {
-			resp.Body.Close()
+		// already running: hand over the link or ask it to show its window
+		if forwardToRunning(dataDir, link) {
 			return
 		}
-		fatal("Не удалось запустить Vela: порт 47390 занят другой программой.")
+		fatal(tr("Не удалось запустить Vela: порт 47390 занят другой программой."))
 		return
 	}
 	go theServer.Serve(listener)
 	go theApp.AutoUpdate()
+	go theApp.updateLoop()
+	go theApp.alertLoop()
+	go registerURLSchemes()
+	go cleanupAfterUpdate()
+	if err := theApp.applyHotkey(); err != nil {
+		go func() {
+			time.Sleep(2 * time.Second) // the tray icon must exist first
+			notify(tr("Горячая клавиша Vela не работает"), err.Error(), true)
+		}()
+	}
+	if *fromArg != "" && *fromArg != Version {
+		theApp.updatedFrom = *fromArg
+		go func() {
+			// the window reconnects by itself; without one, say it in a notification
+			time.Sleep(8 * time.Second)
+			if theApp.subscribers() == 0 {
+				notify("Vela", fmt.Sprintf(tr("Vela обновлена до версии %s"), Version), false)
+			}
+		}()
+	}
+	if link != "" {
+		theApp.OfferLink(link)
+	}
 
 	if *connectArg || theApp.state.ConnectOnLaunch {
 		go theApp.Connect()
 	}
-	if !*hiddenFlag {
+	if !*hiddenFlag || link != "" {
 		openWindow(theServer.URL(), dataDir)
 	}
 	systray.Run(onTrayReady, func() {})
 }
 
-func onTrayReady() {
-	systray.SetIcon(trayOff)
-	systray.SetTitle("Vela")
-	systray.SetTooltip("Vela: не подключено")
-	mOpen := systray.AddMenuItem("Открыть Vela", "")
-	mToggle = systray.AddMenuItem("Подключить", "")
-	systray.AddSeparator()
-	mQuit := systray.AddMenuItem("Выйти", "Отключиться и закрыть Vela")
-	systray.SetOnTapped(func() { openWindow(theServer.URL(), theApp.dataDir) })
-	trayMu.Lock()
-	trayReady = true
-	trayMu.Unlock()
-	updateTray(theApp.Snapshot().Status.State)
-	go func() {
-		for {
-			select {
-			case <-mOpen.ClickedCh:
-				openWindow(theServer.URL(), theApp.dataDir)
-			case <-mToggle.ClickedCh:
-				if theApp.Snapshot().Status.State == "disconnected" {
-					if err := theApp.Connect(); err == ErrNeedAdmin {
-						openWindow(theServer.URL(), theApp.dataDir)
-					}
-				} else {
-					theApp.Disconnect()
-				}
-			case <-mQuit.ClickedCh:
-				quit(theApp)
-			}
+// linkArg returns the app link Vela was started with (vela://..., happ://...).
+func linkArg(args []string) string {
+	for _, a := range args {
+		a = strings.TrimSpace(a)
+		if i := strings.Index(a, "://"); i > 0 && !strings.HasPrefix(a, "-") {
+			return a
 		}
-	}()
+	}
+	return ""
 }
 
-func updateTray(state string) {
-	trayMu.Lock()
-	defer trayMu.Unlock()
-	if !trayReady {
+// forwardToRunning passes a link (or a request to show the window) to the
+// Vela that is already running. The request carries a secret from the data
+// folder, so other programs can't feed links to Vela.
+func forwardToRunning(dataDir, link string) bool {
+	allowForeground()
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	body, _ := json.Marshal(map[string]string{"link": link})
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/ipc", uiPort), bytes.NewReader(body))
+	if err == nil {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Vela-IPC", ipcSecret(dataDir))
+		if resp, err := client.Do(req); err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusNoContent {
+				return true
+			}
+		}
+	}
+	// an older Vela without /ipc
+	if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/show", uiPort)); err == nil {
+		resp.Body.Close()
+		return resp.StatusCode < 300
+	}
+	return false
+}
+
+// showWindow brings the open window to the front or opens a new one.
+func showWindow() {
+	if theApp.subscribers() > 0 && focusWindow() {
 		return
 	}
-	switch state {
-	case "connected":
-		systray.SetIcon(trayOn)
-		systray.SetTooltip("Vela: подключено")
-		mToggle.SetTitle("Отключить")
-	case "connecting":
-		systray.SetTooltip("Vela: подключение…")
-		mToggle.SetTitle("Отключить")
-	default:
-		systray.SetIcon(trayOff)
-		systray.SetTooltip("Vela: не подключено")
-		mToggle.SetTitle("Подключить")
-	}
+	openWindow(theServer.URL(), theApp.dataDir)
 }
 
 func quit(app *App) {
 	quitOnce.Do(func() {
 		app.Disconnect()
+		app.fw.Disable()
 		systray.Quit()
 		time.Sleep(200 * time.Millisecond)
 		os.Exit(0)

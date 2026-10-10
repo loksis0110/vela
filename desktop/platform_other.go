@@ -21,7 +21,7 @@ func runtimePlatform() string {
 func isElevated() bool { return os.Geteuid() == 0 }
 
 func relaunchElevated() error {
-	return errors.New("запустите Vela через sudo, чтобы перехватывать весь трафик")
+	return errors.New(tr("запустите Vela через sudo, чтобы перехватывать весь трафик"))
 }
 
 func openWindow(url, dataDir string) {
@@ -74,3 +74,47 @@ func deviceOS() string {
 }
 
 func osVersion() string { return "" }
+
+func systemLanguage() string {
+	for _, v := range []string{os.Getenv("LC_ALL"), os.Getenv("LC_MESSAGES"), os.Getenv("LANG")} {
+		if v != "" {
+			if strings.HasPrefix(strings.ToLower(v), "ru") {
+				return "ru"
+			}
+			return "en"
+		}
+	}
+	return "en"
+}
+
+func focusWindow() bool { return false }
+
+func allowForeground() {}
+
+func tunnelLUID() (uint64, error) { return 0, errors.New("not supported") }
+
+func startProcess(exe string, args []string, env []string) error {
+	cmd := exec.Command(exe, args...)
+	cmd.Env = env
+	return cmd.Start()
+}
+
+// readClipboard uses the usual desktop tools when they are installed.
+func readClipboard() (string, error) {
+	for _, c := range [][]string{{"wl-paste", "--no-newline"}, {"xclip", "-selection", "clipboard", "-o"}, {"pbpaste"}} {
+		if _, err := exec.LookPath(c[0]); err != nil {
+			continue
+		}
+		out, err := exec.Command(c[0], c[1:]...).Output()
+		return string(out), err
+	}
+	return "", nil
+}
+
+func notify(title, text string, warning bool) {}
+
+func registerURLSchemes() {}
+
+// Global hotkeys are a Windows feature; elsewhere (development builds) the
+// setting is kept but does nothing.
+func registerHotkey(spec *hotkeySpec, onPress func()) error { return nil }

@@ -43,6 +43,8 @@ type Profile struct {
 	Interval   int         `json:"updateIntervalHours,omitempty"`
 	Support    string      `json:"supportUrl,omitempty"`
 	Updated    int64       `json:"updatedAt,omitempty"`
+	// Announce is a message from the provider shown as a banner.
+	Announce string `json:"announce,omitempty"`
 }
 
 // State is persisted to disk.
@@ -62,6 +64,14 @@ type State struct {
 	Sub SubPrefs `json:"sub"`
 	// Random id of this installation sent as HWID when enabled.
 	HWID string `json:"hwid,omitempty"`
+	// Application preferences: language, kill switch, updates, hotkey...
+	Prefs AppPrefs `json:"prefs"`
+	// Hash of the clipboard text offered for import last time.
+	ClipHash string `json:"clipHash,omitempty"`
+	// Subscription alerts already shown as Windows notifications.
+	Notified map[string]int64 `json:"notified,omitempty"`
+	// Banners closed by the user (provider announcements, alerts).
+	Dismissed []string `json:"dismissed,omitempty"`
 }
 
 // SubPrefs are the subscription settings. Zero values are the defaults.
@@ -86,6 +96,11 @@ type Status struct {
 	Elevated   bool   `json:"elevated"`
 	// Notice is an informational message (e.g. automatic switch).
 	Notice string `json:"notice,omitempty"`
+	// KillSwitch: the kill switch filters are on. Blocked: they are on and
+	// the VPN is not up, so the internet is blocked.
+	KillSwitch      bool   `json:"killSwitch,omitempty"`
+	Blocked         bool   `json:"blocked,omitempty"`
+	KillSwitchError string `json:"killSwitchError,omitempty"`
 }
 
 // TrafficPoint is one second of traffic for the graph.
@@ -126,12 +141,33 @@ type App struct {
 	// starting knows it was cancelled.
 	lifecycle sync.Mutex
 	connGen   uint64
+
+	// intent (guarded by mu): the user wants the VPN on. The kill switch
+	// blocks the internet while it is set and the VPN is not up.
+	intent bool
+	fw     firewall
+	fwMu   sync.Mutex
+
+	recorder *core.TrafficRecorder // traffic statistics, guarded by mu
+
+	offers   map[string]*Offer // imports waiting for confirmation, guarded by mu
+	linkWait string            // id of the app link offer shown in the window
+
+	update     UpdateState // guarded by mu
+	updateInfo *UpdateInfo
+	updateKick chan struct{}
+
+	hotkeyErr   string // guarded by mu
+	updatedFrom string // version before an automatic update, shown once
+	trayKey     string // last tray-relevant status, guarded by mu
 }
 
 func NewApp(dataDir string) *App {
-	a := &App{dataDir: dataDir, subs: map[chan []byte]struct{}{}, pings: map[string]int{}, reasons: map[string]string{}}
+	a := &App{dataDir: dataDir, subs: map[chan []byte]struct{}{}, pings: map[string]int{}, reasons: map[string]string{},
+		offers: map[string]*Offer{}, updateKick: make(chan struct{}, 1), fw: newFirewall()}
 	a.state.Settings = core.DefaultSettings()
 	a.load()
+	setLanguage(resolveLanguage(a.state.Prefs.Language))
 	a.status.State = "disconnected"
 	a.status.Elevated = isElevated()
 	a.loadPings()
@@ -179,11 +215,15 @@ func (a *App) ResetSettings() {
 	}
 	a.state.Theme = ""
 	a.state.Sub = SubPrefs{}
+	a.state.Prefs = AppPrefs{}
 	a.state.ConnectOnLaunch = false
 	a.applyFetchOptions()
 	connected := a.status.State == "connected"
 	a.saveLocked()
 	a.mu.Unlock()
+	setLanguage(resolveLanguage(""))
+	a.applyHotkey()
+	a.syncKillSwitch()
 	a.pushState()
 	if connected {
 		go a.Reconnect()
@@ -234,6 +274,21 @@ type Snapshot struct {
 	History         []TrafficPoint    `json:"history"`
 	Onboarding      bool              `json:"onboarding"`
 	Sub             SubPrefs          `json:"sub"`
+
+	Platform string   `json:"platform"`
+	Prefs    AppPrefs `json:"prefs"`
+	// Lang is the language in use ("ru" or "en"); Prefs.Language may be
+	// "" for the system language.
+	Lang         string      `json:"lang"`
+	Hotkey       string      `json:"hotkey"` // combination in use, "" when off
+	HotkeyError  string      `json:"hotkeyError,omitempty"`
+	KillSwitchOK bool        `json:"killSwitchAvailable"`
+	Update       UpdateState `json:"update"`
+	UpdatedFrom  string      `json:"updatedFrom,omitempty"`
+	// Offer is an app link waiting for the user's confirmation.
+	Offer     *Offer   `json:"offer,omitempty"`
+	Alerts    []Alert  `json:"alerts"`
+	Dismissed []string `json:"dismissed"`
 }
 
 func (a *App) Snapshot() Snapshot {
@@ -256,6 +311,11 @@ func (a *App) Snapshot() Snapshot {
 		cp.Nodes = append([]core.Node(nil), p.Nodes...)
 		profiles[i] = &cp
 	}
+	var offer *Offer
+	if o := a.offers[a.linkWait]; o != nil {
+		cp := *o
+		offer = &cp
+	}
 	return Snapshot{
 		Version: Version, Profiles: profiles, ActiveProfile: a.state.ActiveProfile,
 		SelectedNode: a.state.SelectedNode, Settings: a.state.Settings,
@@ -265,6 +325,14 @@ func (a *App) Snapshot() Snapshot {
 		History:    append([]TrafficPoint{}, a.history...),
 		Onboarding: !a.state.OnboardingPassed,
 		Sub:        a.state.Sub,
+
+		Platform: runtimePlatform(), Prefs: a.state.Prefs, Lang: language(),
+		Hotkey: effectiveHotkey(a.state.Prefs.Hotkey), HotkeyError: a.hotkeyErr,
+		KillSwitchOK: killSwitchSupported(),
+		Update:       a.update, UpdatedFrom: a.updatedFrom,
+		Offer:     offer,
+		Alerts:    a.alertsLocked(time.Now()),
+		Dismissed: append([]string{}, a.state.Dismissed...),
 	}
 }
 
@@ -305,12 +373,21 @@ func (a *App) broadcast(kind string, payload any) {
 func (a *App) pushStatus() {
 	a.mu.Lock()
 	st := a.status
+	// the tray menu changes with the connection state, not with traffic
+	key := fmt.Sprint(st.State, st.ActiveNode, st.Blocked)
+	trayChanged := key != a.trayKey
+	a.trayKey = key
 	a.mu.Unlock()
 	a.broadcast("status", st)
-	updateTray(st.State)
+	if trayChanged {
+		refreshTray()
+	}
 }
 
-func (a *App) pushState() { a.broadcast("state", a.Snapshot()) }
+func (a *App) pushState() {
+	a.broadcast("state", a.Snapshot())
+	refreshTray()
+}
 
 // ---------------------------------------------------------------- profiles
 
@@ -321,7 +398,7 @@ const manualProfileID = "manual"
 func (a *App) Import(ctx context.Context, text string) (string, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return "", errors.New("вставьте ссылку на подписку или сервер")
+		return "", errors.New(tr("вставьте ссылку на подписку или сервер"))
 	}
 	if b, ok, err := core.DecodeBackup(text); ok {
 		if err != nil {
@@ -372,16 +449,16 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 		a.saveLocked()
 		a.mu.Unlock()
 		if isNew {
-			parts = append(parts, fmt.Sprintf("«%s»: серверов %d", p.Name, len(r.sub.Nodes)))
+			parts = append(parts, fmt.Sprintf(tr("«%s»: серверов %d"), p.Name, len(r.sub.Nodes)))
 		} else {
-			parts = append(parts, fmt.Sprintf("«%s» обновлена", p.Name))
+			parts = append(parts, fmt.Sprintf(tr("«%s» обновлена"), p.Name))
 		}
 	}
 
 	if strings.TrimSpace(linksText) != "" {
 		res := core.ParseText(linksText)
 		if len(res.Nodes) == 0 {
-			msg := "не нашли поддерживаемых ссылок"
+			msg := tr("не нашли поддерживаемых ссылок")
 			if len(res.Errors) > 0 {
 				msg = res.Errors[0]
 			}
@@ -390,7 +467,7 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 			a.mu.Lock()
 			p := a.findProfile(manualProfileID)
 			if p == nil {
-				p = &Profile{ID: manualProfileID, Kind: "manual", Name: "Мои серверы"}
+				p = &Profile{ID: manualProfileID, Kind: "manual", Name: tr("Мои серверы")}
 				a.state.Profiles = append([]*Profile{p}, a.state.Profiles...)
 			}
 			existing := map[string]bool{}
@@ -409,12 +486,12 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 			a.saveLocked()
 			a.mu.Unlock()
 			if added == 0 {
-				parts = append(parts, "эти серверы уже есть в списке")
+				parts = append(parts, tr("эти серверы уже есть в списке"))
 			} else {
-				parts = append(parts, fmt.Sprintf("серверов добавлено: %d", added))
+				parts = append(parts, fmt.Sprintf(tr("серверов добавлено: %d"), added))
 			}
 			if len(res.Errors) > 0 {
-				parts = append(parts, fmt.Sprintf("пропущено ссылок: %d", len(res.Errors)))
+				parts = append(parts, fmt.Sprintf(tr("пропущено ссылок: %d"), len(res.Errors)))
 			}
 		}
 	}
@@ -433,7 +510,7 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 	a.pushState()
 	msg := strings.Join(parts, ", ")
 	if len(failures) > 0 {
-		msg += ". Не удалось: " + strings.Join(failures, "; ")
+		msg += tr(". Не удалось: ") + strings.Join(failures, "; ")
 	}
 	return capitalize(msg), nil
 }
@@ -497,7 +574,7 @@ func (a *App) RenameProfile(id, name string) error {
 	p := a.findProfile(id)
 	if p == nil {
 		a.mu.Unlock()
-		return errors.New("подписка не найдена")
+		return errors.New(tr("подписка не найдена"))
 	}
 	p.CustomName = name
 	if name == "" {
@@ -521,7 +598,7 @@ func (a *App) UpdateAll(ctx context.Context) (string, error) {
 	}
 	a.mu.Unlock()
 	if len(ids) == 0 {
-		return "", errors.New("подписок пока нет")
+		return "", errors.New(tr("подписок пока нет"))
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -539,12 +616,12 @@ func (a *App) UpdateAll(ctx context.Context) (string, error) {
 	}
 	wg.Wait()
 	if failed == len(ids) {
-		return "", errors.New("не удалось обновить подписки, проверьте интернет")
+		return "", errors.New(tr("не удалось обновить подписки, проверьте интернет"))
 	}
 	if failed > 0 {
-		return fmt.Sprintf("Обновлено %d из %d подписок", len(ids)-failed, len(ids)), nil
+		return fmt.Sprintf(tr("Обновлено %d из %d подписок"), len(ids)-failed, len(ids)), nil
 	}
-	return "Все подписки обновлены", nil
+	return tr("Все подписки обновлены"), nil
 }
 
 func applySubscription(p *Profile, sub *core.Subscription) {
@@ -555,6 +632,7 @@ func applySubscription(p *Profile, sub *core.Subscription) {
 	p.Interval = sub.UpdateInterval
 	p.Support = firstNonEmpty(sub.SupportURL, sub.WebPageURL)
 	p.Updated = sub.UpdatedAt
+	p.Announce = strings.TrimSpace(sub.Announce)
 }
 
 func (a *App) UpdateProfile(ctx context.Context, id string) error {
@@ -562,7 +640,7 @@ func (a *App) UpdateProfile(ctx context.Context, id string) error {
 	p := a.findProfile(id)
 	if p == nil || p.Kind != "subscription" {
 		a.mu.Unlock()
-		return errors.New("подписка не найдена")
+		return errors.New(tr("подписка не найдена"))
 	}
 	u := p.URL
 	a.mu.Unlock()
@@ -581,6 +659,7 @@ func (a *App) UpdateProfile(ctx context.Context, id string) error {
 	connectedHere := changed && a.status.State == "connected" && a.state.ActiveProfile == id
 	a.mu.Unlock()
 	a.pushState()
+	go a.checkAlerts()
 	if connectedHere {
 		go a.Reconnect()
 	}
@@ -629,7 +708,7 @@ func (a *App) DeleteProfile(id string) error {
 	}
 	if idx < 0 {
 		a.mu.Unlock()
-		return errors.New("профиль не найден")
+		return errors.New(tr("профиль не найден"))
 	}
 	wasActive := a.state.ActiveProfile == id
 	busy := wasActive && a.status.State != "disconnected"
@@ -656,7 +735,7 @@ func (a *App) DeleteNode(profileID, nodeID string) error {
 	p := a.findProfile(profileID)
 	if p == nil || p.Kind != "manual" {
 		a.mu.Unlock()
-		return errors.New("удалять можно только серверы, добавленные вручную")
+		return errors.New(tr("удалять можно только серверы, добавленные вручную"))
 	}
 	out := make([]core.Node, 0, len(p.Nodes))
 	for _, n := range p.Nodes {
@@ -687,11 +766,11 @@ func (a *App) Select(profileID, nodeID string) error {
 	p := a.findProfile(profileID)
 	if p == nil {
 		a.mu.Unlock()
-		return errors.New("профиль не найден")
+		return errors.New(tr("профиль не найден"))
 	}
 	if nodeID != "auto" && a.findNode(p, nodeID) == nil {
 		a.mu.Unlock()
-		return errors.New("сервер не найден")
+		return errors.New(tr("сервер не найден"))
 	}
 	sameProfile := a.state.ActiveProfile == profileID
 	a.state.ActiveProfile = profileID
@@ -732,6 +811,11 @@ func (a *App) SetSettings(s core.Settings, connectOnLaunch bool) {
 	a.saveLocked()
 	connected := a.status.State == "connected"
 	a.mu.Unlock()
+	if old.Mode != s.Mode {
+		// the kill switch works only in the TUN mode
+		a.syncKillSwitch()
+		a.pushStatus()
+	}
 	a.pushState()
 	oldJSON, _ := json.Marshal(old)
 	newJSON, _ := json.Marshal(s)
@@ -794,6 +878,7 @@ func (a *App) setStatus(state, errMsg, code string) {
 		a.status.Up, a.status.Down, a.status.UpTotal, a.status.DownTotal = 0, 0, 0, 0
 		a.status.ActiveNode = ""
 	}
+	a.status.Blocked = a.status.KillSwitch && a.intent && state != "connected"
 	a.mu.Unlock()
 	a.pushStatus()
 }
@@ -818,7 +903,7 @@ func (a *App) connect() error {
 	}
 	if p == nil || len(p.Nodes) == 0 {
 		a.mu.Unlock()
-		return errors.New("сначала добавьте сервер или подписку")
+		return errors.New(tr("сначала добавьте сервер или подписку"))
 	}
 	settings := a.state.Settings
 	// warnings and errors only: «info» writes a line per connection (gigabytes a day)
@@ -828,16 +913,19 @@ func (a *App) connect() error {
 	}
 	if settings.Mode == "tun" && !isElevated() {
 		a.mu.Unlock()
-		a.setStatus("disconnected", "Для режима «Весь трафик» нужны права администратора", "need_admin")
+		a.setStatus("disconnected", tr("Для режима «Весь компьютер» нужны права администратора"), "need_admin")
 		return ErrNeedAdmin
 	}
 	nodes := append([]core.Node(nil), p.Nodes...)
 	selected := a.state.SelectedNode
 	gen := a.connGen
+	a.intent = true
 	a.status.State = "connecting"
 	a.status.Error, a.status.ErrorCode, a.status.Notice = "", "", ""
 	a.history = nil
 	a.mu.Unlock()
+	// with the kill switch nothing leaks while the core is starting
+	a.syncKillSwitch()
 	a.pushStatus()
 
 	port, err := freePort()
@@ -859,6 +947,7 @@ func (a *App) connect() error {
 		a.setStatus("disconnected", err.Error(), "")
 		return err
 	}
+	cfg = desktopConfig(cfg)
 	os.WriteFile(filepath.Join(a.dataDir, "last-config.json"), []byte(cfg), 0o600)
 
 	instance, cancel, err := startBox(cfg, filepath.Join(a.dataDir, "core.log"))
@@ -882,7 +971,17 @@ func (a *App) connect() error {
 	a.saveLocked()
 	a.statsStop = make(chan struct{})
 	stop := a.statsStop
+	a.recorder = core.StartTrafficRecorder(port, secret, a.trafficPath())
+	tun := settings.Mode == "tun"
 	a.mu.Unlock()
+	if tun {
+		// the kill switch lets the new tunnel through (and drops the old one)
+		if err := a.attachTunnel(); err != nil {
+			a.mu.Lock()
+			a.status.KillSwitchError = tr("Kill switch не нашёл адаптер Vela, интернет может быть заблокирован: ") + err.Error()
+			a.mu.Unlock()
+		}
+	}
 	a.setStatus("connected", "", "")
 	go a.statsLoop(stop)
 	go a.watchdog(stop)
@@ -894,6 +993,7 @@ func (a *App) connect() error {
 func (a *App) Disconnect() {
 	a.mu.Lock()
 	a.connGen++
+	a.intent = false
 	if a.status.State == "connecting" {
 		a.status.State = "disconnecting"
 		a.mu.Unlock()
@@ -904,12 +1004,16 @@ func (a *App) Disconnect() {
 	a.lifecycle.Lock()
 	defer a.lifecycle.Unlock()
 	a.disconnect()
+	// the user turned the VPN off: the internet is open again
+	a.syncKillSwitch()
+	a.pushStatus()
 }
 
 func (a *App) disconnect() {
 	a.mu.Lock()
 	instance, cancel := a.instance, a.cancel
-	a.instance, a.cancel = nil, nil
+	recorder := a.recorder
+	a.instance, a.cancel, a.recorder = nil, nil, nil
 	if a.statsStop != nil {
 		close(a.statsStop)
 		a.statsStop = nil
@@ -924,6 +1028,8 @@ func (a *App) disconnect() {
 	a.status.State = "disconnecting"
 	a.mu.Unlock()
 	a.pushStatus()
+	// the last seconds of traffic are counted while the core still runs
+	recorder.Stop()
 	done := make(chan struct{})
 	go func() {
 		instance.Close()
@@ -960,11 +1066,11 @@ func humanizeError(err error) string {
 	s := err.Error()
 	switch {
 	case strings.Contains(s, "Access is denied") || strings.Contains(s, "access denied"):
-		return "Нет прав администратора для создания сетевого адаптера"
+		return tr("Нет прав администратора для создания сетевого адаптера")
 	case strings.Contains(s, "address already in use") || strings.Contains(s, "Only one usage of each socket"):
-		return "Порт локального прокси занят другой программой. Поменяйте порт в настройках"
+		return tr("Порт локального прокси занят другой программой. Поменяйте порт в настройках")
 	}
-	return "Не удалось подключиться: " + s
+	return tr("Не удалось подключиться: ") + s
 }
 
 // ---------------------------------------------------------------- controller
@@ -1068,9 +1174,9 @@ func (a *App) selfCheck(selected string) {
 			lastErr = err
 		}
 	}
-	msg := "Выбранный сервер не отвечает: " + core.ExplainError(lastErr.Error()) + ". Выберите другой сервер или «Автовыбор»"
+	msg := fmt.Sprintf(tr("Выбранный сервер не отвечает: %s. Выберите другой сервер или «Автовыбор»"), core.ExplainError(lastErr.Error()))
 	if selected == "auto" || selected == "" {
-		msg = "Ни один сервер пока не ответил. Проверьте подписку или интернет-соединение"
+		msg = tr("Ни один сервер пока не ответил. Проверьте подписку или интернет-соединение")
 	}
 	a.mu.Lock()
 	if a.status.State == "connected" {
