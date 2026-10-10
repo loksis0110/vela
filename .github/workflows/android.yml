@@ -58,7 +58,7 @@ jobs:
       - name: Restore core library (pull requests)
         id: libcache
         if: github.event_name == 'pull_request'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: android/app/libs/libvela.aar
           key: libvela-${{ hashFiles('core/**', 'mobile/**', 'xrayout/**', 'go.mod', 'patches/**', 'scripts/**') }}
@@ -86,6 +86,13 @@ jobs:
           # the Go build cache is not needed any more: room for Gradle
           go clean -cache || true
           df -h /
+      # saved right away, so a failing app build doesn't rebuild the library next time
+      - name: Save core library (pull requests)
+        if: github.event_name == 'pull_request' && steps.libcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: android/app/libs/libvela.aar
+          key: libvela-${{ hashFiles('core/**', 'mobile/**', 'xrayout/**', 'go.mod', 'patches/**', 'scripts/**') }}
       - name: Build APKs (full) and App Bundle (play)
         working-directory: android
         env:
