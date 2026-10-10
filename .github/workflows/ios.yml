@@ -47,20 +47,42 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      # Pull requests reuse the gomobile frameworks while the Go side is
+      # unchanged; builds of main and tags always compile them fresh.
+      - name: Restore core frameworks
+        if: github.event_name == 'pull_request'
+        id: fwcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ios/Frameworks
+          key: ios-frameworks-${{ hashFiles('core/**', 'mobile/**', 'xrayout/**', 'go.mod', 'go.sum', 'patches/**', 'scripts/**', 'tools/rules/**') }}
+
       - uses: actions/setup-go@v5
+        if: steps.fwcache.outputs.cache-hit != 'true'
         with:
           go-version: "1.26"
 
       - name: Build core frameworks
+        if: steps.fwcache.outputs.cache-hit != 'true'
         run: |
           set -o pipefail
           ./scripts/build-mobile-libs.sh ios 2>&1 | tee $RUNNER_TEMP/lib.log
 
+      # saved right away, so a failing app build doesn't lose them
+      - name: Save core frameworks
+        if: github.event_name == 'pull_request' && steps.fwcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ios/Frameworks
+          key: ${{ steps.fwcache.outputs.cache-primary-key }}
+
       - name: Generate Xcode project
         working-directory: ios
         run: |
+          set -o pipefail
           brew install xcodegen
-          xcodegen
+          xcodegen 2>&1 | tee $RUNNER_TEMP/xcodegen.log
 
       - name: Build app (unsigned)
         working-directory: ios
@@ -98,7 +120,16 @@ jobs:
         if: failure()
         run: |
           ./scripts/ci-report.sh $RUNNER_TEMP/lib.log
-          ./scripts/ci-report.sh $RUNNER_TEMP/xcode.log
+          ./scripts/ci-report.sh $RUNNER_TEMP/xcodegen.log
+          # every distinct compiler error, without the long paths
+          if [ -f $RUNNER_TEMP/xcode.log ]; then
+            grep -E ": (error|fatal error): " $RUNNER_TEMP/xcode.log | sed -E 's#^/[^ ]*/ios/##' | sort -u | head -n 80 > $RUNNER_TEMP/errors.log || true
+            if [ -s $RUNNER_TEMP/errors.log ]; then
+              ./scripts/ci-report.sh $RUNNER_TEMP/errors.log
+            else
+              ./scripts/ci-report.sh $RUNNER_TEMP/xcode.log
+            fi
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: Vela-iOS-unsigned-ipa

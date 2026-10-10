@@ -1,0 +1,12 @@
+/* Vela (VelaTunnel): English. Generated from the Russian texts in the code; keys are the Russian texts. */
+
+"Vela не подключилась (%@): %@" = "Vela couldn't connect (%@): %@";
+"Не удалось подключиться: %@" = "Couldn't connect: %@";
+"запуск ядра" = "starting the core";
+"конфигурация" = "configuration";
+"откройте Vela и подключитесь из приложения" = "open Vela and connect from the app";
+"папки" = "folders";
+"подготовка" = "preparing";
+"подключение к серверу" = "connecting to the server";
+"правила маршрутизации" = "routing rules";
+"служба управления" = "control service";

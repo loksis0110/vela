@@ -10,10 +10,14 @@ struct Node: Codable, Identifiable, Hashable {
     let security: String
     let network: String
     let link: String
+    /// "xray" for servers that run on the embedded Xray engine (XHTTP, mKCP,
+    /// Xray JSON). Optional so servers saved by older versions still decode.
+    let engine: String?
     /// Full node object from the Go core, passed back verbatim when building the config.
     let raw: String
 
     var isUDP: Bool { proto == "Hysteria2" || proto == "TUIC" }
+    var isXray: Bool { engine == "xray" }
 
     init?(dict: [String: Any]) {
         guard let id = dict["id"] as? String,
@@ -27,6 +31,7 @@ struct Node: Codable, Identifiable, Hashable {
         security = dict["security"] as? String ?? ""
         network = dict["network"] as? String ?? ""
         link = dict["link"] as? String ?? ""
+        engine = (dict["engine"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         self.raw = raw
     }
 }
@@ -48,6 +53,11 @@ struct Profile: Codable, Identifiable, Hashable {
     /// Optional so state saved by older versions still decodes.
     var title: String?
     var customName: String?
+    /// Message from the provider (announce header or #announce: line).
+    var announce: String?
+
+    /// The name to show; the list of own servers follows the app language.
+    var displayName: String { id == "manual" ? L("Мои серверы") : name }
 }
 
 /// User routing rule: domain, *keyword* or IP/CIDR → direct, proxy or block.
@@ -154,6 +164,10 @@ struct AppState: Codable {
     /// iOS reconnects the VPN by itself (On Demand) until it's turned off in Vela.
     var alwaysOn = false
     var sortByPing = false
+    /// Offer subscriptions copied to the clipboard.
+    var clipboardCheck = true
+    /// Notifications about the end of a subscription and its traffic.
+    var reminders = true
 
     var active: Profile? { profiles.first { $0.id == activeProfile } ?? profiles.first }
 
@@ -172,6 +186,8 @@ struct AppState: Codable {
         connectOnLaunch = try c.decodeIfPresent(Bool.self, forKey: .connectOnLaunch) ?? false
         alwaysOn = try c.decodeIfPresent(Bool.self, forKey: .alwaysOn) ?? false
         sortByPing = try c.decodeIfPresent(Bool.self, forKey: .sortByPing) ?? false
+        clipboardCheck = try c.decodeIfPresent(Bool.self, forKey: .clipboardCheck) ?? true
+        reminders = try c.decodeIfPresent(Bool.self, forKey: .reminders) ?? true
     }
 }
 
@@ -209,6 +225,9 @@ final class Store: ObservableObject {
     @Published var reasons: [String: String] = [:]
     /// progress of the server check
     @Published var probe: (done: Int, total: Int)?
+    /// Provider announcements the user closed: profile id → text.
+    @Published private(set) var dismissedAnnounce: [String: String] =
+        UserDefaults.standard.dictionary(forKey: "dismissedAnnounce") as? [String: String] ?? [:]
 
     let dataURL: URL
     private let fileURL: URL
@@ -271,7 +290,7 @@ final class Store: ObservableObject {
     /// Several subscriptions can be pasted at once, one per line.
     func importText(_ text: String) async throws -> String {
         let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !input.isEmpty else { throw CoreError(message: "Вставьте ссылку на подписку или сервер") }
+        guard !input.isEmpty else { throw CoreError(message: L("Вставьте ссылку на подписку или сервер")) }
         var backupError: NSError?
         let backup = VelacoreDecodeBackup(input, &backupError)
         if let backupError { throw CoreError(message: backupError.localizedDescription) }
@@ -312,7 +331,7 @@ final class Store: ObservableObject {
                     lastProfile = profile.id
                     if let i = existing { st.profiles[i] = profile } else { st.profiles.append(profile) }
                 }
-                parts.append(isNew ? "«\(label)»: серверов \(nodes.count)" : "«\(label)» обновлена")
+                parts.append(isNew ? LF("«%@»: серверов %@", label, "\(nodes.count)") : LF("«%@» обновлена", label))
             }
         }
 
@@ -321,11 +340,11 @@ final class Store: ObservableObject {
             let nodes = Self.nodes(parsed["nodes"])
             let errors = parsed["errors"] as? [String] ?? []
             if nodes.isEmpty {
-                failures.append(errors.first ?? "не нашли поддерживаемых ссылок")
+                failures.append(errors.first ?? L("не нашли поддерживаемых ссылок"))
             } else {
                 var added = 0
                 update { st in
-                    var manual = st.profiles.first { $0.id == Self.manualID } ?? Profile(id: Self.manualID, name: "Мои серверы", kind: "manual")
+                    var manual = st.profiles.first { $0.id == Self.manualID } ?? Profile(id: Self.manualID, name: L("Мои серверы"), kind: "manual")
                     let known = Set(manual.nodes.map(\.link))
                     let fresh = nodes.filter { !known.contains($0.link) }
                     added = fresh.count
@@ -333,13 +352,13 @@ final class Store: ObservableObject {
                     if let i = st.profiles.firstIndex(where: { $0.id == Self.manualID }) { st.profiles[i] = manual } else { st.profiles.insert(manual, at: 0) }
                 }
                 lastProfile = Self.manualID
-                parts.append(added == 0 ? "эти серверы уже есть в списке" : "серверов добавлено: \(added)")
-                if !errors.isEmpty { parts.append("пропущено ссылок: \(errors.count)") }
+                parts.append(added == 0 ? L("эти серверы уже есть в списке") : LF("серверов добавлено: %@", "\(added)"))
+                if !errors.isEmpty { parts.append(LF("пропущено ссылок: %@", "\(errors.count)")) }
             }
         }
 
         guard let target = lastProfile else {
-            throw CoreError(message: failures.isEmpty ? "Не нашли поддерживаемых ссылок" : failures.joined(separator: "; "))
+            throw CoreError(message: failures.isEmpty ? L("Не нашли поддерживаемых ссылок") : failures.joined(separator: "; "))
         }
         update { st in
             // the first import becomes active; later ones are added alongside
@@ -349,13 +368,55 @@ final class Store: ObservableObject {
             }
         }
         var msg = parts.joined(separator: ", ")
-        if !failures.isEmpty { msg += ". Не удалось: " + failures.joined(separator: "; ") }
+        if !failures.isEmpty { msg += ". " + L("Не удалось:") + " " + failures.joined(separator: "; ") }
+        Reminders.shared.sync(ask: true)
         return msg.prefix(1).uppercased() + msg.dropFirst()
+    }
+
+    /// The part of an offer (app link, clipboard) that isn't added yet: new
+    /// subscription URLs and servers not in any list. nil when all is there.
+    func newPart(of offer: ImportOffer) -> ImportOffer? {
+        let urls = Set(state.profiles.filter { $0.kind == "subscription" }.map(\.url))
+        let links = Set(state.profiles.flatMap(\.nodes).map(\.link))
+        var o = offer
+        o.subscriptions = offer.subscriptions.filter { !urls.contains($0) }
+        let fresh = offer.links.split(separator: "\n").map(String.init).filter { !$0.isEmpty && !links.contains($0) }
+        o.links = fresh.joined(separator: "\n")
+        o.linkCount = fresh.count
+        return o.subscriptions.isEmpty && o.links.isEmpty ? nil : o
+    }
+
+    /// Adds what an app link or the clipboard offered through the usual
+    /// import; the name from the link is used when the provider sends none.
+    func importOffer(_ offer: ImportOffer) async throws -> String {
+        let msg = try await importText(offer.text)
+        if !offer.name.isEmpty, offer.subscriptions.count == 1,
+           let p = state.profiles.first(where: { $0.kind == "subscription" && $0.url == offer.subscriptions[0] }),
+           p.title == nil, p.customName == nil {
+            rename(p.id, to: offer.name)
+        }
+        return msg
+    }
+
+    // MARK: - Announcements
+
+    /// The provider's message for a profile, unless the user closed this text.
+    func announcement(for p: Profile?) -> String? {
+        guard let p, let text = p.announce?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty,
+              dismissedAnnounce[p.id] != text else { return nil }
+        return text
+    }
+
+    func dismissAnnouncement(_ p: Profile) {
+        dismissedAnnounce[p.id] = p.announce?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let ids = Set(state.profiles.map(\.id))
+        dismissedAnnounce = dismissedAnnounce.filter { ids.contains($0.key) }
+        UserDefaults.standard.set(dismissedAnnounce, forKey: "dismissedAnnounce")
     }
 
     func refresh(_ profileID: String) async throws {
         guard let p = state.profiles.first(where: { $0.id == profileID && $0.kind == "subscription" }) else {
-            throw CoreError(message: "Подписка не найдена")
+            throw CoreError(message: L("Подписка не найдена"))
         }
         let sub = try await Self.fetchSubscription(p.url)
         let nodes = Self.nodes(sub["nodes"])
@@ -366,17 +427,18 @@ final class Store: ObservableObject {
                 st.profiles[i] = fresh
             }
         }
+        Reminders.shared.sync()
     }
 
     func refreshAll() async throws -> String {
         let ids = state.profiles.filter { $0.kind == "subscription" }.map(\.id)
-        guard !ids.isEmpty else { throw CoreError(message: "Подписок пока нет") }
+        guard !ids.isEmpty else { throw CoreError(message: L("Подписок пока нет")) }
         var failed = 0
         for id in ids {
             do { try await refresh(id) } catch { failed += 1 }
         }
-        if failed == ids.count { throw CoreError(message: "Не удалось обновить подписки, проверьте интернет") }
-        return failed > 0 ? "Обновлено \(ids.count - failed) из \(ids.count) подписок" : "Все подписки обновлены"
+        if failed == ids.count { throw CoreError(message: L("Не удалось обновить подписки, проверьте интернет")) }
+        return failed > 0 ? LF("Обновлено подписок: %@ из %@", "\(ids.count - failed)", "\(ids.count)") : L("Все подписки обновлены")
     }
 
     func refreshDue() async {
@@ -418,6 +480,7 @@ final class Store: ObservableObject {
                 st.selectedNode = "auto"
             }
         }
+        Reminders.shared.sync()
     }
 
     func deleteNode(profile: String, node: String) {
@@ -455,6 +518,11 @@ final class Store: ObservableObject {
     func setConnectOnLaunch(_ on: Bool) { update { $0.connectOnLaunch = on } }
     func setAlwaysOn(_ on: Bool) { update { $0.alwaysOn = on } }
     func setSortByPing(_ on: Bool) { update { $0.sortByPing = on } }
+    func setClipboardCheck(_ on: Bool) { update { $0.clipboardCheck = on } }
+    func setReminders(_ on: Bool) {
+        update { $0.reminders = on }
+        Reminders.shared.sync()
+    }
 
     /// Settings back to defaults; subscriptions, servers and favorites stay.
     func resetSettings() {
@@ -464,8 +532,11 @@ final class Store: ObservableObject {
             st.sub = SubPrefs()
             st.connectOnLaunch = false
             st.alwaysOn = false
+            st.clipboardCheck = true
+            st.reminders = true
         }
         applyFetchOptions()
+        Reminders.shared.sync()
     }
 
     /// Passes the subscription settings to the core.
@@ -529,8 +600,8 @@ final class Store: ObservableObject {
             }
             if let t = extra["theme"] as? String, ["system", "light", "dark"].contains(t) { st.theme = t }
         }
-        if let importError { return "Настройки восстановлены. Подписки не загрузились: " + importError }
-        return msg.isEmpty ? "Настройки восстановлены" : "Восстановлено. " + msg
+        if let importError { return L("Настройки восстановлены. Подписки не загрузились:") + " " + importError }
+        return msg.isEmpty ? L("Настройки восстановлены") : L("Восстановлено.") + " " + msg
     }
 
     // MARK: - Server check
@@ -577,7 +648,7 @@ final class Store: ObservableObject {
             for n in nodes where (pings[n.id] ?? 0) == 0 {
                 let ms = await Task.detached { Int(VelacoreTCPPing(n.server, Int32(n.port))) }.value
                 pings[n.id] = ms > 0 ? ms : -1
-                if ms <= 0 { reasons[n.id] = "сервер недоступен" }
+                if ms <= 0 { reasons[n.id] = L("сервер недоступен") }
             }
         }
     }
@@ -609,7 +680,7 @@ final class Store: ObservableObject {
     /// the extension don't need a shared container.
     func buildConfig(port: Int, secret: String) throws -> String {
         guard let profile = state.active, !profile.nodes.isEmpty else {
-            throw CoreError(message: "Сначала добавьте сервер или подписку")
+            throw CoreError(message: L("Сначала добавьте сервер или подписку"))
         }
         let nodes = profile.nodes.compactMap { Self.json($0.raw) as Any? }
         let ids = Set(profile.nodes.map(\.id))
@@ -654,6 +725,7 @@ final class Store: ObservableObject {
         p.upload = i64("upload"); p.download = i64("download"); p.total = i64("total"); p.expire = i64("expire")
         p.updatedAt = i64("updatedAt")
         p.intervalHours = (sub["updateIntervalHours"] as? NSNumber)?.intValue ?? 0
+        p.announce = (sub["announce"] as? String).flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
         let support = (sub["supportUrl"] as? String) ?? ""
         p.supportURL = support.isEmpty ? ((sub["webPageUrl"] as? String) ?? "") : support
         return p
@@ -662,7 +734,7 @@ final class Store: ObservableObject {
     /// Keeps profile names unique so tabs can be told apart.
     nonisolated static func uniqueName(_ all: [Profile], _ p: Profile) -> String {
         if let custom = p.customName, !custom.isEmpty { return custom }
-        let base = p.name.isEmpty ? (URL(string: p.url)?.host ?? "Подписка") : p.name
+        let base = p.name.isEmpty ? (URL(string: p.url)?.host ?? L("Подписка")) : p.name
         var name = base
         var n = 2
         while all.contains(where: { $0.id != p.id && $0.name == name }) {

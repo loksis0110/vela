@@ -53,6 +53,13 @@ final class TunnelManager: ObservableObject {
     @Published private(set) var ipBusy = false
     @Published private(set) var ipError: String?
     @Published var speed = SpeedState()
+    /// Open connections of the running core (from the stats poll).
+    @Published private(set) var connectionCount = 0
+    /// Traffic statistics: live from the extension while connected, the
+    /// last saved copy otherwise.
+    @Published private(set) var summary: TrafficSummary?
+    @Published private(set) var summaryLive = false
+    @Published private(set) var summaryDate: Date?
 
     private var watchTask: Task<Void, Never>?
     /// Set when this app instance started the connection (not iOS on its own
@@ -73,6 +80,11 @@ final class TunnelManager: ObservableObject {
     private var secret: String {
         get { UserDefaults.standard.string(forKey: "controllerSecret") ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: "controllerSecret") }
+    }
+
+    /// Controller of the running core, for the connections screen.
+    var controller: (port: Int, secret: String)? {
+        state == .connected && port != 0 ? (port, secret) : nil
     }
 
     /// Bundle id of the embedded Packet Tunnel extension. Read from the app
@@ -140,6 +152,8 @@ final class TunnelManager: ObservableObject {
             userStopped = false
             up = 0; down = 0; total = 0; activeNode = nil
             history = []
+            connectionCount = 0
+            if was == .connected { summaryLive = false }
             statsTask?.cancel()
             watchTask?.cancel()
         }
@@ -166,7 +180,7 @@ final class TunnelManager: ObservableObject {
         }
         guard let text else { return }
         lastFailure = text
-        error = "Не удалось подключиться: " + text
+        error = LF("Не удалось подключиться: %@", text)
     }
 
     /// Everything useful for finding out why the VPN doesn't work.
@@ -177,41 +191,40 @@ final class TunnelManager: ObservableObject {
         lines.append("Vela \(info["CFBundleShortVersionString"] ?? "?") (\(info["CFBundleVersion"] ?? "?")), iOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         let group = Bundle.main.object(forInfoDictionaryKey: "AppGroupIdentifier") as? String ?? ""
         let hasGroup = !group.isEmpty && FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil
-        lines.append("App Group: \(hasGroup ? "есть" : "нет (подпись без группы, журнал запуска недоступен)")")
-        lines.append("Расширение VPN: \(Self.tunnelBundleID)")
+        lines.append("App Group: " + (hasGroup ? L("есть") : L("нет (подпись без группы, журнал запуска недоступен)")))
+        lines.append(LF("Расширение VPN: %@", Self.tunnelBundleID))
         let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
-        lines.append("Профилей VPN в iOS: \(managers.count)")
+        lines.append(LF("Профилей VPN в iOS: %@", "\(managers.count)"))
         if let m = manager {
-            lines.append("Профиль включён: \(m.isEnabled), On Demand: \(m.isOnDemandEnabled), статус: \(m.connection.status.rawValue)")
+            lines.append(LF("Профиль включён: %@, On Demand: %@, статус: %@", "\(m.isEnabled)", "\(m.isOnDemandEnabled)", "\(m.connection.status.rawValue)"))
             let err: Error? = await withCheckedContinuation { c in m.connection.fetchLastDisconnectError { c.resume(returning: $0) } }
-            if let e = err as NSError? { lines.append("Последняя ошибка iOS: \(e.localizedDescription) [\(e.domain) \(e.code)]") }
+            if let e = err as NSError? { lines.append(LF("Последняя ошибка iOS: %@", "\(e.localizedDescription) [\(e.domain) \(e.code)]")) }
         } else {
-            lines.append("Профиль VPN ещё не создан")
+            lines.append(L("Профиль VPN ещё не создан"))
         }
-        if let f = lastFailure { lines.append("Последняя ошибка Vela: \(f)") }
+        if let f = lastFailure { lines.append(LF("Последняя ошибка Vela: %@", f)) }
         if let p = store.state.active {
             let sel = store.state.selectedNode
-            let name = p.nodes.first { $0.id == sel }?.name ?? "Автовыбор"
-            lines.append("Подписка: \(p.name), серверов: \(p.nodes.count), выбран: \(name)")
-            if let ms = store.pings[sel] { lines.append("Последняя проверка выбранного: \(ms > 0 ? "\(ms) мс" : (store.reasons[sel] ?? "не работает"))") }
+            let name = p.nodes.first { $0.id == sel }?.name ?? L("Автовыбор")
+            lines.append(LF("Подписка: %@, серверов: %@, выбран: %@", p.displayName, "\(p.nodes.count)", name))
+            if let ms = store.pings[sel] {
+                lines.append(LF("Последняя проверка выбранного: %@", ms > 0 ? "\(ms) " + L("мс") : (store.reasons[sel] ?? L("не работает"))))
+            }
         }
         do {
             let cfg = try store.buildConfig(port: 1, secret: "x")
-            lines.append("Конфигурация: \(cfg.utf8.count / 1024) КБ, серверов в ней: \(cfg.components(separatedBy: "\"tag\": \"node-").count - 1)")
+            lines.append(LF("Конфигурация: %@, серверов в ней: %@", Fmt.bytes(Int64(cfg.utf8.count)), "\(cfg.components(separatedBy: "\"tag\": \"node-").count - 1)"))
         } catch {
-            lines.append("Конфигурация не собирается: \(error.localizedDescription)")
+            lines.append(LF("Конфигурация не собирается: %@", error.localizedDescription))
         }
-        if state == .connected, let session = manager?.connection as? NETunnelProviderSession {
-            let mem: String = await withCheckedContinuation { c in
-                do {
-                    try session.sendProviderMessage(Data("vela:memory".utf8)) { c.resume(returning: $0.flatMap { String(data: $0, encoding: .utf8) } ?? "?") }
-                } catch { c.resume(returning: "?") }
-            }
-            lines.append("Память расширения: \(mem) МБ из ~50")
+        lines.append(LF("Маршрутизация: %@", store.state.settings.routing))
+        if state == .connected {
+            let mem = await sendMessage("vela:memory") ?? "?"
+            lines.append(LF("Память расширения: %@ МБ из ~50", mem))
         }
         if let log = try? String(contentsOf: store.dataURL.appendingPathComponent("start.log"), encoding: .utf8), !log.isEmpty {
             lines.append("")
-            lines.append("Журнал запуска:")
+            lines.append(L("Журнал запуска:"))
             lines.append(log)
         }
         return lines.joined(separator: "\n")
@@ -259,9 +272,9 @@ final class TunnelManager: ObservableObject {
             port = Int.random(in: 20000 ... 60000)
             secret = Store.randomID(16)
             let config = try Store.shared.buildConfig(port: port, secret: secret)
-            try m.connection.startVPNTunnel(options: ["configContent": config as NSString])
+            try m.connection.startVPNTunnel(options: ["configContent": config as NSString, "lang": Lang.code as NSString])
         } catch let e as NEVPNError where e.code == .configurationReadWriteFailed {
-            error = "Разрешите Vela добавить конфигурацию VPN"
+            error = L("Разрешите Vela добавить конфигурацию VPN")
         } catch {
             self.error = error.localizedDescription
         }
@@ -348,7 +361,10 @@ final class TunnelManager: ObservableObject {
                 }
                 last = (u, d)
                 self.total = u + d
+                self.connectionCount = (c["connections"] as? [Any])?.count ?? 0
                 if tick % 3 == 0 { self.activeNode = await self.resolveActive() }
+                // the extension saves the statistics every 30 seconds
+                if tick % 60 == 5 { await self.loadSummary() }
                 tick += 1
             }
         }
@@ -388,23 +404,23 @@ final class TunnelManager: ObservableObject {
         let manual = st.selectedNode != "auto" && profile.nodes.contains { $0.id == st.selectedNode }
         if st.settings.disableFailover || !manual {
             if manual, justConnected {
-                error = "Выбранный сервер не отвечает. Выберите другой сервер или «Автовыбор»"
+                error = L("Выбранный сервер не отвечает. Выберите другой сервер или «Автовыбор»")
             } else if !manual {
                 _ = await request("GET", "/group/auto/delay?url=\(Self.testURL)&timeout=20000", timeout: 25)
             }
             return
         }
-        let name = profile.nodes.first { $0.id == st.selectedNode }?.name ?? "Сервер"
+        let name = profile.nodes.first { $0.id == st.selectedNode }?.name ?? L("Сервер")
         // remembered as failed, so automatic selection skips it next time
         store.pings[st.selectedNode] = -1
-        store.reasons[st.selectedNode] = "перестал отвечать во время работы"
+        store.reasons[st.selectedNode] = L("перестал отвечать во время работы")
         store.savePings()
         if await switchTo("auto") {
             store.select(profile: profile.id, node: "auto")
             error = nil
-            notice = "«\(name)» не отвечает. Vela переключилась на автовыбор"
+            notice = LF("«%@» не отвечает. Vela переключилась на автовыбор", name)
         } else if justConnected {
-            error = "Выбранный сервер не отвечает. Выберите другой сервер"
+            error = L("Выбранный сервер не отвечает. Выберите другой сервер")
         }
     }
 
@@ -457,20 +473,73 @@ final class TunnelManager: ObservableObject {
 
     /// Recent core log from the Network Extension.
     func logs() async -> String {
-        guard state == .connected, let session = manager?.connection as? NETunnelProviderSession else {
-            return "Журнал доступен, пока VPN подключён."
-        }
-        let raw: String = await withCheckedContinuation { cont in
+        guard state == .connected else { return L("Журнал доступен, пока VPN подключён.") }
+        let raw = await sendMessage("vela:logs") ?? ""
+        let text = VelacoreTidyLog(raw)
+        return text.isEmpty ? L("Журнал пуст.") : text
+    }
+
+    /// Sends a command to the Network Extension and returns its reply.
+    private func sendMessage(_ command: String) async -> String? {
+        guard state == .connected, let session = manager?.connection as? NETunnelProviderSession else { return nil }
+        return await withCheckedContinuation { cont in
             do {
-                try session.sendProviderMessage(Data("vela:logs".utf8)) { reply in
-                    cont.resume(returning: reply.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+                try session.sendProviderMessage(Data(command.utf8)) { reply in
+                    cont.resume(returning: reply.flatMap { String(data: $0, encoding: .utf8) })
                 }
             } catch {
-                cont.resume(returning: "")
+                cont.resume(returning: nil)
             }
         }
-        let text = VelacoreTidyLog(raw)
-        return text.isEmpty ? "Журнал пуст." : text
+    }
+
+    // MARK: - Statistics and connections
+
+    /// Loads the traffic statistics: from the extension while connected
+    /// (its file is in its own container), straight from the file when the
+    /// App Group is shared, otherwise the last saved copy.
+    func loadSummary() async {
+        var text: String?
+        if state == .connected { text = await sendMessage("vela:stats") }
+        if text.flatMap({ TrafficSummary(json: $0) }) == nil {
+            let shared = Store.shared.dataURL.appendingPathComponent("traffic.json")
+            if FileManager.default.fileExists(atPath: shared.path) {
+                let path = shared.path
+                text = await Task.detached { VelacoreTrafficSummary(path) }.value
+            }
+        }
+        if let text, let s = TrafficSummary(json: text) {
+            UserDefaults.standard.set(text, forKey: "trafficSummary")
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "trafficSummaryAt")
+            summary = s.rebased()
+            summaryLive = true
+            summaryDate = Date()
+        } else if let saved = UserDefaults.standard.string(forKey: "trafficSummary"), let s = TrafficSummary(json: saved) {
+            summary = s.rebased()
+            summaryLive = false
+            let at = UserDefaults.standard.double(forKey: "trafficSummaryAt")
+            summaryDate = at > 0 ? Date(timeIntervalSince1970: at) : nil
+        }
+    }
+
+    /// Open connections of the running core, newest first.
+    func connections() async -> Result<[Conn], CoreError> {
+        guard let c = controller else { return .failure(CoreError(message: L("VPN не подключён"))) }
+        return await Task.detached(priority: .userInitiated) { () -> Result<[Conn], CoreError> in
+            var err: NSError?
+            let text = VelacoreListConnections(Int32(c.port), c.secret, &err)
+            if let err { return .failure(CoreError(message: err.localizedDescription)) }
+            return .success(Conn.list(text))
+        }.value
+    }
+
+    /// Closes one connection, or all of them when id is "".
+    func closeConnection(_ id: String) async {
+        guard let c = controller else { return }
+        _ = await Task.detached(priority: .userInitiated) { () -> Bool in
+            var err: NSError?
+            return VelacoreCloseConnection(Int32(c.port), c.secret, id, &err)
+        }.value
     }
 
     private func resolveActive() async -> String? {
@@ -507,7 +576,7 @@ final class TunnelManager: ObservableObject {
             let r = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=8000", timeout: 11)
             let ms = (r?["delay"] as? NSNumber)?.intValue ?? -1
             store.pings[n.id] = ms > 0 ? ms : -1
-            if ms <= 0 { store.reasons[n.id] = "сервер не ответил" }
+            if ms <= 0 { store.reasons[n.id] = L("сервер не ответил") }
             store.savePings()
         } else {
             await store.probeOne(n)
@@ -524,7 +593,7 @@ final class TunnelManager: ObservableObject {
             return
         }
         if profile.id != store.state.activeProfile {
-            error = "Чтобы проверить другую подписку, отключитесь"
+            error = L("Чтобы проверить другую подписку, отключитесь")
             return
         }
         for n in profile.nodes { store.pings[n.id] = 0; store.reasons[n.id] = nil }
@@ -552,7 +621,7 @@ final class TunnelManager: ObservableObject {
             for await (id, ms) in group {
                 if ms <= 0, store.stopRequested { store.pings[id] = nil; continue }
                 store.pings[id] = ms > 0 ? ms : -1
-                if ms <= 0 { store.reasons[id] = "сервер не ответил" }
+                if ms <= 0 { store.reasons[id] = L("сервер не ответил") }
                 if let p = store.probe { store.probe = (p.done + 1, p.total) }
                 addNext()
             }

@@ -43,13 +43,13 @@ struct TrafficGraph: View {
             }
             .frame(height: 64)
             HStack(spacing: 10) {
-                legend(Palette.sea, "загрузка")
-                legend(Palette.star, "отдача")
-                Text("пик \(Fmt.speed(peak))").font(.system(size: 11)).foregroundStyle(Palette.muted)
+                legend(Palette.sea, L("загрузка"))
+                legend(Palette.star, L("отдача"))
+                Text(LF("пик %@", Fmt.speed(peak))).font(.system(size: 11)).foregroundStyle(Palette.muted)
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("График трафика, пик \(Fmt.speed(peak))")
+        .accessibilityLabel(LF("График трафика, пик %@", Fmt.speed(peak)))
     }
 
     private func legend(_ color: Color, _ text: String) -> some View {
@@ -91,28 +91,28 @@ struct ToolCard: View {
 
 enum ToolText {
     static func ip(_ info: IPInfo?, busy: Bool, error: String?) -> (String, String) {
-        if busy, info == nil { return ("Узнаём…", "Спрашиваем сайт") }
+        if busy, info == nil { return (L("Узнаём…"), L("Спрашиваем сайт")) }
         if let info {
             let meta = [info.city, info.country, info.isp].filter { !$0.isEmpty }
             return ([info.flag, info.ip].filter { !$0.isEmpty }.joined(separator: " "),
-                    meta.isEmpty ? "Так вас видят сайты" : meta.joined(separator: ", "))
+                    meta.isEmpty ? L("Так вас видят сайты") : meta.joined(separator: ", "))
         }
-        if let error { return ("Не удалось", error) }
-        return ("Узнать", "Как вас видят сайты")
+        if let error { return (L("Не удалось"), error) }
+        return (L("Узнать"), L("Как вас видят сайты"))
     }
 
     static func speed(_ s: SpeedState) -> (String, String) {
         if s.running {
             switch s.phase {
-            case "ping": return ("Пинг…", "Измеряем задержку")
-            case "download": return ("↓ \(Fmt.mbps(s.downMbps)) Мбит/с", "Загрузка…")
-            case "upload": return ("↑ \(Fmt.mbps(s.upMbps)) Мбит/с", "Отдача…")
-            default: return ("Измеряем…", "")
+            case "ping": return (L("Пинг…"), L("Измеряем задержку"))
+            case "download": return ("↓ \(Fmt.mbps(s.downMbps)) " + L("Мбит/с"), L("Загрузка…"))
+            case "upload": return ("↑ \(Fmt.mbps(s.upMbps)) " + L("Мбит/с"), L("Отдача…"))
+            default: return (L("Измеряем…"), "")
             }
         }
-        if s.done, let e = s.error, s.downMbps <= 0 { return ("Не удалось", e) }
-        if s.done { return ("↓ \(Fmt.mbps(s.downMbps))  ↑ \(Fmt.mbps(s.upMbps))", "Мбит/с, пинг \(Int(s.pingMs)) мс") }
-        return ("Измерить", "Через выбранный сервер")
+        if s.done, let e = s.error, s.downMbps <= 0 { return (L("Не удалось"), e) }
+        if s.done { return ("↓ \(Fmt.mbps(s.downMbps))  ↑ \(Fmt.mbps(s.upMbps))", LF("Мбит/с, пинг %@ мс", "\(Int(s.pingMs))")) }
+        return (L("Измерить"), L("Через выбранный сервер"))
     }
 }
 
@@ -161,7 +161,7 @@ struct ShareSheet: View {
                     .background(Color.white, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                     Text(text).font(.system(size: 11, design: .monospaced)).foregroundStyle(Palette.muted).lineLimit(4).textSelection(.enabled)
                     HStack {
-                        Button(copied ? "Скопировано" : "Скопировать") { UIPasteboard.general.string = text; copied = true }
+                        Button(copied ? L("Скопировано") : L("Скопировать")) { Pickup.shared.copy(text); copied = true }
                             .buttonStyle(.bordered)
                         Spacer()
                         ShareLink(item: text) { Label("Отправить", systemImage: "square.and.arrow.up") }
@@ -268,7 +268,7 @@ final class ScannerController: UIViewController, AVCaptureMetadataOutputObjectsD
 
     private func showDenied() {
         let label = UILabel()
-        label.text = "Нет доступа к камере. Разрешите его для Vela в Настройках iPhone или выберите фото с QR-кодом."
+        label.text = L("Нет доступа к камере. Разрешите его для Vela в Настройках iPhone или выберите фото с QR-кодом.")
         label.textColor = .white
         label.numberOfLines = 0
         label.textAlignment = .center
@@ -305,7 +305,7 @@ final class ScannerController: UIViewController, AVCaptureMetadataOutputObjectsD
 struct LogsSheet: View {
     @EnvironmentObject var tunnel: TunnelManager
     @Environment(\.dismiss) private var dismiss
-    @State private var text = "Загружаем…"
+    @State private var text = L("Загружаем…")
 
     var body: some View {
         NavigationStack {
@@ -326,7 +326,7 @@ struct LogsSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Закрыть") { dismiss() } }
                 ToolbarItemGroup(placement: .primaryAction) {
-                    Button { UIPasteboard.general.string = text } label: { Image(systemName: "doc.on.doc") }
+                    Button { Pickup.shared.copy(text) } label: { Image(systemName: "doc.on.doc") }
                         .accessibilityLabel("Скопировать")
                     Button { Task { text = await tunnel.logs() } } label: { Image(systemName: "arrow.clockwise") }
                         .accessibilityLabel("Обновить")
@@ -363,7 +363,7 @@ struct Chip: View {
 struct DiagnosticsSheet: View {
     @EnvironmentObject var tunnel: TunnelManager
     @Environment(\.dismiss) private var dismiss
-    @State private var text = "Собираем…"
+    @State private var text = L("Собираем…")
     @State private var copied = false
 
     var body: some View {
@@ -387,7 +387,7 @@ struct DiagnosticsSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Закрыть") { dismiss() } }
                 ToolbarItemGroup(placement: .primaryAction) {
-                    Button(copied ? "Скопировано" : "Скопировать") { UIPasteboard.general.string = text; copied = true }
+                    Button(copied ? L("Скопировано") : L("Скопировать")) { Pickup.shared.copy(text); copied = true }
                     Button { Task { text = await tunnel.diagnostics() } } label: { Image(systemName: "arrow.clockwise") }
                         .accessibilityLabel("Обновить")
                 }

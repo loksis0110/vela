@@ -2,6 +2,9 @@
 name: Vela
 options:
   bundleIdPrefix: app.vela
+  # English is the fallback for languages Vela has no translation for;
+  # ru.lproj and en.lproj are both complete (keys are the Russian texts)
+  developmentLanguage: en
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
@@ -9,8 +12,8 @@ settings:
   base:
     # Put your Apple Developer Team ID here (or pass DEVELOPMENT_TEAM=... to xcodebuild)
     DEVELOPMENT_TEAM: ""
-    MARKETING_VERSION: "1.3.2"
-    CURRENT_PROJECT_VERSION: "8"
+    MARKETING_VERSION: "1.4.0"
+    CURRENT_PROJECT_VERSION: "9"
     SWIFT_VERSION: "5.9"
     APP_GROUP_IDENTIFIER: group.app.vela.client
     ENABLE_BITCODE: NO
@@ -58,9 +61,15 @@ targets:
         NSCameraUsageDescription: Камера нужна, чтобы отсканировать QR-код подписки или сервера.
         ITSAppUsesNonExemptEncryption: true
         AppGroupIdentifier: $(APP_GROUP_IDENTIFIER)
+        CFBundleLocalizations: [ru, en]
+        # "add subscription" links of provider sites (core.DeepLinkSchemes + sub)
+        # and raw server links
         CFBundleURLTypes:
           - CFBundleURLName: app.vela.client.links
-            CFBundleURLSchemes: [vela, vless, vmess, trojan, ss, hysteria2, hy2, tuic]
+            CFBundleURLSchemes: [vela, happ, v2rayng, v2rayn, hiddify, sing-box, clash, clashmeta, mihomo, flclash,
+                                 streisand, v2box, karing, sn, incy, sub]
+          - CFBundleURLName: app.vela.client.servers
+            CFBundleURLSchemes: [vless, vmess, trojan, ss, hysteria2, hy2, tuic]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.vela.client
@@ -72,7 +81,8 @@ targets:
     platform: iOS
     sources:
       - path: VelaTunnel
-      # rule sets for the smart mode, copied into the extension bundle
+      # rule sets of the routing modes (all .srs files), copied into the
+      # extension bundle; the extension installs every one it finds
       - path: ../core/rules
         buildPhase: resources
     dependencies:

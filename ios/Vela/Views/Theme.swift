@@ -46,15 +46,21 @@ extension ColorScheme {
 
 enum Fmt {
     static func bytes(_ n: Int64) -> String {
-        guard n > 0 else { return "0 Б" }
-        let units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
+        let units = Lang.isRU ? ["Б", "КБ", "МБ", "ГБ", "ТБ"] : ["B", "KB", "MB", "GB", "TB"]
+        guard n > 0 else { return "0 " + units[0] }
         var v = Double(n), i = 0
         while v >= 1024, i < units.count - 1 { v /= 1024; i += 1 }
-        let num = i == 0 ? String(Int(v)) : (v < 10 ? String(format: "%.1f", v).replacingOccurrences(of: ".", with: ",") : String(Int(v)))
+        let num = i == 0 ? String(Int(v)) : (v < 10 ? decimal(v) : String(Int(v)))
         return "\(num) \(units[i])"
     }
 
-    static func speed(_ n: Int64) -> String { bytes(n) + "/с" }
+    /// One decimal with the separator of the app language: 1,5 / 1.5.
+    static func decimal(_ v: Double) -> String {
+        let s = String(format: "%.1f", v)
+        return Lang.isRU ? s.replacingOccurrences(of: ".", with: ",") : s
+    }
+
+    static func speed(_ n: Int64) -> String { bytes(n) + (Lang.isRU ? "/с" : "/s") }
 
     static func duration(_ s: Int) -> String {
         let h = s / 3600, m = (s % 3600) / 60, r = s % 60
@@ -63,9 +69,37 @@ enum Fmt {
 
     static func date(_ unix: Int64) -> String {
         let f = DateFormatter()
-        f.locale = Locale(identifier: "ru_RU")
-        f.dateFormat = "d MMMM yyyy"
+        f.locale = Lang.locale
+        f.dateFormat = Lang.isRU ? "d MMMM yyyy" : "MMMM d, yyyy"
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(unix)))
+    }
+
+    /// "9 окт" / "Oct 9".
+    static func shortDay(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Lang.locale
+        f.setLocalizedDateFormatFromTemplate("dMMM")
+        return f.string(from: d)
+    }
+
+    /// "Октябрь 2026" / "October 2026".
+    static func month(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Lang.locale
+        f.setLocalizedDateFormatFromTemplate("LLLLyyyy")
+        let s = f.string(from: d)
+        return s.prefix(1).uppercased() + s.dropFirst()
+    }
+
+    /// "5 с", "3 мин", "2 ч" / "5 s", "3 min", "2 h".
+    static func age(_ seconds: Int) -> String {
+        let s = max(0, seconds)
+        if s < 60 { return "\(s) " + L("с") }
+        if s < 3600 { return "\(s / 60) " + L("мин") }
+        let h = s / 3600, m = (s % 3600) / 60
+        var out = "\(h) " + L("ч")
+        if m > 0 { out += " \(m) " + L("мин") }
+        return out
     }
 
     /// Splits a leading flag emoji from a server name.
@@ -85,11 +119,11 @@ enum Fmt {
         let scalars = Array(flag.unicodeScalars)
         guard scalars.count >= 2 else { return flag }
         let code = String(scalars.prefix(2).compactMap { UnicodeScalar($0.value - 0x1F1E6 + 65).map(Character.init) })
-        return Locale(identifier: "ru_RU").localizedString(forRegionCode: code) ?? code
+        return Lang.locale.localizedString(forRegionCode: code) ?? code
     }
 
     static func mbps(_ v: Double) -> String {
-        v >= 100 ? String(format: "%.0f", v) : String(format: "%.1f", v).replacingOccurrences(of: ".", with: ",")
+        v >= 100 ? String(format: "%.0f", v) : decimal(v)
     }
 
     static func badge(_ name: String) -> String {
@@ -103,11 +137,11 @@ enum Fmt {
         guard let ms else { return nil }
         switch ms {
         case 0: return ("…", Palette.muted)
-        case ..<0: return ("не работает", Palette.danger)
-        case ..<150: return ("\(ms) мс", Palette.sea)
-        case ..<300: return ("\(ms) мс", Palette.star)
-        case ..<600: return ("\(ms) мс", Palette.flare)
-        default: return ("\(ms) мс", Palette.danger)
+        case ..<0: return (L("не работает"), Palette.danger)
+        case ..<150: return ("\(ms) " + L("мс"), Palette.sea)
+        case ..<300: return ("\(ms) " + L("мс"), Palette.star)
+        case ..<600: return ("\(ms) " + L("мс"), Palette.flare)
+        default: return ("\(ms) " + L("мс"), Palette.danger)
         }
     }
 }
@@ -121,6 +155,20 @@ struct Badge: View {
             .foregroundStyle(Palette.star)
             .frame(width: size, height: size)
             .background(Palette.hull, in: RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
+    }
+}
+
+/// Small capsule next to the protocol, e.g. "Xray" for servers on the Xray engine.
+struct MiniTag: View {
+    let text: String
+    var color: Color = Palette.flare
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .overlay(Capsule().stroke(color.opacity(0.6), lineWidth: 1))
+            .fixedSize()
     }
 }
 
