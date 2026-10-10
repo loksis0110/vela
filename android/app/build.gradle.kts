@@ -23,8 +23,8 @@ android {
         applicationId = "app.vela.client"
         minSdk = 24
         targetSdk = 37
-        versionCode = 8
-        versionName = "1.3.2"
+        versionCode = 9
+        versionName = "1.4.0"
         base.archivesName.set("Vela-$versionName")
     }
 
@@ -44,6 +44,21 @@ android {
                 keyAlias = "vela"
                 keyPassword = "velatest"
             }
+        }
+    }
+
+    // full: APKs for direct download (current behavior).
+    // play: Google Play build; ad blocking is off because Play's VpnService
+    // policy doesn't allow apps to manipulate ads. Nothing else differs.
+    flavorDimensions += "store"
+    productFlavors {
+        create("full") {
+            dimension = "store"
+            buildConfigField("boolean", "PLAY", "false")
+        }
+        create("play") {
+            dimension = "store"
+            buildConfigField("boolean", "PLAY", "true")
         }
     }
 

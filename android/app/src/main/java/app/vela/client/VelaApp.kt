@@ -1,7 +1,9 @@
 package app.vela.client
 
 import android.app.Application
+import android.content.res.Configuration
 import android.os.Build
+import app.vela.client.notify.Reminders
 import app.vela.client.data.Store
 import app.vela.client.vpn.VpnManager
 import app.vela.client.widget.VelaWidget
@@ -19,6 +21,7 @@ import java.io.File
 class VelaApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        Lang.init(this)
         Store.init(this)
         DefaultNetworkMonitor.init(this)
         val work = File(filesDir, "core").apply { mkdirs() }
@@ -35,11 +38,22 @@ class VelaApp : Application() {
                 it.appMarketingVersion = BuildConfig.VERSION_NAME
             },
         )
+        Lang.applyToCore()
+        Reminders.ensureChannel(this)
+        Reminders.onWake(this)
         // keep the home screen widget in sync with the connection
         CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
             combine(VpnManager.status, Store.state) { s, st -> Triple(s.state, s.activeNode, st.active?.id to st.selectedNode) }
                 .distinctUntilChanged()
                 .collect { runCatching { VelaWidget.updateAll(this@VelaApp) } }
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // the system language may have changed: texts of notifications, widget, core
+        Lang.onConfigurationChanged()
+        Reminders.ensureChannel(this)
+        runCatching { VelaWidget.updateAll(this) }
     }
 }

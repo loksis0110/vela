@@ -1,23 +1,22 @@
 package app.vela.client.ui
 
 import androidx.compose.ui.graphics.Color
+import app.vela.client.Lang
+import app.vela.client.R
 import java.text.SimpleDateFormat
 import java.util.Date
-import java.util.Locale
-
-private val RU = Locale.forLanguageTag("ru")
 
 fun formatBytes(n: Long): String {
-    if (n <= 0) return "0 Б"
-    val units = listOf("Б", "КБ", "МБ", "ГБ", "ТБ")
+    val units = listOf(R.string.unit_b, R.string.unit_kb, R.string.unit_mb, R.string.unit_gb, R.string.unit_tb)
+    if (n <= 0) return "0 " + Lang.str(units[0])
     var v = n.toDouble()
     var i = 0
     while (v >= 1024 && i < units.lastIndex) { v /= 1024; i++ }
-    val num = if (i == 0) v.toLong().toString() else if (v < 10) String.format(RU, "%.1f", v) else v.toLong().toString()
-    return "$num ${units[i]}"
+    val num = if (i == 0) v.toLong().toString() else if (v < 10) String.format(Lang.locale(), "%.1f", v) else v.toLong().toString()
+    return "$num ${Lang.str(units[i])}"
 }
 
-fun formatSpeed(n: Long) = formatBytes(n) + "/с"
+fun formatSpeed(n: Long) = Lang.str(R.string.unit_per_second, formatBytes(n))
 
 fun formatDuration(sec: Long): String {
     val s = sec.coerceAtLeast(0)
@@ -25,9 +24,9 @@ fun formatDuration(sec: Long): String {
     return if (h > 0) "%d:%02d:%02d".format(h, m, r) else "%02d:%02d".format(m, r)
 }
 
-fun formatDate(unix: Long): String = SimpleDateFormat("d MMMM yyyy", RU).format(Date(unix * 1000))
+fun formatDate(unix: Long): String = SimpleDateFormat(Lang.str(R.string.fmt_date), Lang.locale()).format(Date(unix * 1000))
 
-fun formatDateTime(unix: Long): String = SimpleDateFormat("d MMM, HH:mm", RU).format(Date(unix * 1000))
+fun formatDateTime(unix: Long): String = SimpleDateFormat(Lang.str(R.string.fmt_date_time), Lang.locale()).format(Date(unix * 1000))
 
 /** Splits a leading flag emoji from a server name. */
 fun splitFlag(name: String): Pair<String?, String> {
@@ -50,12 +49,14 @@ fun badgeFor(name: String): String {
 
 data class PingLabel(val text: String, val color: Color)
 
+fun formatMs(ms: Int): String = Lang.str(R.string.unit_ms, ms)
+
 fun pingLabel(ms: Int?): PingLabel? = when {
     ms == null -> null
     ms == 0 -> PingLabel("…", Vela.Muted)
-    ms < 0 -> PingLabel("не работает", Vela.Danger)
-    ms < 150 -> PingLabel("$ms мс", Vela.Sea)
-    ms < 300 -> PingLabel("$ms мс", Vela.Star)
-    ms < 600 -> PingLabel("$ms мс", Vela.Flare)
-    else -> PingLabel("$ms мс", Vela.Danger)
+    ms < 0 -> PingLabel(Lang.str(R.string.ping_dead), Vela.Danger)
+    ms < 150 -> PingLabel(formatMs(ms), Vela.Sea)
+    ms < 300 -> PingLabel(formatMs(ms), Vela.Star)
+    ms < 600 -> PingLabel(formatMs(ms), Vela.Flare)
+    else -> PingLabel(formatMs(ms), Vela.Danger)
 }

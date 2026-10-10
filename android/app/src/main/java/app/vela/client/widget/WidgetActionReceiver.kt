@@ -11,6 +11,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import app.vela.client.Lang
 import app.vela.client.R
 import app.vela.client.ui.MainActivity
 import app.vela.client.vpn.VelaVpnService
@@ -31,7 +32,8 @@ class WidgetActionReceiver : BroadcastReceiver() {
     }
 
     /** The app has to be opened once: Android asks for VPN permission there. */
-    private fun askToOpen(context: Context) {
+    private fun askToOpen(base: Context) {
+        val context = Lang.localized(base)
         val nm = context.getSystemService(NotificationManager::class.java) ?: return
         if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHANNEL) == null) {
             nm.createNotificationChannel(NotificationChannel(CHANNEL, context.getString(R.string.widget_channel), NotificationManager.IMPORTANCE_DEFAULT))

@@ -61,6 +61,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -70,6 +71,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.graphics.drawable.toBitmap
+import app.vela.client.Lang
+import app.vela.client.R
 import app.vela.client.data.Store
 import app.vela.client.vpn.IpInfo
 import app.vela.client.vpn.SpeedState
@@ -117,12 +120,12 @@ fun TrafficGraph(points: List<Pair<Long, Long>>, modifier: Modifier = Modifier) 
         }
         Row(Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(8.dp).clip(RoundedCornerShape(2.dp)).background(down))
-            Text(" загрузка", color = Vela.Muted, fontSize = 11.sp)
+            Text(" " + stringResource(R.string.graph_download), color = Vela.Muted, fontSize = 11.sp)
             Spacer(Modifier.width(10.dp))
             Box(Modifier.size(8.dp).clip(RoundedCornerShape(2.dp)).background(up))
-            Text(" отдача", color = Vela.Muted, fontSize = 11.sp)
+            Text(" " + stringResource(R.string.graph_upload), color = Vela.Muted, fontSize = 11.sp)
             Spacer(Modifier.width(10.dp))
-            Text("пик ${formatSpeed(peak)}", color = Vela.Muted, fontSize = 11.sp)
+            Text(stringResource(R.string.graph_peak, formatSpeed(peak)), color = Vela.Muted, fontSize = 11.sp)
         }
     }
 }
@@ -152,25 +155,25 @@ fun ToolCard(label: String, value: String, meta: String, busy: Boolean, modifier
 }
 
 fun ipTexts(info: IpInfo?, busy: Boolean, error: String?): Pair<String, String> = when {
-    busy && info == null -> "Узнаём…" to "Спрашиваем сайт"
+    busy && info == null -> Lang.str(R.string.ip_busy) to Lang.str(R.string.ip_busy_meta)
     info != null -> (listOf(info.flag, info.ip).filter { it.isNotBlank() }.joinToString(" ")) to
-        listOf(info.city, info.country, info.isp).filter { it.isNotBlank() }.distinct().joinToString(", ").ifEmpty { "Так вас видят сайты" }
-    error != null -> "Не удалось" to error
-    else -> "Узнать" to "Как вас видят сайты"
+        listOf(info.city, info.country, info.isp).filter { it.isNotBlank() }.distinct().joinToString(", ").ifEmpty { Lang.str(R.string.ip_seen) }
+    error != null -> Lang.str(R.string.failed) to error
+    else -> Lang.str(R.string.ip_check) to Lang.str(R.string.ip_check_meta)
 }
 
 fun speedTexts(s: SpeedState): Pair<String, String> {
-    fun mbps(v: Double) = if (v >= 100) "%.0f".format(Locale.US, v) else "%.1f".format(Locale.US, v).replace('.', ',')
+    fun mbps(v: Double) = if (v >= 100) "%.0f".format(Lang.locale(), v) else "%.1f".format(Lang.locale(), v)
     return when {
         s.running -> when (s.phase) {
-            "ping" -> "Пинг…" to "Измеряем задержку"
-            "download" -> "↓ ${mbps(s.downMbps)} Мбит/с" to "Загрузка…"
-            "upload" -> "↑ ${mbps(s.upMbps)} Мбит/с" to "Отдача…"
-            else -> "Измеряем…" to ""
+            "ping" -> Lang.str(R.string.speed_ping) to Lang.str(R.string.speed_ping_meta)
+            "download" -> Lang.str(R.string.speed_down_value, mbps(s.downMbps)) to Lang.str(R.string.speed_down_meta)
+            "upload" -> Lang.str(R.string.speed_up_value, mbps(s.upMbps)) to Lang.str(R.string.speed_up_meta)
+            else -> Lang.str(R.string.speed_measuring) to ""
         }
-        s.done && s.error != null && s.downMbps <= 0 -> "Не удалось" to s.error
-        s.done -> "↓ ${mbps(s.downMbps)}  ↑ ${mbps(s.upMbps)}" to "Мбит/с, пинг ${s.pingMs.toInt()} мс"
-        else -> "Измерить" to "Через выбранный сервер"
+        s.done && s.error != null && s.downMbps <= 0 -> Lang.str(R.string.failed) to s.error
+        s.done -> "↓ ${mbps(s.downMbps)}  ↑ ${mbps(s.upMbps)}" to Lang.str(R.string.speed_done_meta, s.pingMs.toInt())
+        else -> Lang.str(R.string.speed_start) to Lang.str(R.string.speed_start_meta)
     }
 }
 
@@ -228,9 +231,9 @@ fun ShareDialog(title: String, hint: String, text: String, onDismiss: () -> Unit
                 ) {
                     val (ready, img) = qr
                     if (img != null) {
-                        Image(img, "QR-код", Modifier.fillMaxWidth().heightIn(max = 300.dp))
+                        Image(img, stringResource(R.string.qr_code), Modifier.fillMaxWidth().heightIn(max = 300.dp))
                     } else if (ready) {
-                        Text("Слишком длинно для QR-кода, скопируйте текст", color = Color.DarkGray, fontSize = 13.sp, modifier = Modifier.padding(24.dp))
+                        Text(stringResource(R.string.qr_too_long), color = Color.DarkGray, fontSize = 13.sp, modifier = Modifier.padding(24.dp))
                     } else {
                         CircularProgressIndicator(Modifier.padding(40.dp), color = Color.Gray)
                     }
@@ -250,10 +253,10 @@ fun ShareDialog(title: String, hint: String, text: String, onDismiss: () -> Unit
                         Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), title),
                     )
                 }
-            }) { Text("Отправить") }
+            }) { Text(stringResource(R.string.send)) }
         },
         dismissButton = {
-            TextButton(onClick = { copyText(context, text); copied = true }) { Text(if (copied) "Скопировано" else "Скопировать", color = Vela.Muted) }
+            TextButton(onClick = { copyText(context, text); copied = true }) { Text(stringResource(if (copied) R.string.copied else R.string.copy), color = Vela.Muted) }
         },
     )
 }
@@ -264,16 +267,18 @@ fun ShareDialog(title: String, hint: String, text: String, onDismiss: () -> Unit
 fun LogsDialog(onDismiss: () -> Unit) {
     val context = LocalContext.current
     var tick by remember { mutableStateOf(0) }
-    val text by produceState("Загружаем…", tick) {
+    val loading = stringResource(R.string.loading)
+    val empty = stringResource(R.string.log_empty)
+    val text by produceState(loading, tick) {
         value = withContext(Dispatchers.IO) {
-            Velacore.readLog(Store.logFile.absolutePath, 300).ifBlank { "Журнал пуст. Он заполняется, пока VPN подключён." }
+            Velacore.readLog(Store.logFile.absolutePath, 300).ifBlank { empty }
         }
     }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Column(
             Modifier.fillMaxWidth(0.94f).clip(RoundedCornerShape(24.dp)).background(Vela.Deep).padding(18.dp),
         ) {
-            Text("Журнал ядра", fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+            Text(stringResource(R.string.log_title), fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
             Box(
                 Modifier.padding(top = 10.dp).fillMaxWidth().heightIn(min = 200.dp, max = 460.dp)
                     .clip(RoundedCornerShape(12.dp)).background(Vela.Ink).border(1.dp, Vela.Hull, RoundedCornerShape(12.dp)),
@@ -288,9 +293,9 @@ fun LogsDialog(onDismiss: () -> Unit) {
                 }
             }
             Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = { copyText(context, text) }) { Text("Скопировать", color = Vela.Muted) }
-                TextButton(onClick = { tick++ }) { Text("Обновить", color = Vela.Muted) }
-                TextButton(onClick = onDismiss) { Text("Закрыть") }
+                TextButton(onClick = { copyText(context, text) }) { Text(stringResource(R.string.copy), color = Vela.Muted) }
+                TextButton(onClick = { tick++ }) { Text(stringResource(R.string.refresh), color = Vela.Muted) }
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.close)) }
             }
         }
     }
@@ -333,11 +338,11 @@ fun AppPickerDialog(selected: List<String>, onDismiss: () -> Unit, onDone: (List
     var query by remember { mutableStateOf("") }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Column(Modifier.fillMaxWidth(0.94f).fillMaxSize(0.9f).clip(RoundedCornerShape(24.dp)).background(Vela.Deep).padding(16.dp)) {
-            Text("Приложения", fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+            Text(stringResource(R.string.apps_title), fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
             OutlinedTextField(
                 value = query, onValueChange = { query = it }, singleLine = true,
                 leadingIcon = { Icon(Icons.Rounded.Search, null, tint = Vela.Muted) },
-                placeholder = { Text("Поиск", color = Vela.Muted) },
+                placeholder = { Text(stringResource(R.string.search), color = Vela.Muted) },
                 colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Vela.Star, unfocusedBorderColor = Vela.Line, cursorColor = Vela.Star),
                 modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
             )
@@ -368,9 +373,9 @@ fun AppPickerDialog(selected: List<String>, onDismiss: () -> Unit, onDone: (List
                 }
             }
             Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("Выбрано: ${chosen.size}", color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                TextButton(onClick = onDismiss) { Text("Отмена", color = Vela.Muted) }
-                TextButton(onClick = { onDone(chosen.toList().sorted()) }) { Text("Готово") }
+                Text(stringResource(R.string.apps_selected, chosen.size), color = Vela.Muted, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel), color = Vela.Muted) }
+                TextButton(onClick = { onDone(chosen.toList().sorted()) }) { Text(stringResource(R.string.done)) }
             }
         }
     }
@@ -384,14 +389,12 @@ fun appLabel(context: Context, pkg: String): String = runCatching {
 
 // ------------------------------------------------------------------ countries
 
-private val ruLocale = Locale.forLanguageTag("ru")
-
-/** "🇩🇪" → "Германия". */
+/** "🇩🇪" → "Germany" / "Германия". */
 fun countryName(flag: String): String {
     val cps = flag.codePoints().toArray()
     if (cps.size < 2) return flag
     val code = String(charArrayOf('A' + (cps[0] - 0x1F1E6), 'A' + (cps[1] - 0x1F1E6)))
-    return Locale("", code).getDisplayCountry(ruLocale).ifBlank { code }
+    return Locale("", code).getDisplayCountry(Lang.locale()).ifBlank { code }
 }
 
 @Composable

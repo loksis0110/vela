@@ -1,8 +1,13 @@
 package app.vela.client.data
 
 import android.content.Context
-import app.vela.velacore.Velacore
+import android.content.SharedPreferences
 import android.net.Uri
+import app.vela.client.BuildConfig
+import app.vela.client.Lang
+import app.vela.client.R
+import app.vela.client.notify.Reminders
+import app.vela.velacore.Velacore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -24,6 +29,8 @@ data class Node(
     val port: Int,
     val security: String,
     val network: String,
+    /** "xray" for servers run by the embedded Xray engine. */
+    val engine: String,
     /** Full node object as produced by the Go core (kept verbatim). */
     val raw: JSONObject,
 ) {
@@ -38,6 +45,7 @@ data class Node(
             port = o.optInt("port"),
             security = o.optString("security"),
             network = o.optString("network"),
+            engine = o.optString("engine"),
             raw = o,
         )
     }
@@ -58,6 +66,8 @@ data class Profile(
     val intervalHours: Int = 0,
     val supportUrl: String = "",
     val updatedAt: Long = 0,
+    /** Message from the provider, shown as a banner. */
+    val announce: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("id", id).put("name", name).put("kind", kind).put("url", url)
@@ -66,6 +76,7 @@ data class Profile(
         .put("upload", upload).put("download", download).put("total", total)
         .put("expire", expire).put("updateIntervalHours", intervalHours)
         .put("supportUrl", supportUrl).put("updatedAt", updatedAt)
+        .put("announce", announce)
 
     companion object {
         fun from(o: JSONObject) = Profile(
@@ -83,6 +94,7 @@ data class Profile(
             intervalHours = o.optInt("updateIntervalHours"),
             supportUrl = o.optString("supportUrl"),
             updatedAt = o.optLong("updatedAt"),
+            announce = o.optString("announce"),
         )
     }
 }
@@ -117,7 +129,8 @@ data class Settings(
     val apps: List<String> = emptyList(),
 ) {
     fun toJson(): JSONObject = JSONObject()
-        .put("mode", "tun").put("routing", routing).put("blockAds", blockAds)
+        // Google Play's VpnService policy forbids ad blocking
+        .put("mode", "tun").put("routing", routing).put("blockAds", blockAds && !BuildConfig.PLAY)
         .put("ipv6", ipv6).put("stack", stack).put("remoteDns", remoteDns)
         .put("directDns", directDns)
         .put("directDomains", JSONArray(directDomains))
@@ -193,14 +206,28 @@ data class AppState(
     val connectOnLaunch: Boolean = false,
     /** Servers sorted by the last check. */
     val sortByPing: Boolean = false,
+    /** Don't offer links found in the clipboard. */
+    val noClipboard: Boolean = false,
+    /** Don't remind about the end of subscriptions and traffic. */
+    val noReminders: Boolean = false,
 ) {
     val active: Profile? get() = profiles.firstOrNull { it.id == activeProfile } ?: profiles.firstOrNull()
 }
+
+/** A problem the user can fix; the message is shown as is. */
+class VelaError(message: String) : Exception(message)
+
+private fun fail(id: Int, vararg args: Any): Nothing = throw VelaError(Lang.str(id, *args))
 
 /** Holds the app state, persisted as JSON in the app's private storage. */
 object Store {
     private lateinit var file: File
     lateinit var dataDir: File
+        private set
+    private lateinit var appContext: Context
+
+    /** Small things that are not settings: dismissed banners, clipboard, alerts shown. */
+    lateinit var prefs: SharedPreferences
         private set
 
     private val _state = MutableStateFlow(AppState())
@@ -209,19 +236,31 @@ object Store {
     /** Latency in ms per node id: -1 unreachable, -2 measured only when connected, 0 measuring. */
     val pings = MutableStateFlow<Map<String, Int>>(emptyMap())
 
-    /** Why a server failed the last check (Russian, human readable). */
+    /** Why a server failed the last check (human readable). */
     val reasons = MutableStateFlow<Map<String, String>>(emptyMap())
+
+    /** Hidden provider announcements: profile id to the hash of the hidden text. */
+    val dismissedAnnounce = MutableStateFlow<Map<String, String>>(emptyMap())
 
     const val MANUAL_ID = "manual"
 
     fun init(context: Context) {
+        appContext = context.applicationContext ?: context
         dataDir = context.filesDir
         file = File(dataDir, "state.json")
+        prefs = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
         _state.value = load()
         loadPings()
+        runCatching {
+            val o = JSONObject(prefs.getString("dismissedAnnounce", "{}") ?: "{}")
+            dismissedAnnounce.value = o.keys().asSequence().associateWith { o.getString(it) }
+        }
         if (_state.value.hwid.isEmpty()) update { it.copy(hwid = randomId(16)) }
         applyFetchOptions()
     }
+
+    /** Statistics file written by the traffic recorder of the core. */
+    val trafficFile: File get() = File(dataDir, "traffic.json")
 
     /** Passes the subscription settings to the core. */
     private fun applyFetchOptions() {
@@ -244,10 +283,39 @@ object Store {
 
     fun setSortByPing(on: Boolean) = update { it.copy(sortByPing = on) }
 
+    fun setClipboard(on: Boolean) = update { it.copy(noClipboard = !on) }
+
+    fun setReminders(on: Boolean) {
+        update { it.copy(noReminders = !on) }
+        Reminders.onChanged(appContext)
+    }
+
     /** Settings back to defaults; subscriptions, servers and favorites stay. */
     fun resetSettings() {
-        update { it.copy(settings = Settings(), theme = "system", sub = SubPrefs(), connectOnLaunch = false) }
+        update {
+            it.copy(
+                settings = Settings(), theme = "system", sub = SubPrefs(), connectOnLaunch = false,
+                noClipboard = false, noReminders = false,
+            )
+        }
         applyFetchOptions()
+        Reminders.onChanged(appContext)
+    }
+
+    /** Hides the provider's message until it changes. */
+    fun dismissAnnounce(profileId: String, text: String) {
+        val next = dismissedAnnounce.value + (profileId to announceHash(text))
+        dismissedAnnounce.value = next
+        prefs.edit().putString("dismissedAnnounce", JSONObject(next as Map<*, *>).toString()).apply()
+    }
+
+    fun announceHash(text: String): String = text.trim().hashCode().toString(16)
+
+    /** The announcement to show for a profile, or null when there is none or it was hidden. */
+    fun visibleAnnounce(p: Profile?, dismissed: Map<String, String>): String? {
+        val text = p?.announce?.trim().orEmpty()
+        if (text.isEmpty() || dismissed[p!!.id] == announceHash(text)) return null
+        return text
     }
 
     /** Core log of the current connection (shown in Settings). */
@@ -269,6 +337,8 @@ object Store {
             hwid = o.optString("hwid"),
             connectOnLaunch = o.optBoolean("connectOnLaunch"),
             sortByPing = o.optBoolean("sortByPing"),
+            noClipboard = o.optBoolean("noClipboard"),
+            noReminders = o.optBoolean("noReminders"),
         )
     }.getOrDefault(AppState())
 
@@ -304,9 +374,71 @@ object Store {
             .put("hwid", next.hwid)
             .put("connectOnLaunch", next.connectOnLaunch)
             .put("sortByPing", next.sortByPing)
+            .put("noClipboard", next.noClipboard)
+            .put("noReminders", next.noReminders)
         val tmp = File(file.parentFile, "state.json.tmp")
         tmp.writeText(o.toString())
         tmp.renameTo(file)
+    }
+
+    /** True when this subscription URL is already added. */
+    fun hasSubscription(url: String): Boolean =
+        _state.value.profiles.any { it.kind == "subscription" && it.url.trim() == url.trim() }
+
+    /** True when every share link in the text is already among «My servers». */
+    fun hasAllLinks(links: String): Boolean {
+        val known = _state.value.profiles.flatMap { it.nodes }.map { it.raw.optString("link").trim() }.toSet()
+        val list = links.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        return list.isNotEmpty() && list.all { it in known }
+    }
+
+    /** Downloads a subscription without adding it (for the confirmation of an app link). */
+    suspend fun preview(url: String): JSONObject = withContext(Dispatchers.IO) {
+        JSONObject(Velacore.fetchSubscription(url))
+    }
+
+    /** Adds a subscription downloaded by [preview]. Returns a message for the user. */
+    suspend fun addFetched(url: String, sub: JSONObject, name: String = ""): String = withContext(Dispatchers.IO) {
+        val (label, isNew) = saveSubscription(url, sub)
+        val id = _state.value.profiles.firstOrNull { it.kind == "subscription" && it.url == url }?.id
+        if (id != null) {
+            makeActiveIfNone(id)
+            applySuggestedName(id, name)
+        }
+        Reminders.onSubscriptionsChanged(appContext)
+        val count = sub.optJSONArray("nodes").toNodes().size
+        if (isNew) Lang.str(R.string.import_sub_added, label, count) else Lang.str(R.string.import_sub_updated, label)
+    }
+
+    /** Uses the name from an app link when the provider gives none. */
+    fun applySuggestedName(profileId: String, name: String) {
+        val p = _state.value.profiles.firstOrNull { it.id == profileId } ?: return
+        if (name.isNotBlank() && p.title.isBlank() && p.customName.isBlank()) rename(p.id, name.take(60))
+    }
+
+    private fun saveSubscription(url: String, sub: JSONObject): Pair<String, Boolean> {
+        val nodes = sub.optJSONArray("nodes").toNodes()
+        var label = ""
+        var isNew = false
+        update { st ->
+            val existing = st.profiles.firstOrNull { it.kind == "subscription" && it.url == url }
+            isNew = existing == null
+            var profile = subscriptionProfile(existing?.id ?: randomId(), url, sub, nodes, existing?.customName ?: "")
+            profile = profile.copy(name = uniqueName(st.profiles, profile))
+            label = profile.name
+            val profiles = if (existing != null) st.profiles.map { if (it.id == existing.id) profile else it } else st.profiles + profile
+            st.copy(profiles = profiles)
+        }
+        return label to isNew
+    }
+
+    private fun makeActiveIfNone(target: String) = update { st ->
+        // the first import becomes active; later ones are added alongside
+        if (st.activeProfile.isEmpty() || st.profiles.none { it.id == st.activeProfile }) {
+            st.copy(activeProfile = target, selectedNode = "auto")
+        } else {
+            st
+        }
     }
 
     /**
@@ -315,8 +447,8 @@ object Store {
      */
     suspend fun import(text: String): String = withContext(Dispatchers.IO) {
         val input = text.trim()
-        require(input.isNotEmpty()) { "Вставьте ссылку на подписку или сервер" }
-        val backup = runCatching { Velacore.decodeBackup(input) }.getOrElse { error(it.message ?: "Резервная копия повреждена") }
+        if (input.isEmpty()) fail(R.string.import_empty)
+        val backup = runCatching { Velacore.decodeBackup(input) }.getOrElse { throw VelaError(it.message ?: Lang.str(R.string.backup_broken)) }
         if (backup.isNotEmpty()) return@withContext restore(JSONObject(backup))
         val split = JSONObject(Velacore.splitImport(input))
         val urls = split.optJSONArray("subscriptions").strings()
@@ -330,23 +462,13 @@ object Store {
         }
         for ((url, result) in fetched) {
             val sub = result.getOrElse {
-                failures += (Uri.parse(url).host ?: url) + ": " + (it.message ?: "ошибка")
+                failures += (Uri.parse(url).host ?: url) + ": " + (it.message ?: Lang.str(R.string.error_generic))
                 null
             } ?: continue
-            val nodes = sub.optJSONArray("nodes").toNodes()
-            var label = ""
-            var isNew = false
-            update { st ->
-                val existing = st.profiles.firstOrNull { it.kind == "subscription" && it.url == url }
-                isNew = existing == null
-                var profile = subscriptionProfile(existing?.id ?: randomId(), url, sub, nodes, existing?.customName ?: "")
-                profile = profile.copy(name = uniqueName(st.profiles, profile))
-                label = profile.name
-                lastProfile = profile.id
-                val profiles = if (existing != null) st.profiles.map { if (it.id == existing.id) profile else it } else st.profiles + profile
-                st.copy(profiles = profiles)
-            }
-            parts += if (isNew) "«$label»: серверов ${nodes.size}" else "«$label» обновлена"
+            val (label, isNew) = saveSubscription(url, sub)
+            lastProfile = _state.value.profiles.firstOrNull { it.kind == "subscription" && it.url == url }?.id ?: lastProfile
+            val count = sub.optJSONArray("nodes").toNodes().size
+            parts += if (isNew) Lang.str(R.string.import_sub_added, label, count) else Lang.str(R.string.import_sub_updated, label)
         }
 
         if (linksText.isNotBlank()) {
@@ -354,11 +476,11 @@ object Store {
             val nodes = parsed.optJSONArray("nodes").toNodes()
             val errors = parsed.optJSONArray("errors").strings()
             if (nodes.isEmpty()) {
-                failures += errors.firstOrNull() ?: "не нашли поддерживаемых ссылок"
+                failures += errors.firstOrNull() ?: Lang.str(R.string.import_no_links_lower)
             } else {
                 var added = 0
                 update { st ->
-                    val manual = st.profiles.firstOrNull { it.id == MANUAL_ID } ?: Profile(MANUAL_ID, "Мои серверы", "manual")
+                    val manual = st.profiles.firstOrNull { it.id == MANUAL_ID } ?: Profile(MANUAL_ID, Lang.str(R.string.my_servers), "manual")
                     val known = manual.nodes.map { it.raw.optString("link") }.toSet()
                     val fresh = nodes.filter { it.raw.optString("link") !in known && manual.nodes.none { m -> m.id == it.id } }
                     added = fresh.size
@@ -371,29 +493,23 @@ object Store {
                     st.copy(profiles = profiles)
                 }
                 lastProfile = MANUAL_ID
-                parts += if (added == 0) "эти серверы уже есть в списке" else "серверов добавлено: $added"
-                if (errors.isNotEmpty()) parts += "пропущено ссылок: ${errors.size}"
+                parts += if (added == 0) Lang.str(R.string.import_links_known) else Lang.str(R.string.import_links_added, added)
+                if (errors.isNotEmpty()) parts += Lang.str(R.string.import_links_skipped, errors.size)
             }
         }
 
-        val target = lastProfile ?: error(failures.joinToString("; ").ifEmpty { "Не нашли поддерживаемых ссылок" })
-        update { st ->
-            // the first import becomes active; later ones are added alongside
-            if (st.activeProfile.isEmpty() || st.profiles.none { it.id == st.activeProfile }) {
-                st.copy(activeProfile = target, selectedNode = "auto")
-            } else {
-                st
-            }
-        }
+        val target = lastProfile ?: throw VelaError(failures.joinToString("; ").ifEmpty { Lang.str(R.string.import_no_links) })
+        makeActiveIfNone(target)
+        if (urls.isNotEmpty()) Reminders.onSubscriptionsChanged(appContext)
         var msg = parts.joinToString(", ")
-        if (failures.isNotEmpty()) msg += ". Не удалось: " + failures.joinToString("; ")
+        if (failures.isNotEmpty()) msg += ". " + Lang.str(R.string.import_failed, failures.joinToString("; "))
         msg.replaceFirstChar { it.uppercase() }
     }
 
     /** Keeps profile names unique so tabs can be told apart. */
     private fun uniqueName(all: List<Profile>, p: Profile): String {
         if (p.customName.isNotBlank()) return p.customName
-        val base = p.name.ifBlank { Uri.parse(p.url).host ?: "Подписка" }
+        val base = p.name.ifBlank { Uri.parse(p.url).host ?: Lang.str(R.string.subscription) }
         var name = base
         var n = 2
         while (all.any { it.id != p.id && it.name == name }) {
@@ -420,18 +536,18 @@ object Store {
     /** Refreshes all subscriptions. Returns a message for the user. */
     suspend fun refreshAll(): String = coroutineScope {
         val ids = state.value.profiles.filter { it.kind == "subscription" }.map { it.id }
-        if (ids.isEmpty()) error("Подписок пока нет")
+        if (ids.isEmpty()) fail(R.string.refresh_none)
         val failed = ids.map { id -> async { runCatching { refresh(id) }.isFailure } }.awaitAll().count { it }
         when {
-            failed == ids.size -> error("Не удалось обновить подписки, проверьте интернет")
-            failed > 0 -> "Обновлено ${ids.size - failed} из ${ids.size} подписок"
-            else -> "Все подписки обновлены"
+            failed == ids.size -> fail(R.string.refresh_all_failed)
+            failed > 0 -> Lang.str(R.string.refresh_some, ids.size - failed, ids.size)
+            else -> Lang.str(R.string.refresh_all_done)
         }
     }
 
     suspend fun refresh(profileId: String) = withContext(Dispatchers.IO) {
         val p = _state.value.profiles.firstOrNull { it.id == profileId && it.kind == "subscription" }
-            ?: error("Подписка не найдена")
+            ?: fail(R.string.refresh_not_found)
         val sub = JSONObject(Velacore.fetchSubscription(p.url))
         val nodes = sub.optJSONArray("nodes").toNodes()
         update { st ->
@@ -446,6 +562,7 @@ object Store {
                 },
             )
         }
+        Reminders.onSubscriptionsChanged(appContext)
     }
 
     /** Refreshes subscriptions whose update interval has passed. */
@@ -471,15 +588,19 @@ object Store {
         intervalHours = sub.optInt("updateIntervalHours"),
         supportUrl = sub.optString("supportUrl").ifBlank { sub.optString("webPageUrl") },
         updatedAt = sub.optLong("updatedAt"),
+        announce = sub.optString("announce").trim(),
     )
 
-    fun deleteProfile(id: String) = update { st ->
-        val rest = st.profiles.filterNot { it.id == id }
-        if (st.activeProfile == id) {
-            st.copy(profiles = rest, activeProfile = rest.firstOrNull()?.id ?: "", selectedNode = "auto")
-        } else {
-            st.copy(profiles = rest)
+    fun deleteProfile(id: String) {
+        update { st ->
+            val rest = st.profiles.filterNot { it.id == id }
+            if (st.activeProfile == id) {
+                st.copy(profiles = rest, activeProfile = rest.firstOrNull()?.id ?: "", selectedNode = "auto")
+            } else {
+                st.copy(profiles = rest)
+            }
         }
+        Reminders.onSubscriptionsChanged(appContext)
     }
 
     fun deleteNode(profileId: String, nodeId: String) = update { st ->
@@ -554,7 +675,7 @@ object Store {
                 theme = extra?.optString("theme")?.takeIf { it in setOf("system", "light", "dark") } ?: st.theme,
             )
         }
-        return if (msg.isEmpty()) "Настройки восстановлены" else "Восстановлено. $msg"
+        return if (msg.isEmpty()) Lang.str(R.string.backup_restored_settings) else Lang.str(R.string.backup_restored, msg)
     }
 
     fun setWasConnected(value: Boolean) = update { it.copy(wasConnected = value) }
@@ -562,8 +683,8 @@ object Store {
     /** Builds the sing-box configuration for the active profile. */
     fun buildConfig(controllerPort: Int, controllerSecret: String): String {
         val st = _state.value
-        val profile = st.active ?: error("Сначала добавьте сервер или подписку")
-        if (profile.nodes.isEmpty()) error("В подписке нет серверов")
+        val profile = st.active ?: fail(R.string.error_add_server_first)
+        if (profile.nodes.isEmpty()) fail(R.string.error_no_servers)
         val req = JSONObject()
             .put("platform", "android")
             .put("nodes", JSONArray().apply { profile.nodes.forEach { put(it.raw) } })

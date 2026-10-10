@@ -1,9 +1,12 @@
 package app.vela.client.vpn
 
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import app.vela.client.Lang
+import app.vela.client.R
 import app.vela.client.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -13,6 +16,10 @@ import kotlinx.coroutines.launch
 /** Quick Settings tile: connect / disconnect from the notification shade. */
 class VelaTileService : TileService() {
     private var job: Job? = null
+
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(Lang.wrap(base))
+    }
 
     override fun onStartListening() {
         job = CoroutineScope(Dispatchers.Main).launch {
@@ -32,9 +39,9 @@ class VelaTileService : TileService() {
         }
         if (Build.VERSION.SDK_INT >= 29) {
             tile.subtitle = when (state) {
-                ConnState.Connected -> "Подключено"
-                ConnState.Connecting -> "Подключение…"
-                else -> "Выключено"
+                ConnState.Connected -> Lang.str(R.string.notif_connected)
+                ConnState.Connecting -> Lang.str(R.string.notif_connecting)
+                else -> Lang.str(R.string.tile_off)
             }
         }
         tile.updateTile()

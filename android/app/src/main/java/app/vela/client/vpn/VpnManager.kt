@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import androidx.core.content.ContextCompat
+import app.vela.client.Lang
+import app.vela.client.R
 import app.vela.client.data.Store
 import app.vela.velacore.Velacore
 import kotlinx.coroutines.CancellationException
@@ -169,7 +171,7 @@ object VpnManager {
             throw e
         } catch (e: Exception) {
             ip.value = null
-            ipError.value = e.message ?: "не удалось узнать IP"
+            ipError.value = e.message ?: Lang.str(R.string.ip_failed)
         } finally {
             ipBusy.value = false
         }
@@ -244,13 +246,13 @@ object VpnManager {
             val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
             ms = request("GET", "/proxies/${Velacore.nodeTag(node.id)}/delay?$q", timeoutMs = 11000)
                 ?.let { JSONObject(it).optInt("delay", -1) } ?: -1
-            if (ms <= 0) reason = "сервер не ответил"
+            if (ms <= 0) reason = Lang.str(R.string.reason_no_answer)
         } else {
             val json = JSONArray().put(node.raw).toString()
             got = false
             runCatching {
                 Velacore.probeNodes(json, 9000, 1) { _, delay, r, _ -> ms = delay; reason = r; got = true }
-            }.onFailure { reason = "не удалось проверить"; got = true }
+            }.onFailure { reason = Lang.str(R.string.reason_check_failed); got = true }
         }
         if (!got) {
             // stopped before an answer
@@ -290,7 +292,7 @@ object VpnManager {
                             val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
                             val ms = request("GET", "/proxies/${Velacore.nodeTag(node.id)}/delay?$q", timeoutMs = 11000)
                                 ?.let { JSONObject(it).optInt("delay", -1) } ?: -1
-                            report(node.id, ms, if (ms > 0) "" else "сервер не ответил")
+                            report(node.id, ms, if (ms > 0) "" else Lang.str(R.string.reason_no_answer))
                         }
                     }
                 }.awaitAll()
@@ -303,8 +305,8 @@ object VpnManager {
                     if (ok.isFailure) {
                         // temporary core unavailable: fall back to TCP reachability
                         nodes.forEach { n ->
-                            if (n.isUdp) report(n.id, -1, "проверяется только после подключения")
-                            else Velacore.tcpPing(n.server, n.port).let { report(n.id, it, if (it > 0) "" else "сервер недоступен") }
+                            if (n.isUdp) report(n.id, -1, Lang.str(R.string.reason_only_connected))
+                            else Velacore.tcpPing(n.server, n.port).let { report(n.id, it, if (it > 0) "" else Lang.str(R.string.reason_unreachable)) }
                         }
                     }
                 }
