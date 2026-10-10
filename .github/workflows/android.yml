@@ -101,7 +101,9 @@ jobs:
           fi
           chmod +x gradlew
           set -o pipefail
-          ./gradlew --no-daemon assembleFullRelease bundlePlayRelease 2>&1 | tee $RUNNER_TEMP/gradle.log
+          # separate runs: APK splits are switched off while a bundle is built
+          ./gradlew --no-daemon assembleFullRelease 2>&1 | tee $RUNNER_TEMP/gradle.log
+          ./gradlew --no-daemon bundlePlayRelease 2>&1 | tee -a $RUNNER_TEMP/gradle.log
           # Vela-1.4.0-full-arm64-v8a-release.apk -> Vela-1.4.0-arm64-v8a-release.apk
           mkdir -p ../dist
           for f in app/build/outputs/apk/full/release/*.apk; do

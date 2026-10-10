@@ -80,7 +80,9 @@ android {
 
     splits {
         abi {
-            isEnable = true
+            // per-ABI APKs for direct download; App Bundles split by ABI on their
+            // own and can't be built with APK splits on (build them separately)
+            isEnable = gradle.startParameter.taskNames.none { it.contains("bundle", ignoreCase = true) }
             isUniversalApk = true
             reset()
             include("arm64-v8a", "armeabi-v7a")
