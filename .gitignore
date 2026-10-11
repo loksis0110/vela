@@ -7,3 +7,4 @@ ios/*.xcodeproj/
 go.sum.bak
 .DS_Store
 third_party/
+.cache/

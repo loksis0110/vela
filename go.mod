@@ -11,6 +11,8 @@ require (
 	github.com/sagernet/sing-box v1.14.2
 	golang.org/x/sys v0.47.0
 	github.com/xtls/xray-core v1.260327.1-0.20260728075948-5ca6f4b7d4dc
+	github.com/miekg/dns v1.1.72
+	google.golang.org/grpc v1.82.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 

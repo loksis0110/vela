@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -41,25 +42,46 @@ func EncodeQR(text string, size int) ([]byte, error) {
 	if len(text) > 900 {
 		level = qrgen.Low
 	}
-	return qrgen.Encode(text, level, size)
+	png, err := qrgen.Encode(text, level, size)
+	if err != nil {
+		return nil, errorf("слишком много данных для QR-кода")
+	}
+	return png, nil
 }
 
 // DecodeQR finds a QR code in a PNG/JPEG/GIF image and returns its text.
 func DecodeQR(data []byte) (string, error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return "", errors.New(T("это не картинка"))
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width*cfg.Height > 100_000_000 {
+		return "", errors.New(T("картинка слишком большая"))
+	}
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return "", errors.New(T("это не картинка"))
 	}
-	bmp, err := gozxing.NewBinaryBitmapFromImage(img)
-	if err != nil {
-		return "", err
-	}
 	hints := map[gozxing.DecodeHintType]interface{}{gozxing.DecodeHintType_TRY_HARDER: true}
-	res, err := qrcode.NewQRCodeReader().Decode(bmp, hints)
-	if err != nil {
-		return "", errors.New(T("на картинке не найден QR-код"))
+	// a light QR code on a dark background (dark themes) is tried inverted
+	for _, src := range []image.Image{img, invertedImage{img}} {
+		bmp, err := gozxing.NewBinaryBitmapFromImage(src)
+		if err != nil {
+			continue
+		}
+		if res, err := qrcode.NewQRCodeReader().Decode(bmp, hints); err == nil {
+			return strings.TrimSpace(res.GetText()), nil
+		}
 	}
-	return strings.TrimSpace(res.GetText()), nil
+	return "", errors.New(T("на картинке не найден QR-код"))
+}
+
+// invertedImage is a negative of an image.
+type invertedImage struct{ image.Image }
+
+func (i invertedImage) At(x, y int) color.Color {
+	r, g, b, a := i.Image.At(x, y).RGBA()
+	return color.RGBA64{R: uint16(a - r), G: uint16(a - g), B: uint16(a - b), A: uint16(a)}
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -97,8 +119,10 @@ type IPInfo struct {
 // MyIP asks public services for the external address.
 func MyIP(ctx context.Context, dialer N.Dialer) (*IPInfo, error) {
 	client := HTTPClient(dialer, 12*time.Second)
+	defer client.CloseIdleConnections()
 	var info IPInfo
-	if err := getJSON(ctx, client, "https://ipwho.is/?lang=ru", func(b []byte) error {
+	// country and city names in the language of the app
+	if err := getJSON(ctx, client, "https://ipwho.is/?lang="+Language(), func(b []byte) error {
 		var r struct {
 			Success     bool   `json:"success"`
 			IP          string `json:"ip"`
@@ -197,8 +221,11 @@ func SpeedTest(ctx context.Context, dialer N.Dialer, limit time.Duration, progre
 	if limit <= 0 {
 		limit = 8 * time.Second
 	}
+	// the first second of a transfer is not measured (TCP slow start)
+	limit = max(limit, 3*time.Second)
 	var res SpeedResult
 	client := HTTPClient(dialer, limit+15*time.Second)
+	defer client.CloseIdleConnections()
 
 	// latency: best of a few small requests over a warm connection
 	best := 0
@@ -376,7 +403,9 @@ func DecodeBackup(text string) (b Backup, ok bool, err error) {
 	if !strings.HasPrefix(text, BackupPrefix) {
 		return b, false, nil
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(text, BackupPrefix))
+	// messengers and mail break long lines; some tools add padding
+	payload := strings.Join(strings.Fields(strings.TrimPrefix(text, BackupPrefix)), "")
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(payload, "="))
 	if err != nil {
 		return b, true, errors.New(T("резервная копия повреждена"))
 	}
@@ -410,17 +439,25 @@ func TidyLogLine(line string) string {
 
 // ReadLog returns up to limit last lines of a core log file, tidied.
 func ReadLog(path string, limit int) []string {
+	if limit <= 0 {
+		limit = 300
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return []string{}
 	}
 	defer f.Close()
+	partial := false
 	if st, err := f.Stat(); err == nil && st.Size() > 512<<10 {
 		f.Seek(st.Size()-512<<10, 0)
+		partial = true
 	}
 	lines := []string{}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	if partial {
+		sc.Scan() // the first line is cut in the middle
+	}
 	for sc.Scan() {
 		lines = append(lines, TidyLogLine(sc.Text()))
 		if len(lines) > limit*2 {
@@ -452,8 +489,9 @@ func HostHasIPv6() bool {
 				continue
 			}
 			ip := ipn.IP
-			// global unicast, not ULA (fc00::/7) — VPN adapters use ULA
-			if ip.IsGlobalUnicast() && ip[0]&0xfe != 0xfc {
+			// global unicast, not ULA (fc00::/7, used by VPN adapters) and
+			// not Teredo (2001::/32), which Windows sets up but rarely works
+			if ip.IsGlobalUnicast() && ip[0]&0xfe != 0xfc && !(ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0 && ip[3] == 0) {
 				return true
 			}
 		}

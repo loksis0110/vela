@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/velaapp/vela/xrayout"
+
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -174,5 +176,10 @@ func TestXrayEndToEnd(t *testing.T) {
 		pc.Close()
 		done()
 		t.Logf("%s: TCP and UDP ok", n.Name)
+	}
+	// live XHTTP/gRPC connections and Xray handlers go away with the core
+	instance.Close()
+	if !waitFor(6*time.Second, func() bool { return xrayout.CurrentStats() == (xrayout.Stats{}) }) {
+		t.Fatalf("left after close: %+v", xrayout.CurrentStats())
 	}
 }

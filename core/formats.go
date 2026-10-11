@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -8,7 +9,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/option"
+	sjson "github.com/sagernet/sing/common/json"
 	"gopkg.in/yaml.v3"
 )
 
@@ -161,12 +166,20 @@ func xrayConfigNode(name string, outs []any) (Node, error) {
 			ordered = append(ordered, ob)
 		}
 	}
+	list := make([]any, len(ordered))
+	for i, ob := range ordered {
+		sanitizeXrayOutbound(ob)
+		list[i] = ob
+	}
 	protocol, host, port, network, security := xrayServerInfo(ordered[0])
 	if host == "" || port == 0 {
 		return Node{}, errorf("%s: в конфигурации Xray нет адреса сервера", name)
 	}
 	if name == "" {
 		name = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+	if err := checkXray(list); err != nil {
+		return Node{}, fmt.Errorf("%s: %w", name, err)
 	}
 	outbound := xrayOutboundOptions(ordered...)
 	return jsonNode(name, outbound, Node{Protocol: protocol, Server: host, Port: port,
@@ -230,10 +243,21 @@ func parseJSONLink(link string) (Node, error) {
 		if len(outs) == 0 {
 			return Node{}, errorf("повреждённая запись сервера")
 		}
+		for _, o := range outs {
+			if m, ok := o.(map[string]any); ok {
+				sanitizeXrayOutbound(m)
+			}
+		}
+		if err := checkXray(outs); err != nil {
+			return Node{}, err
+		}
 		first, _ := outs[0].(map[string]any)
 		n.Protocol, n.Server, n.Port, n.Network, n.Security = xrayServerInfo(first)
 		n.Engine = EngineXray
 	} else {
+		if err := checkSingBoxOutbound(raw); err != nil {
+			return Node{}, err
+		}
 		n.Protocol = protocolLabel(typ)
 		n.Server, _ = ob["server"].(string)
 		n.Port = anyInt(ob["server_port"])
@@ -253,6 +277,18 @@ func parseJSONLink(link string) (Node, error) {
 	return n, nil
 }
 
+var optionsContext = sync.OnceValue(func() context.Context { return include.Context(context.Background()) })
+
+// checkSingBoxOutbound makes sure sing-box accepts an outbound from a
+// sing-box JSON subscription (unknown fields or types would stop the whole
+// connection from starting).
+func checkSingBoxOutbound(raw []byte) error {
+	if _, err := sjson.UnmarshalExtendedContext[option.Outbound](optionsContext(), raw); err != nil {
+		return errorf("sing-box не принимает настройки сервера: %v", err)
+	}
+	return nil
+}
+
 // --- Clash / Mihomo YAML -------------------------------------------------------
 
 func parseClash(text string) (ParseResult, bool) {
@@ -264,6 +300,15 @@ func parseClash(text string) (ParseResult, bool) {
 	}
 	var res ParseResult
 	for _, p := range doc.Proxies {
+		if ob, info, ok := clashOutbound(p); ok {
+			node, err := jsonNode(firstNonEmpty(str(p, "name"), net.JoinHostPort(info.Server, strconv.Itoa(info.Port))), ob, info)
+			if err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("%v: %v", p["name"], err))
+				continue
+			}
+			res.Nodes = append(res.Nodes, node)
+			continue
+		}
 		link, err := clashToLink(p)
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Sprintf("%v: %v", p["name"], err))
@@ -324,6 +369,55 @@ func strList(v any) []string {
 	return nil
 }
 
+// clashOutbound converts Clash proxies that have no share link (SOCKS5,
+// HTTP, AnyTLS) into sing-box outbounds.
+func clashOutbound(p map[string]any) (map[string]any, Node, bool) {
+	typ := strings.ToLower(str(p, "type"))
+	server := str(p, "server")
+	port, _ := strconv.Atoi(str(p, "port"))
+	ob := map[string]any{"server": server, "server_port": port}
+	tls := func() map[string]any {
+		t := map[string]any{"enabled": true}
+		if sni := firstNonEmpty(str(p, "sni"), str(p, "servername")); sni != "" {
+			t["server_name"] = sni
+		} else if net.ParseIP(server) == nil {
+			t["server_name"] = server
+		}
+		if boolOf(p, "skip-cert-verify") {
+			t["insecure"] = true
+		}
+		if alpn := strList(p["alpn"]); len(alpn) > 0 {
+			t["alpn"] = alpn
+		}
+		if fp := str(p, "client-fingerprint"); fp != "" {
+			t["utls"] = map[string]any{"enabled": true, "fingerprint": utlsFingerprint(fp)}
+		}
+		return t
+	}
+	info := Node{Server: server, Port: port}
+	switch typ {
+	case "socks5", "http":
+		ob["type"] = map[string]string{"socks5": "socks", "http": "http"}[typ]
+		if u := str(p, "username"); u != "" {
+			ob["username"] = u
+			ob["password"] = str(p, "password")
+		}
+		if boolOf(p, "tls") {
+			ob["tls"] = tls()
+			info.Security = "TLS"
+		}
+		info.Protocol = protocolLabel(ob["type"].(string))
+	case "anytls":
+		ob["type"] = "anytls"
+		ob["password"] = str(p, "password")
+		ob["tls"] = tls()
+		info.Protocol, info.Security = "AnyTLS", "TLS"
+	default:
+		return nil, Node{}, false
+	}
+	return ob, info, server != "" && port > 0
+}
+
 // clashToLink converts a Clash proxy into a standard share link, so every
 // parser fix and the Xray fallback apply to it too.
 func clashToLink(p map[string]any) (string, error) {
@@ -347,7 +441,7 @@ func clashToLink(p map[string]any) (string, error) {
 			if path := str(ws, "path"); path != "" {
 				q.Set("path", path)
 			}
-			if h := str(sub(ws, "headers"), "Host"); h != "" {
+			if h := firstNonEmpty(str(sub(ws, "headers"), "Host"), str(sub(ws, "headers"), "host")); h != "" {
 				q.Set("host", h)
 			}
 		case "grpc":
@@ -442,14 +536,25 @@ func clashToLink(p map[string]any) (string, error) {
 		}
 		v["sni"] = str(p, "servername")
 		v["fp"] = str(p, "client-fingerprint")
+		if alpn := strList(p["alpn"]); len(alpn) > 0 {
+			v["alpn"] = strings.Join(alpn, ",")
+		}
+		if boolOf(p, "skip-cert-verify") {
+			v["allowInsecure"] = "1"
+		}
 		data, _ := json.Marshal(v)
 		return "vmess://" + base64.StdEncoding.EncodeToString(data), nil
 	case "ss":
-		if plugin := str(p, "plugin"); plugin != "" {
-			return "", errorf("плагины Shadowsocks не поддерживаются")
-		}
 		userinfo := base64.RawURLEncoding.EncodeToString([]byte(str(p, "cipher") + ":" + str(p, "password")))
-		return "ss://" + userinfo + "@" + hostport + frag, nil
+		query := ""
+		if plugin := str(p, "plugin"); plugin != "" {
+			spec, err := clashPlugin(plugin, sub(p, "plugin-opts"))
+			if err != nil {
+				return "", err
+			}
+			query = "?" + url.Values{"plugin": {spec}}.Encode()
+		}
+		return "ss://" + userinfo + "@" + hostport + query + frag, nil
 	case "hysteria2", "hy2":
 		if s := str(p, "sni"); s != "" {
 			q.Set("sni", s)
@@ -463,6 +568,9 @@ func clashToLink(p map[string]any) (string, error) {
 		}
 		if fp := str(p, "fingerprint"); fp != "" {
 			q.Set("pinSHA256", fp)
+		}
+		if ports := str(p, "ports"); ports != "" {
+			q.Set("mport", ports) // port hopping
 		}
 		auth := firstNonEmpty(str(p, "password"), str(p, "auth"))
 		return "hysteria2://" + url.PathEscape(auth) + "@" + hostport + "?" + q.Encode() + frag, nil
@@ -485,4 +593,36 @@ func clashToLink(p map[string]any) (string, error) {
 		return "tuic://" + url.PathEscape(str(p, "uuid")) + ":" + url.PathEscape(str(p, "password")) + "@" + hostport + "?" + q.Encode() + frag, nil
 	}
 	return "", errorf("тип %s не поддерживается", typ)
+}
+
+// clashPlugin turns Clash "plugin" + "plugin-opts" into a SIP003 plugin
+// string for the share link.
+func clashPlugin(plugin string, opts map[string]any) (string, error) {
+	switch strings.ToLower(plugin) {
+	case "obfs", "simple-obfs":
+		spec := "obfs-local;obfs=" + firstNonEmpty(str(opts, "mode"), "http")
+		if h := str(opts, "host"); h != "" {
+			spec += ";obfs-host=" + h
+		}
+		return spec, nil
+	case "v2ray-plugin":
+		if m := str(opts, "mode"); m != "" && m != "websocket" {
+			return "", errorf("плагин Shadowsocks %s не поддерживается", plugin+" "+m)
+		}
+		spec := "v2ray-plugin"
+		if boolOf(opts, "tls") {
+			spec += ";tls"
+		}
+		if h := str(opts, "host"); h != "" {
+			spec += ";host=" + h
+		}
+		if path := str(opts, "path"); path != "" {
+			spec += ";path=" + path
+		}
+		if boolOf(opts, "mux") {
+			spec += ";mux=4"
+		}
+		return spec, nil
+	}
+	return "", errorf("плагин Shadowsocks %s не поддерживается", plugin)
 }
