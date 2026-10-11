@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -14,16 +15,31 @@ import (
 	"github.com/velaapp/vela/core"
 )
 
+// recoverError turns a panic into an error: a panic crossing the gomobile
+// boundary would crash the whole app (and these functions read untrusted
+// text from subscriptions and the clipboard).
+func recoverError(err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("internal error: %v", r)
+	}
+}
+
 // ParseText parses share links or a base64 subscription body.
 // Returns JSON: {"nodes":[...],"errors":[...]}.
-func ParseText(text string) string {
+func ParseText(text string) (out string) {
+	defer func() {
+		if r := recover(); r != nil {
+			out = fmt.Sprintf(`{"nodes":[],"errors":[%q]}`, fmt.Sprint("internal error: ", r))
+		}
+	}()
 	data, _ := json.Marshal(core.ParseText(text))
 	return string(data)
 }
 
 // FetchSubscription downloads a subscription URL.
 // Returns JSON of core.Subscription.
-func FetchSubscription(url string) (string, error) {
+func FetchSubscription(url string) (out string, err error) {
+	defer recoverError(&err)
 	sub, err := core.FetchSubscription(context.Background(), url)
 	if err != nil {
 		return "", err
@@ -33,7 +49,8 @@ func FetchSubscription(url string) (string, error) {
 }
 
 // BuildConfig takes JSON of core.BuildRequest and returns sing-box JSON.
-func BuildConfig(requestJSON string) (string, error) {
+func BuildConfig(requestJSON string) (out string, err error) {
+	defer recoverError(&err)
 	var req core.BuildRequest
 	if err := json.Unmarshal([]byte(requestJSON), &req); err != nil {
 		return "", err
@@ -76,7 +93,11 @@ type ProbeHandler interface {
 // ProbeNodes makes a real request through every node using a temporary core
 // (call it while the VPN is off). nodesJSON is a JSON array of nodes as
 // returned by ParseText/FetchSubscription. Blocks until all are checked.
-func ProbeNodes(nodesJSON string, timeoutMs int32, parallel int32, handler ProbeHandler) error {
+func ProbeNodes(nodesJSON string, timeoutMs int32, parallel int32, handler ProbeHandler) (err error) {
+	defer recoverError(&err)
+	if handler == nil {
+		return errors.New("no handler")
+	}
 	var nodes []core.Node
 	if err := json.Unmarshal([]byte(nodesJSON), &nodes); err != nil {
 		return err
@@ -93,8 +114,12 @@ func ProbeNodes(nodesJSON string, timeoutMs int32, parallel int32, handler Probe
 		probeMu.Unlock()
 		cancel()
 	}()
-	err := core.ProbeNodes(ctx, nil, nodes, time.Duration(timeoutMs)*time.Millisecond, int(parallel),
+	// results arrive from several checks at once: hand them over one by one
+	var resultMu sync.Mutex
+	err = core.ProbeNodes(ctx, nil, nodes, time.Duration(timeoutMs)*time.Millisecond, int(parallel),
 		func(r core.ProbeResult) {
+			resultMu.Lock()
+			defer resultMu.Unlock()
 			handler.OnResult(r.ID, int32(r.Delay), r.Reason, r.Error)
 		})
 	if errors.Is(err, context.Canceled) {
@@ -138,7 +163,8 @@ func EncodeQR(text string, size int32) ([]byte, error) {
 }
 
 // DecodeQR returns the text of a QR code found in a PNG/JPEG image.
-func DecodeQR(image []byte) (string, error) {
+func DecodeQR(image []byte) (text string, err error) {
+	defer recoverError(&err)
 	return core.DecodeQR(image)
 }
 
@@ -163,14 +189,52 @@ type SpeedHandler interface {
 
 // SpeedTest measures ping, download and upload over the current network
 // (through the VPN when it's on). Returns JSON of core.SpeedResult.
+// StopSpeedTest ends it early.
 func SpeedTest(seconds int32, handler SpeedHandler) string {
-	res := core.SpeedTest(context.Background(), nil, time.Duration(seconds)*time.Second, func(p string, v float64) {
+	ctx, cancel := context.WithCancel(context.Background())
+	speedMu.Lock()
+	speedSeq++
+	id := speedSeq
+	speedCancels[id] = cancel
+	speedMu.Unlock()
+	defer func() {
+		speedMu.Lock()
+		delete(speedCancels, id)
+		speedMu.Unlock()
+		cancel()
+	}()
+	res := core.SpeedTest(ctx, nil, time.Duration(seconds)*time.Second, func(p string, v float64) {
 		if handler != nil {
 			handler.OnProgress(p, v)
 		}
 	})
 	data, _ := json.Marshal(res)
 	return string(data)
+}
+
+var (
+	speedMu      sync.Mutex
+	speedSeq     int
+	speedCancels = map[int]context.CancelFunc{}
+)
+
+// StopSpeedTest ends running speed tests; they return what was measured.
+func StopSpeedTest() {
+	speedMu.Lock()
+	for _, c := range speedCancels {
+		c()
+	}
+	speedMu.Unlock()
+}
+
+// NodeIsEncrypted tells whether a server (JSON of core.Node) encrypts the
+// traffic it carries (see Settings.requireEncryption).
+func NodeIsEncrypted(nodeJSON string) bool {
+	var n core.Node
+	if json.Unmarshal([]byte(nodeJSON), &n) != nil {
+		return false
+	}
+	return core.IsEncrypted(n)
 }
 
 // EncodeBackup turns backup JSON (core.Backup) into shareable text.
@@ -183,7 +247,8 @@ func EncodeBackup(backupJSON string) (string, error) {
 }
 
 // DecodeBackup returns the backup JSON, or "" when text is not a backup.
-func DecodeBackup(text string) (string, error) {
+func DecodeBackup(text string) (out string, err error) {
+	defer recoverError(&err)
 	b, ok, err := core.DecodeBackup(text)
 	if !ok || err != nil {
 		return "", err
@@ -216,7 +281,8 @@ func SetLanguage(lang string) {
 // (vela://, happ://, v2rayng://, hiddify://, sing-box://, clash://, ...).
 // Returns JSON of core.ImportRequest:
 // {"subscriptions":[...],"links":"...","linkCount":n,"name":"..."}.
-func ParseDeepLink(raw string) (string, error) {
+func ParseDeepLink(raw string) (out string, err error) {
+	defer recoverError(&err)
 	req, err := core.ParseDeepLink(raw)
 	if err != nil {
 		return "", err
@@ -228,7 +294,12 @@ func ParseDeepLink(raw string) (string, error) {
 // DetectImport checks text (the clipboard) for subscriptions, share links or
 // app links. Returns JSON of core.ImportRequest; both lists empty when there
 // is nothing to add.
-func DetectImport(text string) string {
+func DetectImport(text string) (out string) {
+	defer func() {
+		if recover() != nil {
+			out = `{"subscriptions":[],"links":"","linkCount":0}`
+		}
+	}()
 	data, _ := json.Marshal(normalizeImport(core.DetectImport(text)))
 	return string(data)
 }

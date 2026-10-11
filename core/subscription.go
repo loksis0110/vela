@@ -3,8 +3,8 @@ package core
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -120,12 +120,22 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 		}
 		return nil
 	}}
+	// the transport is used once: don't leave its connections open
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errorf("не удалось загрузить подписку: %w", err)
+		// the URL (with the user's token) is not part of the message
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = errors.New("timeout")
+		}
+		return nil, errorf("не удалось загрузить подписку: %s (%v)", ExplainError(err.Error()), err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode/100 != 2 {
 		switch resp.StatusCode {
 		case http.StatusForbidden, http.StatusUnauthorized:
 			return nil, errorf("сервер подписки отказал (%d). Возможно, нужен HWID или превышен лимит устройств", resp.StatusCode)
@@ -134,9 +144,12 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 		}
 		return nil, errorf("сервер подписки ответил %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionSize+1))
 	if err != nil {
-		return nil, err
+		return nil, errorf("не удалось загрузить подписку: %s (%v)", ExplainError(err.Error()), err)
+	}
+	if len(body) > maxSubscriptionSize {
+		return nil, errorf("подписка слишком большая")
 	}
 	text, directives := extractDirectives(string(body))
 	parsed := ParseText(text)
@@ -160,10 +173,12 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 		sub.Title = u.Hostname()
 	}
 	if v := header("profile-update-interval"); v != "" {
-		sub.UpdateInterval, _ = strconv.Atoi(strings.TrimSpace(v))
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			sub.UpdateInterval = min(n, 24*30)
+		}
 	}
-	sub.SupportURL = header("support-url")
-	sub.WebPageURL = header("profile-web-page-url")
+	sub.SupportURL = safeLink(header("support-url"))
+	sub.WebPageURL = safeLink(header("profile-web-page-url"))
 	sub.Announce = decodeHeaderText(header("announce"))
 	if len([]rune(sub.Announce)) > 500 {
 		sub.Announce = string([]rune(sub.Announce)[:500]) + "…"
@@ -174,7 +189,10 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 			continue
 		}
 		n, _ := strconv.ParseFloat(strings.TrimSpace(v), 64)
-		switch strings.ToLower(k) {
+		if n < 0 || n != n { // negative or NaN
+			n = 0
+		}
+		switch strings.ToLower(strings.TrimSpace(k)) {
 		case "upload":
 			sub.Upload = int64(n)
 		case "download":
@@ -182,6 +200,9 @@ func FetchSubscription(ctx context.Context, rawURL string) (*Subscription, error
 		case "total":
 			sub.Total = int64(n)
 		case "expire":
+			if n > 1e11 { // some panels send milliseconds
+				n /= 1000
+			}
 			sub.Expire = int64(n)
 		}
 	}
@@ -231,17 +252,41 @@ func extractDirectives(body string) (string, map[string]string) {
 	return rest, directives
 }
 
+// maxSubscriptionSize limits a subscription body (tens of thousands of servers).
+const maxSubscriptionSize = 8 << 20
+
 func decodeHeaderText(v string) string {
 	v = strings.TrimSpace(v)
-	if strings.HasPrefix(v, "base64:") {
-		if b, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(v, "base64:")); err == nil {
-			return strings.TrimSpace(string(b))
+	if strings.HasPrefix(strings.ToLower(v), "base64:") {
+		if b, ok := tryBase64(v[len("base64:"):]); ok {
+			return strings.TrimSpace(b)
 		}
 	}
-	if s, err := url.QueryUnescape(v); err == nil {
-		return s
+	// percent-encoded UTF-8; "+" stays a plus ("C++ VPN")
+	if s, err := url.PathUnescape(v); err == nil {
+		return strings.TrimSpace(s)
 	}
 	return v
+}
+
+// safeLink keeps provider links (support, web page) the apps may open only
+// when they are web or Telegram links: no javascript:, file:, intent: ...
+func safeLink(v string) string {
+	v = strings.TrimSpace(v)
+	u, err := url.Parse(v)
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https", "http":
+		if u.Host == "" {
+			return ""
+		}
+		return v
+	case "tg", "mailto":
+		return v
+	}
+	return ""
 }
 
 func shortHash(s string) string {
@@ -265,24 +310,39 @@ func TCPPing(host string, port int, timeout time.Duration) int {
 	return ms
 }
 
+// trimURL removes quotes, brackets and trailing punctuation around a URL
+// copied from a message: «https://x/sub», (https://x/sub), https://x/sub.
+func trimURL(s string) string {
+	s = strings.TrimLeft(s, "\"'«<([{“„")
+	if i := strings.Index(strings.ToLower(s), "http"); i > 0 && i < 4 {
+		s = s[i:]
+	}
+	return strings.TrimRight(s, "\"'»>)]}”.,;:!?")
+}
+
 // SplitImport separates pasted text into subscription URLs (http/https) and
 // the remaining share links, so several subscriptions can be added at once.
 func SplitImport(text string) (subscriptions []string, links string) {
 	var rest []string
 	seen := map[string]bool{}
-	for _, f := range strings.FieldsFunc(strings.TrimPrefix(text, "\ufeff"), func(r rune) bool {
-		return r == '\n' || r == '\r' || r == ' ' || r == '\t'
+	for _, line := range strings.FieldsFunc(strings.TrimPrefix(text, "\ufeff"), func(r rune) bool {
+		return r == '\n' || r == '\r'
 	}) {
-		f = strings.TrimSpace(f)
-		lower := strings.ToLower(f)
-		if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
-			if !seen[f] {
-				seen[f] = true
-				subscriptions = append(subscriptions, f)
+		for _, f := range strings.Fields(line) {
+			if u := trimURL(f); isHTTP(u) {
+				if !seen[u] {
+					seen[u] = true
+					subscriptions = append(subscriptions, u)
+				}
+				continue
 			}
-			continue
+			// a raw space inside the "#name" of the previous share link
+			if n := len(rest); n > 0 && !strings.Contains(f, "://") && strings.Contains(rest[n-1], "://") && strings.Contains(rest[n-1], "#") {
+				rest[n-1] += " " + f
+				continue
+			}
+			rest = append(rest, f)
 		}
-		rest = append(rest, f)
 	}
 	return subscriptions, strings.Join(rest, "\n")
 }
