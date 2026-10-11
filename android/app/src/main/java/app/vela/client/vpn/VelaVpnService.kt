@@ -75,6 +75,9 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     private var statsJob: Job? = null
     private var watchJob: Job? = null
 
+    /** Id of the newest start command: stopping must not cancel a newer «connect». */
+    @Volatile private var lastStartId = 0
+
     // ------------------------------------------------------------- lifecycle
 
     override fun attachBaseContext(base: Context) {
@@ -82,13 +85,22 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
         when (intent?.action) {
-            ACTION_STOP -> scope.launch { stopVpn() }
-            ACTION_RESTART -> scope.launch { restartVpn() }
+            ACTION_STOP -> scope.launch { stopVpn(startId) }
+            ACTION_RESTART -> scope.launch { restartVpn(startId) }
             // ACTION_START, or null/"android.net.VpnService" when started by Always-on VPN
             else -> {
-                showNotification(getString(R.string.notif_connecting))
-                scope.launch { startVpn() }
+                // started with startForegroundService: Android requires the
+                // notification right away, before the core is up
+                if (!showNotification(Lang.str(R.string.notif_connecting))) {
+                    if (VpnManager.status.value.state == ConnState.Disconnected) {
+                        VpnManager.status.value = VpnStatus(error = Lang.str(R.string.error_vpn_permission))
+                        stopSelf(startId)
+                    }
+                    return START_NOT_STICKY
+                }
+                scope.launch { startVpn(startId) }
             }
         }
         return START_NOT_STICKY
@@ -96,21 +108,28 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     override fun onRevoke() {
         // another VPN app took over, or the user revoked permission
-        scope.launch { stopVpn() }
+        val id = lastStartId
+        scope.launch { stopVpn(id) }
     }
 
     override fun onDestroy() {
+        // stopped without «disconnect» (e.g. by the system): don't leave the
+        // interface open or the app showing «connected»
+        if (VpnManager.status.value.state != ConnState.Disconnected || tunFd != null) {
+            cleanup()
+            VpnManager.status.value = VpnStatus(state = ConnState.Disconnected)
+        }
         runCatching { commandServer?.close() }
         commandServer = null
         scope.cancel()
         super.onDestroy()
     }
 
-    private suspend fun startVpn() = lock.withLock {
+    private suspend fun startVpn(startId: Int) = lock.withLock {
         val current = VpnManager.status.value.state
         if (current == ConnState.Connected) {
             // e.g. Always-on asked again: keep the right notification text
-            showNotification(getString(R.string.notif_connected))
+            showNotification(Lang.str(R.string.notif_connected))
             return@withLock
         }
         VpnManager.status.value = VpnStatus(state = ConnState.Connecting)
@@ -131,26 +150,24 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             startRecorder(port, secret)
             Store.setWasConnected(true)
             VpnManager.status.value = VpnStatus(state = ConnState.Connected, since = System.currentTimeMillis() / 1000)
-            showNotification(getString(R.string.notif_connected))
+            showNotification(Lang.str(R.string.notif_connected))
             startStats()
             startWatchdog()
         } catch (e: Exception) {
             Log.e(TAG, "start failed", e)
             cleanup()
             VpnManager.status.value = VpnStatus(state = ConnState.Disconnected, error = humanize(e))
-            stopForegroundCompat()
-            stopSelf()
+            finish(startId)
         }
     }
 
-    private suspend fun restartVpn() = lock.withLock {
+    private suspend fun restartVpn(startId: Int) = lock.withLock {
         val server = commandServer
-        if (server == null) {
-            // nothing is running (e.g. the process was restarted)
-            if (VpnManager.status.value.state == ConnState.Disconnected) stopSelf()
+        if (server == null || VpnManager.status.value.state != ConnState.Connected) {
+            // nothing is running (the process was restarted, or the start failed)
+            if (VpnManager.status.value.state == ConnState.Disconnected) stopSelf(startId)
             return@withLock
         }
-        if (VpnManager.status.value.state != ConnState.Connected) return@withLock
         try {
             watchJob?.cancel()
             val port = VpnManager.controllerPort.takeIf { it != 0 } ?: freePort()
@@ -163,25 +180,35 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             server.startOrReloadService(config, OverrideOptions())
             startRecorder(port, secret)
             VpnManager.status.value = VpnManager.status.value.copy(error = null, notice = null, activeNode = null)
-            showNotification(getString(R.string.notif_connected))
+            showNotification(Lang.str(R.string.notif_connected))
             startWatchdog()
         } catch (e: Exception) {
             Log.e(TAG, "restart failed", e)
             cleanup()
             Store.setWasConnected(false)
             VpnManager.status.value = VpnStatus(state = ConnState.Disconnected, error = humanize(e))
-            stopForegroundCompat()
-            stopSelf()
+            finish(startId)
         }
     }
 
-    private suspend fun stopVpn() = lock.withLock {
-        VpnManager.status.value = VpnManager.status.value.copy(state = ConnState.Disconnecting)
-        Store.setWasConnected(false)
-        cleanup()
-        VpnManager.status.value = VpnStatus(state = ConnState.Disconnected)
+    private suspend fun stopVpn(startId: Int) = lock.withLock {
+        if (VpnManager.status.value.state != ConnState.Disconnected || commandServer != null) {
+            VpnManager.status.value = VpnManager.status.value.copy(state = ConnState.Disconnecting)
+            Store.setWasConnected(false)
+            cleanup()
+            VpnManager.status.value = VpnStatus(state = ConnState.Disconnected)
+        }
+        finish(startId)
+    }
+
+    /**
+     * Leaves the foreground and stops the service, unless a newer command came
+     * in meanwhile (e.g. «connect» right after «disconnect»): that one goes on.
+     */
+    private fun finish(startId: Int) {
+        if (startId != lastStartId) return
         stopForegroundCompat()
-        stopSelf()
+        stopSelf(startId)
     }
 
     private fun cleanup() {
@@ -287,7 +314,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         val s = VpnManager.status.value
         if (st.settings.disableFailover || !manual) {
             if (manual && justConnected) {
-                VpnManager.status.value = s.copy(error = getString(R.string.error_server_silent_auto))
+                VpnManager.status.value = s.copy(error = Lang.str(R.string.error_server_silent_auto))
             } else if (!manual) {
                 VpnManager.retestAuto()
             }
@@ -296,25 +323,25 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         val name = profile.nodes.first { it.id == selected }.name
         // remembered as failed, so automatic selection skips it next time
         Store.pings.update { it + (selected to -1) }
-        Store.reasons.update { it + (selected to getString(R.string.reason_stopped_answering)) }
+        Store.reasons.update { it + (selected to Lang.str(R.string.reason_stopped_answering)) }
         Store.savePings()
         if (VpnManager.switchTo("auto")) {
             Store.select(profile.id, "auto")
             VpnManager.status.value = VpnManager.status.value.copy(
                 error = null,
-                notice = getString(R.string.notice_switched_auto, name),
+                notice = Lang.str(R.string.notice_switched_auto, name),
             )
         } else if (justConnected) {
-            VpnManager.status.value = s.copy(error = getString(R.string.error_server_silent))
+            VpnManager.status.value = s.copy(error = Lang.str(R.string.error_server_silent))
         }
     }
 
     private fun humanize(e: Exception): String {
         val msg = e.message ?: e.toString()
         return when {
-            "missing vpn permission" in msg -> getString(R.string.error_vpn_permission)
+            "missing vpn permission" in msg || "not prepared" in msg -> Lang.str(R.string.error_vpn_permission)
             e is VelaError -> msg
-            else -> getString(R.string.error_connect, msg)
+            else -> Lang.str(R.string.error_connect, msg)
         }
     }
 
@@ -322,7 +349,8 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     // ------------------------------------------------------------- notification
 
-    private fun showNotification(text: String) {
+    /** Shows the status in the foreground notification; false when Android refused it. */
+    private fun showNotification(text: String): Boolean {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
             // also renames the channel after a language change
@@ -341,7 +369,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             .setContentTitle(text)
             .setContentText(profile?.name ?: getString(R.string.app_name))
             .setContentIntent(open)
-            .addAction(0, getString(R.string.notif_disconnect), stop)
+            .addAction(0, Lang.str(R.string.notif_disconnect), stop)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
@@ -349,7 +377,11 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
         val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else 0
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+        // Android 12+ may refuse a foreground start (from the background, or the
+        // VPN permission went to another app): that must not crash the app
+        return runCatching { ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type) }
+            .onFailure { Log.e(TAG, "startForeground", it) }
+            .isSuccess
     }
 
     private fun stopForegroundCompat() {
@@ -359,20 +391,14 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     // ------------------------------------------------------------- CommandServerHandler
 
     override fun serviceStop() {
-        scope.launch { stopVpn() }
+        val id = lastStartId
+        scope.launch { stopVpn(id) }
     }
 
     override fun serviceReload() {
-        scope.launch {
-            val port = VpnManager.controllerPort.takeIf { it != 0 } ?: freePort()
-            val secret = VpnManager.controllerSecret.ifEmpty { Store.randomId(16) }
-            runCatching {
-                val config = Store.buildConfig(port, secret)
-                runCatching { Velacore.stopTrafficRecorder() }
-                commandServer?.startOrReloadService(config, OverrideOptions())
-                startRecorder(port, secret)
-            }
-        }
+        // the same path as a settings change: under the lock, never racing a stop
+        val id = lastStartId
+        scope.launch { restartVpn(id) }
     }
 
     override fun getSystemProxyStatus(): SystemProxyStatus = SystemProxyStatus().apply {

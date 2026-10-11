@@ -207,7 +207,7 @@ fun decodeQr(bmp: Bitmap): String? {
 }
 
 fun copyText(context: Context, text: String) {
-    context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Vela", text))
+    runCatching { context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("Vela", text)) }
 }
 
 /** QR code + text of a server, a subscription or a backup. */
@@ -317,12 +317,17 @@ private fun launcherApps(context: Context): List<AppEntry> {
         .sortedBy { it.label.lowercase() }
 }
 
+/** Icons already drawn, so scrolling back doesn't load them again. */
+private val iconCache = android.util.LruCache<String, ImageBitmap>(300)
+
 @Composable
 private fun AppIcon(pkg: String) {
     val context = LocalContext.current
-    val icon by produceState<ImageBitmap?>(null, pkg) {
+    val icon by produceState<ImageBitmap?>(iconCache.get(pkg), pkg) {
+        if (value != null) return@produceState
         value = withContext(Dispatchers.IO) {
             runCatching { context.packageManager.getApplicationIcon(pkg).toBitmap(96, 96).asImageBitmap() }.getOrNull()
+                ?.also { iconCache.put(pkg, it) }
         }
     }
     val img = icon
@@ -351,8 +356,10 @@ fun AppPickerDialog(selected: List<String>, onDismiss: () -> Unit, onDone: (List
                 Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Vela.Muted) }
             } else {
                 val q = query.trim().lowercase()
-                val shown = list.filter { q.isEmpty() || q in it.label.lowercase() || q in it.pkg }
-                    .sortedByDescending { it.pkg in selected }
+                val shown = remember(list, q) {
+                    val first = selected.toSet()
+                    list.filter { q.isEmpty() || q in it.label.lowercase() || q in it.pkg }.sortedByDescending { it.pkg in first }
+                }
                 LazyColumn(Modifier.weight(1f).padding(top = 6.dp)) {
                     items(shown, key = { it.pkg }) { app ->
                         val on = app.pkg in chosen

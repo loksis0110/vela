@@ -1,5 +1,6 @@
 package app.vela.client.vpn
 
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -7,6 +8,7 @@ import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import app.vela.client.Lang
 import app.vela.client.R
+import app.vela.client.data.Store
 import app.vela.client.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +24,7 @@ class VelaTileService : TileService() {
     }
 
     override fun onStartListening() {
+        job?.cancel()
         job = CoroutineScope(Dispatchers.Main).launch {
             VpnManager.status.collect { render(it.state) }
         }
@@ -29,6 +32,7 @@ class VelaTileService : TileService() {
 
     override fun onStopListening() {
         job?.cancel()
+        job = null
     }
 
     private fun render(state: ConnState) {
@@ -50,21 +54,30 @@ class VelaTileService : TileService() {
     override fun onClick() {
         when (VpnManager.status.value.state) {
             ConnState.Connected, ConnState.Connecting -> VpnManager.stop(this)
-            else -> {
-                if (VpnManager.prepare(this) != null) {
-                    // VPN permission must be granted from the app once
-                    val intent = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    if (Build.VERSION.SDK_INT >= 34) {
-                        startActivityAndCollapse(
-                            android.app.PendingIntent.getActivity(this, 0, intent, android.app.PendingIntent.FLAG_IMMUTABLE),
-                        )
-                    } else {
-                        @Suppress("DEPRECATION")
-                        startActivityAndCollapse(intent)
-                    }
+            ConnState.Disconnecting -> {}
+            ConnState.Disconnected -> {
+                val noServers = Store.state.value.active?.nodes.isNullOrEmpty()
+                if (noServers || runCatching { VpnManager.prepare(this) }.getOrNull() != null) {
+                    // nothing to connect to yet, or VPN permission must be granted in
+                    // the app once: open it (it connects right away when it can)
+                    openApp(if (noServers) null else MainActivity.ACTION_CONNECT)
                 } else {
                     VpnManager.start(this)
                 }
+            }
+        }
+    }
+
+    private fun openApp(action: String?) {
+        val intent = Intent(this, MainActivity::class.java).setAction(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startActivityAndCollapse(
+                    PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT),
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                startActivityAndCollapse(intent)
             }
         }
     }
