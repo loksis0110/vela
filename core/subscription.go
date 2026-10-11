@@ -262,8 +262,13 @@ func decodeHeaderText(v string) string {
 			return strings.TrimSpace(b)
 		}
 	}
-	// percent-encoded UTF-8; "+" stays a plus ("C++ VPN")
-	if s, err := url.PathUnescape(v); err == nil {
+	// percent-encoded UTF-8. "+" is a space only in form encoding (escapes
+	// and no raw spaces: "%D0%9C%D0%BE%D0%B9+VPN"); "C++ VPN" keeps its pluses
+	unescape := url.PathUnescape
+	if strings.Contains(v, "%") && strings.Contains(v, "+") && !strings.Contains(v, " ") {
+		unescape = url.QueryUnescape
+	}
+	if s, err := unescape(v); err == nil {
 		return strings.TrimSpace(s)
 	}
 	return v

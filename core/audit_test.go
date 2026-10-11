@@ -227,6 +227,7 @@ func TestDetectImportHeuristics(t *testing.T) {
 		"«https://panel.example.com/sub/AbCdEf123456»",
 		"Ваша подписка: https://sub.example.net/s1/xyz12345.",
 		"https://raw.githubusercontent.com/someone/free/main/v2ray/configs.txt",
+		"https://example.com/sub/ivanov",
 	}
 	for _, s := range yes {
 		if r := DetectImport(s); len(r.Subscriptions) != 1 || strings.ContainsAny(r.Subscriptions[0], "«».") && strings.HasSuffix(r.Subscriptions[0], ".") {
@@ -302,6 +303,9 @@ func TestFetchSubscriptionDetails(t *testing.T) {
 	sub, err := FetchSubscription(context.Background(), srv.URL+"/sub")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if decodeHeaderText("%D0%9C%D0%BE%D0%B9+VPN") != "Мой VPN" || decodeHeaderText("100% VPN+") != "100% VPN+" {
+		t.Fatal("title decoding")
 	}
 	if sub.Title != "C++ VPN" || sub.Announce != "Привет" || sub.SupportURL != "" || sub.WebPageURL == "" {
 		t.Fatalf("headers %+v", sub)

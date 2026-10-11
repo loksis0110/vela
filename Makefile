@@ -13,6 +13,8 @@ XRAY_VERSION = $(shell sed -n 's/^[[:space:]]*github.com\/xtls\/xray-core //p' g
 
 test: core
 	GOBIN="$(CURDIR)/.cache/bin" GOWORK=off go install github.com/xtls/xray-core/main@$(XRAY_VERSION) || true
+	@test -x .cache/bin/main && echo "::notice title=Xray tests::end-to-end tests run against $$(.cache/bin/main version | head -n 1)" \
+		|| echo "::warning title=Xray tests::the Xray server could not be built, end-to-end tests are skipped"
 	VELA_XRAY_BIN="$$(test -x .cache/bin/main && echo "$(CURDIR)/.cache/bin/main")" go test -tags "$(TAGS)" ./core/ ./mobile/
 
 # Fresh "blocked in Russia" lists for release builds

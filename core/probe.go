@@ -100,20 +100,30 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 		probe, cancel, err := startProbeBox(outbounds)
 		if err != nil {
 			// one broken server must not fail all checks: find the ones the
-			// core rejects, report them and check the rest
+			// core rejects by halving the list, report them, check the rest
 			var good []map[string]any
-			for _, ob := range outbounds {
-				if ctx.Err() != nil {
-					return ctx.Err()
+			var split func(list []map[string]any)
+			split = func(list []map[string]any) {
+				if len(list) == 0 || ctx.Err() != nil {
+					return
 				}
-				one, oneCancel, oneErr := startProbeBox([]map[string]any{ob})
-				if oneErr != nil {
-					rejected[ob["tag"].(string)] = oneErr
-					continue
+				part, partCancel, partErr := startProbeBox(list)
+				if partErr == nil {
+					part.Close()
+					partCancel()
+					good = append(good, list...)
+					return
 				}
-				one.Close()
-				oneCancel()
-				good = append(good, ob)
+				if len(list) == 1 {
+					rejected[list[0]["tag"].(string)] = partErr
+					return
+				}
+				split(list[:len(list)/2])
+				split(list[len(list)/2:])
+			}
+			split(outbounds)
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 			probe, cancel, err = startProbeBox(good)
 			if err != nil {

@@ -288,6 +288,8 @@ func tokenLike(s string, minLen int) bool {
 	return false
 }
 
+var subscriptionID = regexp.MustCompile(`^[A-Za-z0-9_=-]{6,}$`)
+
 // subscriptionWords are path segments and host labels subscription panels use.
 var subscriptionWords = map[string]bool{
 	"sub": true, "subs": true, "subscribe": true, "subscription": true, "vpn": true, "proxy": true,
@@ -318,9 +320,14 @@ func looksLikeSubscription(u *url.URL) bool {
 		}
 	}
 	shortToken, longToken := false, false
-	for _, seg := range strings.Split(strings.Trim(u.Path, "/"), "/") {
+	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i, seg := range segments {
 		if subscriptionWords[strings.ToLower(seg)] {
 			keyword = true
+		}
+		// "/sub/<id>": panels let admins pick readable ids
+		if l := strings.ToLower(seg); (l == "sub" || l == "subs") && i+1 < len(segments) && subscriptionID.MatchString(segments[i+1]) {
+			return true
 		}
 		if tokenLike(seg, 16) {
 			longToken = true
