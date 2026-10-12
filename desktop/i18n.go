@@ -87,6 +87,7 @@ var english = map[string]string{
 	"Не удалось скачать обновление. Попробуйте позже":                "Could not download the update. Try again later",
 	"Нет прав администратора для создания сетевого адаптера":         "No administrator rights to create the network adapter",
 	"Нет серверов":                                                   "No servers",
+	"Нет подключения к интернету":                                    "No internet connection",
 	"Ни один сервер пока не ответил. Проверьте подписку или интернет-соединение": "No server has answered yet. Check the subscription or the internet connection",
 	"Новая версия не найдена. Проверьте обновления ещё раз":                      "No new version found. Check for updates again",
 	"Обновление повреждено: контрольная сумма не совпала":                        "The update is damaged: the checksum does not match",

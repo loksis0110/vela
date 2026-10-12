@@ -12,6 +12,7 @@ let status = { state: "disconnected" };
 let pings = {};
 let reasons = {};          // node id -> why it failed
 let probe = null;          // {done,total} while servers are being checked
+let probeStarted = 0;      // when this window started a check
 let sortByPing = (() => { try { return localStorage.getItem("vela-sort") === "ping"; } catch (_) { return false; } })();
 let viewProfile = null;   // profile shown in the servers sheet
 let favorites = new Set();
@@ -56,6 +57,12 @@ function connectEvents() {
       // the backend has the latest check results
       pings = Object.assign({}, snap.pings || {});
       reasons = Object.assign({}, snap.reasons || {});
+      // a window opened (or reconnected) during a check shows its progress;
+      // a check that ended while the window missed the last event is over
+      if (snap.probing && snap.probeTotal > 0) {
+        if (!probe) probe = { done: snap.probeDone || 0, total: snap.probeTotal };
+      } else if (probe && Date.now() - probeStarted > 3000) probe = null;
+      renderProbe();
       favorites = new Set(snap.favorites || []);
       if (!traffic.length && snap.history) traffic = snap.history.slice();
       const langChanged = setLang(snap.lang);
@@ -94,6 +101,7 @@ function connectEvents() {
       pings[d.id] = d.ms;
       if (d.reason) reasons[d.id] = d.reason; else delete reasons[d.id];
       queuePing(d.id);
+      if (probe && sortByPing) queueSort();
     } else if (msg.type === "speed") {
       onSpeed(msg.data);
     } else if (msg.type === "probe") {
@@ -102,6 +110,7 @@ function connectEvents() {
       if (d.stopped) {
         for (const id of Object.keys(pings)) if (pings[id] === 0) delete pings[id];
         renderPings();
+        if (sortByPing) renderNodes();
         toast(t("probe.stopped"));
       } else if (d.error) {
         toast(t("probe.failed", { error: d.error }), true);
@@ -110,11 +119,7 @@ function connectEvents() {
       }
       renderProbe();
       if (!probe && d.total && !d.error && !d.stopped) {
-        const p = snap && snap.profiles.find((x) => x.id === viewProfile);
-        if (p) {
-          const ok = p.nodes.filter((n) => pings[n.id] > 0).length;
-          toast(t("probe.done", { ok, total: p.nodes.length }));
-        }
+        if (d.ok !== undefined) toast(t("probe.done", { ok: d.ok, total: d.total }));
         if (sortByPing) renderNodes();
       }
     } else if (msg.type === "update") {
@@ -514,6 +519,23 @@ function queuePing(id) {
     }
     renderCurrent();
   });
+}
+
+// sorted by speed: working servers move up while the check runs, at most
+// once a second and not while the pointer is over the list (rows moving
+// under the cursor would swallow clicks)
+let sortTimer = 0;
+function queueSort() {
+  if (sortTimer) return;
+  sortTimer = setTimeout(() => {
+    sortTimer = 0;
+    if (!probe || !sortByPing || $("#servers").hidden) return;
+    if ($("#nodeList").matches(":hover")) return queueSort();
+    const list = $("#nodeList");
+    const top = list.scrollTop;
+    renderNodes();
+    list.scrollTop = top;
+  }, 1000);
 }
 
 function renderProbe() {
@@ -1646,6 +1668,7 @@ $("#pingAll").addEventListener("click", () => {
   if (!p) return;
   p.nodes.forEach((n) => { pings[n.id] = 0; delete reasons[n.id]; });
   probe = { done: 0, total: p.nodes.length };
+  probeStarted = Date.now();
   renderProbe();
   renderPings();
   api("ping", { profile: viewProfile }).catch((e) => toast(e.message, true));

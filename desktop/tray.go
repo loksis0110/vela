@@ -31,9 +31,16 @@ type trayMenu struct {
 	routingItems                                      map[string]*systray.MenuItem
 	modeItems                                         map[string]*systray.MenuItem
 
-	serverItems []*systray.MenuItem
-	serverIDs   []string
-	serverSig   string
+	// Server items are never removed: fyne.io/systray closes the click
+	// channel of a removed item, and a click delivered at that moment
+	// panics (send on a closed channel). The items are reused in place
+	// (title, check mark), surplus ones are hidden, and a click reads the
+	// id of its slot under mu.
+	serverItems   []*systray.MenuItem
+	serverIDs     []string
+	serverTitles  []string
+	serverShown   []bool
+	serverEnabled []bool
 
 	iconOn, iconSet bool
 
@@ -262,36 +269,72 @@ func (t *trayMenu) update() {
 		setChecked(item, settings.Mode == m)
 	}
 
-	// the server list is rebuilt only when it changes
+	// the server list: while a check runs the order would change with every
+	// result, so it is updated when the check ends
 	entries := append([]trayServer{{"auto", tr("Автовыбор")}}, servers...)
 	if len(servers) == 0 {
 		entries = append(entries, trayServer{"", tr("Нет серверов")})
 	}
-	var sig strings.Builder
-	for _, e := range entries {
-		sig.WriteString(e.id + "\x00" + e.name + "\x00")
-	}
-	if sig.String() != t.serverSig {
-		for _, item := range t.serverItems {
-			item.Remove()
-		}
-		t.serverItems, t.serverIDs = nil, nil
-		for _, e := range entries {
-			item := t.server.AddSubMenuItem(trimTitle(e.name, 48), "")
-			if e.id == "" {
-				item.Disable()
-			} else {
-				id := e.id
-				go onClick(item, func() { selectFromTray(id) })
+	if theApp.probing.Load() && len(t.serverIDs) > 0 {
+		entries = nil
+		for i, id := range t.serverIDs {
+			if t.serverShown[i] {
+				entries = append(entries, trayServer{id, t.serverTitles[i]})
 			}
-			t.serverItems = append(t.serverItems, item)
-			t.serverIDs = append(t.serverIDs, e.id)
 		}
-		t.serverSig = sig.String()
+	}
+	for len(t.serverItems) < len(entries) {
+		slot := len(t.serverItems)
+		title := trimTitle(entries[slot].name, 48)
+		item := t.server.AddSubMenuItem(title, "")
+		t.serverItems = append(t.serverItems, item)
+		t.serverIDs = append(t.serverIDs, "")
+		t.serverTitles = append(t.serverTitles, title)
+		t.serverShown = append(t.serverShown, true)
+		t.serverEnabled = append(t.serverEnabled, true)
+		go onClick(item, func() { t.clickServer(slot) })
 	}
 	for i, item := range t.serverItems {
-		id := t.serverIDs[i]
-		setChecked(item, id != "" && (id == selected || (id == "auto" && (selected == "" || selected == "auto"))))
+		if i >= len(entries) {
+			// changing a hidden item would show it again
+			if t.serverShown[i] {
+				item.Hide()
+				t.serverShown[i], t.serverIDs[i] = false, ""
+			}
+			continue
+		}
+		e := entries[i]
+		t.serverIDs[i] = e.id
+		if title := trimTitle(e.name, 48); title != t.serverTitles[i] || !t.serverShown[i] {
+			item.SetTitle(title)
+			t.serverTitles[i] = title
+		}
+		if !t.serverShown[i] {
+			item.Show()
+			t.serverShown[i] = true
+		}
+		if enabled := e.id != ""; enabled != t.serverEnabled[i] {
+			if enabled {
+				item.Enable()
+			} else {
+				item.Disable()
+			}
+			t.serverEnabled[i] = enabled
+		}
+		setChecked(item, e.id != "" && (e.id == selected || (e.id == "auto" && (selected == "" || selected == "auto"))))
+	}
+}
+
+// clickServer selects the server shown in a slot of the menu.
+func (t *trayMenu) clickServer(slot int) {
+	t.mu.Lock()
+	id := ""
+	if slot < len(t.serverIDs) && t.serverShown[slot] {
+		id = t.serverIDs[slot]
+	}
+	t.mu.Unlock()
+	if id != "" {
+		selectFromTray(id)
 	}
 }
 

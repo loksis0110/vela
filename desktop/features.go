@@ -110,6 +110,14 @@ func (a *App) watchdog(stop chan struct{}) {
 		}
 		if _, err := core.ProbeTag(context.Background(), instance, core.TagSelector, 8*time.Second); err == nil {
 			fails = 0
+			a.clearServerError()
+			continue
+		}
+		// the whole network is down (Wi-Fi lost, cable out): not the
+		// server's fault, switching servers would not help
+		if !core.NetworkReachable(context.Background(), instance) {
+			fails = 0
+			a.setServerError(tr("Нет подключения к интернету"), "no_internet")
 			continue
 		}
 		fails++
@@ -144,6 +152,32 @@ func (a *App) watchdog(stop chan struct{}) {
 				cancel()
 			}
 		}
+	}
+}
+
+// setServerError shows a problem of the working connection (the VPN stays on).
+func (a *App) setServerError(msg, code string) {
+	a.mu.Lock()
+	changed := a.status.State == "connected" && (a.status.Error != msg || a.status.ErrorCode != code)
+	if changed {
+		a.status.Error, a.status.ErrorCode = msg, code
+	}
+	a.mu.Unlock()
+	if changed {
+		a.pushStatus()
+	}
+}
+
+// clearServerError removes it once traffic gets through again.
+func (a *App) clearServerError() {
+	a.mu.Lock()
+	changed := a.status.ErrorCode == "server_unreachable" || a.status.ErrorCode == "no_internet"
+	if changed {
+		a.status.Error, a.status.ErrorCode = "", ""
+	}
+	a.mu.Unlock()
+	if changed {
+		a.pushStatus()
 	}
 }
 

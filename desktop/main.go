@@ -17,7 +17,7 @@ import (
 	"fyne.io/systray"
 )
 
-var Version = "1.4.1"
+var Version = "1.4.2"
 
 //go:embed assets/tray-off.ico
 var trayOff []byte
@@ -141,6 +141,13 @@ func showWindow() {
 	openWindow(theServer.URL(), theApp.dataDir)
 }
 
+// quit disconnects and exits. The kill switch filters live in a dynamic
+// WFP session and go away with this process; after an update or a restart
+// with admin rights the new Vela turns them on again as it connects
+// (-connect), so for a moment in between (well under a second, plus the
+// time the new process needs to start) traffic is not blocked. Persistent
+// filters would close that gap but could block the computer for good if
+// Vela never came back.
 func quit(app *App) {
 	quitOnce.Do(func() {
 		app.Disconnect()
