@@ -24,7 +24,7 @@ struct TrafficDay: Identifiable, Hashable {
 
     /// The day as a date (local time zone, like the recorder in the extension).
     var date: Date? {
-        TrafficSummary.parser(day.count == 7 ? "yyyy-MM" : "yyyy-MM-dd").date(from: day)
+        (day.count == 7 ? TrafficSummary.monthParser : TrafficSummary.dayParser).date(from: day)
     }
 }
 
@@ -47,6 +47,10 @@ struct TrafficSummary {
         total = TrafficDay(o["total"])
     }
 
+    // made once: the chart asks for 43 dates on every redraw
+    static let dayParser = parser("yyyy-MM-dd")
+    static let monthParser = parser("yyyy-MM")
+
     static func parser(_ format: String) -> DateFormatter {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -60,7 +64,7 @@ struct TrafficSummary {
     func rebased(to now: Date = Date()) -> TrafficSummary {
         var s = self
         let cal = Calendar.current
-        let dayF = Self.parser("yyyy-MM-dd"), monthF = Self.parser("yyyy-MM")
+        let dayF = Self.dayParser, monthF = Self.monthParser
         let known = Dictionary(days.map { ($0.day, $0) }, uniquingKeysWith: { a, _ in a })
         s.days = (0 ... 30).reversed().map { back in
             let key = dayF.string(from: cal.date(byAdding: .day, value: -back, to: now) ?? now)

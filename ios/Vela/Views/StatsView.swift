@@ -48,7 +48,7 @@ struct StatsView: View {
 
     private func tile(_ title: String, _ d: TrafficDay) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title).font(.system(size: 12)).foregroundStyle(Palette.muted)
+            Text(title).font(.system(size: 12)).foregroundStyle(Palette.muted).lineLimit(1).minimumScaleFactor(0.75)
             Text(Fmt.bytes(d.total)).font(.system(size: 17, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.7)
             Text("↓ " + Fmt.bytes(d.down)).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
             Text("↑ " + Fmt.bytes(d.up)).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)

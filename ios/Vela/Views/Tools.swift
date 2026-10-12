@@ -101,7 +101,7 @@ enum ToolText {
         return (L("Узнать"), L("Как вас видят сайты"))
     }
 
-    static func speed(_ s: SpeedState) -> (String, String) {
+    static func speed(_ s: SpeedState, viaVPN: Bool) -> (String, String) {
         if s.running {
             switch s.phase {
             case "ping": return (L("Пинг…"), L("Измеряем задержку"))
@@ -112,7 +112,8 @@ enum ToolText {
         }
         if s.done, let e = s.error, s.downMbps <= 0 { return (L("Не удалось"), e) }
         if s.done { return ("↓ \(Fmt.mbps(s.downMbps))  ↑ \(Fmt.mbps(s.upMbps))", LF("Мбит/с, пинг %@ мс", "\(Int(s.pingMs))")) }
-        return (L("Измерить"), L("Через выбранный сервер"))
+        // with the VPN off the test measures the plain connection
+        return (L("Измерить"), viaVPN ? L("Через выбранный сервер") : L("Без VPN"))
     }
 }
 

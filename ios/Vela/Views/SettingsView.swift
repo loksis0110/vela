@@ -188,7 +188,7 @@ struct SettingsView: View {
                         ForEach($s.rules) { $rule in
                             HStack {
                                 TextField("example.com", text: $rule.match).textInputAutocapitalization(.never).autocorrectionDisabled()
-                                Picker("", selection: $rule.action) {
+                                Picker("Действие", selection: $rule.action) {
                                     Text("Напрямую").tag("direct")
                                     Text("Через VPN").tag("proxy")
                                     Text("Блокировать").tag("block")
