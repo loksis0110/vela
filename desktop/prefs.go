@@ -98,15 +98,8 @@ func (a *App) applyHotkey() error {
 
 // hotkeyPressed connects or disconnects.
 func (a *App) hotkeyPressed() {
-	a.mu.Lock()
-	state := a.status.State
-	a.mu.Unlock()
-	if state == "disconnected" {
-		if err := a.Connect(); err != nil {
-			// no servers yet or admin rights needed: the window explains
-			showWindow()
-		}
-		return
+	if err := a.Toggle(); err != nil {
+		// no servers yet or admin rights needed: the window explains
+		showWindow()
 	}
-	a.Disconnect()
 }

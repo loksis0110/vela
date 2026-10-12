@@ -241,7 +241,7 @@ func (t *trayMenu) update() {
 		t.iconOn, t.iconSet = on, true
 	}
 	t.open.SetTitle(tr("Открыть Vela"))
-	if st.State == "disconnected" {
+	if st.State == "disconnected" && !st.Blocked {
 		t.toggle.SetTitle(tr("Подключить"))
 	} else {
 		t.toggle.SetTitle(tr("Отключить"))
@@ -306,13 +306,9 @@ func setChecked(item *systray.MenuItem, on bool) {
 }
 
 func toggleFromTray() {
-	if theApp.Snapshot().Status.State == "disconnected" {
-		if err := theApp.Connect(); err != nil {
-			showWindow()
-		}
-		return
+	if err := theApp.Toggle(); err != nil {
+		showWindow()
 	}
-	theApp.Disconnect()
 }
 
 func selectFromTray(id string) {

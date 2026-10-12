@@ -820,3 +820,11 @@ svg { display: block; }
 @media (min-width: 900px) {
   #connections .conn-tools, #connections .conns { width: 100%; max-width: 912px; margin-left: auto; margin-right: auto; }
 }
+
+/* a short window: the whole server sheet scrolls, so the list is never
+   squeezed to a few rows under the subscription card and the filters */
+@media (max-height: 700px) {
+  #servers, #servers.docked { overflow-y: auto; }
+  #servers .nodes { flex: none; overflow: visible; min-height: auto; }
+  #servers .sheet-head { position: sticky; top: 0; z-index: 2; background: var(--ink); }
+}
