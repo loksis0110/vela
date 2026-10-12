@@ -53,7 +53,7 @@ class VelaWidget : AppWidgetProvider() {
                 on || busy -> PendingIntent.getService(
                     context, 21, Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_STOP), flags,
                 )
-                profile == null || VpnService.prepare(context) != null -> PendingIntent.getActivity(
+                profile == null || profile.nodes.isEmpty() || VpnService.prepare(context) != null -> PendingIntent.getActivity(
                     context, 22,
                     Intent(context, MainActivity::class.java).setAction(MainActivity.ACTION_CONNECT).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                     flags,

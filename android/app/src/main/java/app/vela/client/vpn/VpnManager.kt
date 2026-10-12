@@ -77,16 +77,22 @@ object VpnManager {
 
     fun start(context: Context) {
         val intent = Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_START)
-        ContextCompat.startForegroundService(context, intent)
+        // Android 12+ refuses foreground starts from the background
+        runCatching { ContextCompat.startForegroundService(context, intent) }.onFailure {
+            android.util.Log.e("VelaVpn", "start", it)
+            if (status.value.state == ConnState.Disconnected) status.value = VpnStatus(error = Lang.str(R.string.error_connect, it.message ?: it.toString()))
+        }
     }
 
     /** Rebuilds the config in the running service (settings, server list). */
     fun restart(context: Context) {
-        context.startService(Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_RESTART))
+        if (status.value.state != ConnState.Connected) return
+        runCatching { context.startService(Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_RESTART)) }
     }
 
     fun stop(context: Context) {
-        context.startService(Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_STOP))
+        runCatching { context.startService(Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_STOP)) }
+            .onFailure { android.util.Log.e("VelaVpn", "stop", it) }
     }
 
     // ------------------------------------------------------------ controller

@@ -3,15 +3,15 @@ package app.vela.client.ui
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -57,9 +57,20 @@ fun Constellation(state: ConnState, modifier: Modifier = Modifier) {
         }, tween(800), label = "glow",
     )
     val lineColor = if (state == ConnState.Connecting) Vela.Flare else Vela.Star
-    val spin by rememberInfiniteTransition(label = "orbit").animateFloat(
-        0f, 360f, infiniteRepeatable(tween(6000, easing = LinearEasing)), label = "spin",
-    )
+    // the orbit turns only while connecting: an always-running animation kept
+    // the home screen asking for a new frame 60 times a second
+    val spin = remember { Animatable(0f) }
+    val spinning = state == ConnState.Connecting
+    LaunchedEffect(spinning) {
+        if (!spinning) {
+            spin.snapTo(0f)
+            return@LaunchedEffect
+        }
+        while (true) {
+            spin.animateTo(360f, tween(6000, easing = LinearEasing))
+            spin.snapTo(0f)
+        }
+    }
 
     Box(modifier) {
         Canvas(Modifier.fillMaxSize()) {
@@ -71,7 +82,7 @@ fun Constellation(state: ConnState, modifier: Modifier = Modifier) {
                 Brush.radialGradient(listOf(glow.copy(alpha = if (state == ConnState.Disconnected) 0.08f else 0.32f), Color.Transparent), c, 128f * k),
                 128f * k, c,
             )
-            rotate(if (state == ConnState.Connecting) spin else 0f, c) {
+            rotate(if (spinning) spin.value else 0f, c) {
                 drawCircle(
                     if (state == ConnState.Disconnected) Vela.Line else glow.copy(alpha = 0.5f), 118f * k, c,
                     style = Stroke(width = 1f * k, pathEffect = PathEffect.dashPathEffect(floatArrayOf(2f * k, 6f * k))),

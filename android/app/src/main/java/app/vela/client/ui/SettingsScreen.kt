@@ -88,6 +88,9 @@ fun SettingsScreen(
     DisposableEffect(Unit) { onDispose { if (ua.trim() != latestSub.userAgent) onSub(latestSub.copy(userAgent = ua.trim())) } }
     val context = LocalContext.current
     var picking by remember { mutableStateOf(false) }
+    // «exclude»/«only» chosen with no apps yet: applied once apps are picked, so
+    // the VPN isn't reloaded twice for nothing (and «only» never means «all»)
+    var pendingMode by remember { mutableStateOf<String?>(null) }
     var logs by remember { mutableStateOf(false) }
     var rules by remember { mutableStateOf(settings.rules) }
     // text fields are saved only if the user edited them, so a backup restored
@@ -181,13 +184,17 @@ fun SettingsScreen(
                     Row(
                         Modifier.fillMaxWidth().clickable(role = Role.RadioButton) {
                             if (v != settings.appMode) {
-                                if (v != "" && settings.apps.isEmpty()) picking = true
-                                onChange(settings.copy(appMode = v))
+                                if (v != "" && settings.apps.isEmpty()) {
+                                    pendingMode = v
+                                    picking = true
+                                } else {
+                                    onChange(settings.copy(appMode = v))
+                                }
                             }
                         }.padding(vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        RadioButton(settings.appMode == v, null, colors = RadioButtonDefaults.colors(selectedColor = Vela.Star))
+                        RadioButton((pendingMode ?: settings.appMode) == v, null, colors = RadioButtonDefaults.colors(selectedColor = Vela.Star))
                         Text(l, modifier = Modifier.padding(start = 8.dp))
                     }
                 }
@@ -325,12 +332,16 @@ fun SettingsScreen(
             selected = settings.apps,
             onDismiss = {
                 picking = false
+                pendingMode = null
                 // «only selected» with nothing selected would quietly tunnel everything
                 if (settings.apps.isEmpty() && settings.appMode.isNotEmpty()) onChange(settings.copy(appMode = ""))
             },
             onDone = { list ->
                 picking = false
-                onChange(settings.copy(apps = list, appMode = if (list.isEmpty()) "" else settings.appMode.ifEmpty { "exclude" }))
+                val mode = if (list.isEmpty()) "" else (pendingMode ?: settings.appMode).ifEmpty { "exclude" }
+                pendingMode = null
+                val next = settings.copy(apps = list, appMode = mode)
+                if (next != settings) onChange(next)
             },
         )
     }
