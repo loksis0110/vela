@@ -45,6 +45,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -66,6 +67,20 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         private const val CHANNEL = "vpn"
         private const val NOTIFICATION_ID = 1
         private const val TAG = "VelaVpn"
+
+        @Volatile private var running: VelaVpnService? = null
+
+        /** The app language changed: the notification follows it (also while connected). */
+        fun onLanguageChanged() {
+            val s = running ?: return
+            s.post {
+                when (VpnManager.status.value.state) {
+                    ConnState.Connected -> s.showNotification(Lang.str(R.string.notif_connected), update = true)
+                    ConnState.Connecting -> s.showNotification(Lang.str(R.string.notif_connecting), update = true)
+                    else -> {}
+                }
+            }
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -78,17 +93,37 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     /** Id of the newest start command: stopping must not cancel a newer «connect». */
     @Volatile private var lastStartId = 0
 
+    /**
+     * Commands run one by one in the order they came: «disconnect» quickly
+     * followed by «connect» must never be carried out the other way round.
+     */
+    private val commands = Channel<suspend () -> Unit>(Channel.UNLIMITED)
+
+    private fun post(block: suspend () -> Unit) {
+        commands.trySend(block)
+    }
+
     // ------------------------------------------------------------- lifecycle
 
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(Lang.wrap(base))
     }
 
+    override fun onCreate() {
+        super.onCreate()
+        running = this
+        scope.launch {
+            for (command in commands) {
+                runCatching { command() }.onFailure { Log.e(TAG, "command", it) }
+            }
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         lastStartId = startId
         when (intent?.action) {
-            ACTION_STOP -> scope.launch { stopVpn(startId) }
-            ACTION_RESTART -> scope.launch { restartVpn(startId) }
+            ACTION_STOP -> post { stopVpn(startId) }
+            ACTION_RESTART -> post { restartVpn(startId) }
             // ACTION_START, or null/"android.net.VpnService" when started by Always-on VPN
             else -> {
                 // started with startForegroundService: Android requires the
@@ -100,7 +135,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                     }
                     return START_NOT_STICKY
                 }
-                scope.launch { startVpn(startId) }
+                post { startVpn(startId) }
             }
         }
         return START_NOT_STICKY
@@ -109,10 +144,11 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     override fun onRevoke() {
         // another VPN app took over, or the user revoked permission
         val id = lastStartId
-        scope.launch { stopVpn(id) }
+        post { stopVpn(id) }
     }
 
     override fun onDestroy() {
+        if (running === this) running = null
         // stopped without «disconnect» (e.g. by the system): don't leave the
         // interface open or the app showing «connected»
         if (VpnManager.status.value.state != ConnState.Disconnected || tunFd != null) {
@@ -121,7 +157,10 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         }
         runCatching { commandServer?.close() }
         commandServer = null
+        commands.close()
         scope.cancel()
+        // the process may be killed soon after: «was connected» must be on disk
+        Store.flush()
         super.onDestroy()
     }
 
@@ -349,8 +388,11 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     // ------------------------------------------------------------- notification
 
-    /** Shows the status in the foreground notification; false when Android refused it. */
-    private fun showNotification(text: String): Boolean {
+    /**
+     * Shows the status in the foreground notification; false when Android refused it.
+     * [update] only redraws the notification of the running service.
+     */
+    private fun showNotification(text: String, update: Boolean = false): Boolean {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
             // also renames the channel after a language change
@@ -376,6 +418,7 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
+        if (update) return runCatching { nm.notify(NOTIFICATION_ID, notification) }.isSuccess
         val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else 0
         // Android 12+ may refuse a foreground start (from the background, or the
         // VPN permission went to another app): that must not crash the app
@@ -392,13 +435,13 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     override fun serviceStop() {
         val id = lastStartId
-        scope.launch { stopVpn(id) }
+        post { stopVpn(id) }
     }
 
     override fun serviceReload() {
         // the same path as a settings change: under the lock, never racing a stop
         val id = lastStartId
-        scope.launch { restartVpn(id) }
+        post { restartVpn(id) }
     }
 
     override fun getSystemProxyStatus(): SystemProxyStatus = SystemProxyStatus().apply {

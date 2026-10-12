@@ -104,8 +104,11 @@ fun ImportConfirmDialog(
     offer: ImportOffer,
     onDismiss: () -> Unit,
     onConfirm: (preview: JSONObject?, done: (String?) -> Unit) -> Unit,
+    /** Adding is still going on (e.g. started before the screen was rotated). */
+    working: Boolean = false,
 ) {
-    var busy by remember { mutableStateOf(false) }
+    var started by remember { mutableStateOf(false) }
+    val busy = started || working
     var error by remember { mutableStateOf<String?>(null) }
     val single = offer.subscriptions.singleOrNull()
     var preview by remember(offer) { mutableStateOf<Preview?>(if (single != null) Preview.Loading else null) }
@@ -174,9 +177,9 @@ fun ImportConfirmDialog(
             Button(
                 enabled = !busy,
                 onClick = {
-                    busy = true
+                    started = true
                     error = null
-                    onConfirm((preview as? Preview.Ready)?.sub) { err -> busy = false; error = err }
+                    onConfirm((preview as? Preview.Ready)?.sub) { err -> started = false; error = err }
                 },
             ) { Text(stringResource(if (busy) R.string.adding else R.string.add)) }
         },
@@ -213,12 +216,13 @@ fun ClipboardPrompt(offer: ImportOffer, busy: Boolean, onAdd: () -> Unit, onDism
 }
 
 @Composable
-fun AddDialog(initial: String, onDismiss: () -> Unit, onSubmit: (String, (String?) -> Unit) -> Unit) {
+fun AddDialog(initial: String, onDismiss: () -> Unit, onSubmit: (String, (String?) -> Unit) -> Unit, working: Boolean = false) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var text by rememberSaveable { mutableStateOf(initial) }
     var error by remember { mutableStateOf<String?>(null) }
-    var busy by remember { mutableStateOf(false) }
+    var started by remember { mutableStateOf(false) }
+    val busy = started || working
     val noQr = stringResource(R.string.add_no_qr)
     val clipEmpty = stringResource(R.string.add_clipboard_empty)
     val scanPrompt = stringResource(R.string.add_scan_prompt)
@@ -287,8 +291,9 @@ fun AddDialog(initial: String, onDismiss: () -> Unit, onSubmit: (String, (String
             Button(
                 enabled = !busy && text.isNotBlank(),
                 onClick = {
-                    busy = true
-                    onSubmit(text) { err -> busy = false; error = err }
+                    started = true
+                    error = null
+                    onSubmit(text) { err -> started = false; error = err }
                 },
             ) { Text(stringResource(if (busy) R.string.loading_short else R.string.add)) }
         },

@@ -7,6 +7,7 @@ import app.vela.client.BuildConfig
 import app.vela.client.Lang
 import app.vela.client.R
 import app.vela.client.notify.Reminders
+import app.vela.client.vpn.VpnManager
 import app.vela.velacore.Velacore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -20,8 +21,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import android.util.Log
 import java.io.File
+import java.io.FileOutputStream
 import java.security.SecureRandom
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class Node(
@@ -377,10 +380,40 @@ object Store {
 
     /** Remembers check results so automatic selection can skip dead servers after a restart. */
     fun savePings() {
-        runCatching {
-            val o = JSONObject()
-            pings.value.filterValues { it != 0 }.forEach { (k, v) -> o.put(k, v) }
-            File(dataDir, "pings.json").writeText(o.toString())
+        // written by the same thread as the state, never on the UI thread
+        if (pingsQueued.compareAndSet(false, true)) {
+            writer.execute {
+                pingsQueued.set(false)
+                runCatching {
+                    val o = JSONObject()
+                    pings.value.filterValues { it != 0 }.forEach { (k, v) -> o.put(k, v) }
+                    writeAtomically(File(dataDir, "pings.json"), o.toString())
+                }.onFailure { Log.w("VelaStore", "can't save the check results", it) }
+            }
+        }
+    }
+
+    private val pingsQueued = AtomicBoolean(false)
+
+    /**
+     * Waits until every change made so far is on disk. Called when the app
+     * leaves the screen: Android may kill the process at any moment after that.
+     */
+    fun flush() {
+        runCatching { writer.submit(Runnable {}).get(3, TimeUnit.SECONDS) }
+    }
+
+    /** Replaces the file only with fully written data (survives a crash or power loss). */
+    private fun writeAtomically(target: File, text: String) {
+        val tmp = File(target.parentFile, target.name + ".tmp")
+        FileOutputStream(tmp).use { out ->
+            out.write(text.toByteArray())
+            out.flush()
+            runCatching { out.fd.sync() }
+        }
+        if (!tmp.renameTo(target)) {
+            tmp.copyTo(target, overwrite = true)
+            tmp.delete()
         }
     }
 
@@ -418,12 +451,7 @@ object Store {
                 .put("sortByPing", st.sortByPing)
                 .put("noClipboard", st.noClipboard)
                 .put("noReminders", st.noReminders)
-            val tmp = File(dataDir, "state.json.tmp")
-            tmp.writeText(o.toString())
-            if (!tmp.renameTo(file)) {
-                tmp.copyTo(file, overwrite = true)
-                tmp.delete()
-            }
+            writeAtomically(file, o.toString())
         } catch (e: Exception) {
             // full storage and the like: the app keeps working with what is in memory
             Log.e("VelaStore", "can't save the state", e)
@@ -469,6 +497,7 @@ object Store {
         val nodes = sub.optJSONArray("nodes").toNodes()
         var label = ""
         var isNew = false
+        var reload = false
         update { st ->
             val existing = st.profiles.firstOrNull { it.kind == "subscription" && it.url == url }
             isNew = existing == null
@@ -476,9 +505,25 @@ object Store {
             profile = profile.copy(name = uniqueName(st.profiles, profile))
             label = profile.name
             val profiles = if (existing != null) st.profiles.map { if (it.id == existing.id) profile else it } else st.profiles + profile
-            st.copy(profiles = profiles)
+            val next = st.copy(profiles = profiles)
+            if (existing != null) withNewServers(st, next, existing.id).also { reload = it.second }.first else next
         }
+        if (reload) VpnManager.restart(appContext)
         return label to isNew
+    }
+
+    /**
+     * After the servers of a subscription were replaced: when it is the one in
+     * use and its server set really changed, the running VPN must get the new
+     * list (returned as true). The chosen server stays chosen while it exists.
+     */
+    private fun withNewServers(before: AppState, after: AppState, profileId: String): Pair<AppState, Boolean> {
+        if (before.active?.id != profileId) return after to false
+        val old = before.active?.nodes.orEmpty().map { it.id }.toSet()
+        val fresh = after.profiles.firstOrNull { it.id == profileId }?.nodes.orEmpty().map { it.id }.toSet()
+        if (old == fresh) return after to false
+        val selected = if (after.selectedNode == "auto" || after.selectedNode in fresh) after.selectedNode else "auto"
+        return after.copy(selectedNode = selected) to true
     }
 
     private fun makeActiveIfNone(target: String) = update { st ->
@@ -599,18 +644,24 @@ object Store {
             ?: fail(R.string.refresh_not_found)
         val sub = JSONObject(Velacore.fetchSubscription(p.url))
         val nodes = sub.optJSONArray("nodes").toNodes()
+        var reload = false
         update { st ->
-            st.copy(
+            // deleted or renamed meanwhile: use what is there now
+            val cur = st.profiles.firstOrNull { it.id == p.id } ?: return@update st
+            val next = st.copy(
                 profiles = st.profiles.map {
-                    if (it.id == p.id) {
-                        val fresh = subscriptionProfile(p.id, p.url, sub, nodes, p.customName)
+                    if (it.id == cur.id) {
+                        val fresh = subscriptionProfile(cur.id, cur.url, sub, nodes, cur.customName)
                         fresh.copy(name = uniqueName(st.profiles, fresh))
                     } else {
                         it
                     }
                 },
             )
+            withNewServers(st, next, cur.id).also { reload = it.second }.first
         }
+        // a background refresh while connected: the running VPN gets the new servers
+        if (reload) VpnManager.restart(appContext)
         Reminders.onSubscriptionsChanged(appContext)
     }
 
