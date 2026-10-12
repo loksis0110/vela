@@ -39,3 +39,9 @@ func TrafficSummary(path string) string {
 	data, _ := json.Marshal(core.LoadTrafficSummary(path, time.Now()))
 	return string(data)
 }
+
+// SetLanguage switches messages produced by the core inside the extension
+// ("ru" or "en").
+func SetLanguage(lang string) {
+	core.SetLanguage(lang)
+}
