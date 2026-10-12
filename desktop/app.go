@@ -130,6 +130,8 @@ type App struct {
 	reasons map[string]string
 	pingsMu sync.Mutex
 	probing atomic.Bool
+	// progress of the running server check, for windows opened during it
+	probeDone, probeTotal atomic.Int64
 
 	history  []TrafficPoint // last minutes of traffic, guarded by mu
 	speeding atomic.Bool
@@ -276,6 +278,8 @@ type Snapshot struct {
 	Pings           map[string]int    `json:"pings"`
 	Reasons         map[string]string `json:"reasons"`
 	Probing         bool              `json:"probing"`
+	ProbeDone       int               `json:"probeDone"`
+	ProbeTotal      int               `json:"probeTotal"`
 	Favorites       []string          `json:"favorites"`
 	Theme           string            `json:"theme"`
 	History         []TrafficPoint    `json:"history"`
@@ -331,6 +335,7 @@ func (a *App) Snapshot() Snapshot {
 		SelectedNode: a.state.SelectedNode, Settings: a.state.Settings,
 		ConnectOnLaunch: a.state.ConnectOnLaunch, Status: a.status, Pings: pings,
 		Reasons: reasons, Probing: a.probing.Load(),
+		ProbeDone: int(a.probeDone.Load()), ProbeTotal: int(a.probeTotal.Load()),
 		Favorites: append([]string{}, a.state.Favorites...), Theme: a.state.Theme,
 		History:    append([]TrafficPoint{}, a.history...),
 		Onboarding: !a.state.OnboardingPassed,
@@ -1221,9 +1226,10 @@ func (a *App) statsLoop(stop chan struct{}) {
 func (a *App) selfCheck(selected string) {
 	time.Sleep(500 * time.Millisecond)
 	var lastErr error
+	var instance *box.Box
 	for attempt := 0; attempt < 2; attempt++ {
 		a.mu.Lock()
-		instance := a.instance
+		instance = a.instance
 		still := a.status.State == "connected"
 		a.mu.Unlock()
 		if !still || instance == nil {
@@ -1235,17 +1241,15 @@ func (a *App) selfCheck(selected string) {
 			lastErr = err
 		}
 	}
+	if !core.NetworkReachable(context.Background(), instance) {
+		a.setServerError(tr("Нет подключения к интернету"), "no_internet")
+		return
+	}
 	msg := fmt.Sprintf(tr("Выбранный сервер не отвечает: %s. Выберите другой сервер или «Автовыбор»"), core.ExplainError(lastErr.Error()))
 	if selected == "auto" || selected == "" {
 		msg = tr("Ни один сервер пока не ответил. Проверьте подписку или интернет-соединение")
 	}
-	a.mu.Lock()
-	if a.status.State == "connected" {
-		a.status.Error = msg
-		a.status.ErrorCode = "server_unreachable"
-	}
-	a.mu.Unlock()
-	a.pushStatus()
+	a.setServerError(msg, "server_unreachable")
 }
 
 // resolveActive returns the node id currently carrying traffic.
@@ -1275,21 +1279,16 @@ func (a *App) Ping(profileID string) {
 	if !a.probing.CompareAndSwap(false, true) {
 		return
 	}
-	defer a.probing.Store(false)
 	ctx, stop := context.WithCancel(context.Background())
 	a.mu.Lock()
 	a.probeStop = stop
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
+	p := a.findProfile(profileID)
+	if p == nil {
 		a.probeStop = nil
 		a.mu.Unlock()
 		stop()
-	}()
-	a.mu.Lock()
-	p := a.findProfile(profileID)
-	if p == nil {
-		a.mu.Unlock()
+		a.probing.Store(false)
+		a.broadcast("probe", map[string]int{"done": 0, "total": 0}) // the window stops waiting
 		return
 	}
 	nodes := append([]core.Node(nil), p.Nodes...)
@@ -1298,6 +1297,17 @@ func (a *App) Ping(profileID string) {
 		instance = nil
 	}
 	a.mu.Unlock()
+	// the check is over: the window and the tray learn it from the state
+	// that follows, so the flag is cleared before it is sent
+	finish := func() {
+		a.mu.Lock()
+		a.probeStop = nil
+		a.mu.Unlock()
+		stop()
+		a.probing.Store(false)
+		a.probeDone.Store(0)
+		a.probeTotal.Store(0)
+	}
 
 	a.pingsMu.Lock()
 	for _, n := range nodes {
@@ -1305,8 +1315,31 @@ func (a *App) Ping(profileID string) {
 		delete(a.reasons, n.ID)
 	}
 	a.pingsMu.Unlock()
-	total, done := len(nodes), 0
+	total := len(nodes)
+	a.probeDone.Store(0)
+	a.probeTotal.Store(int64(total))
 	a.broadcast("probe", map[string]int{"done": 0, "total": total})
+
+	// results come in bursts: the progress goes out a few times a second
+	progressStop := make(chan struct{})
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		var sent int64
+		for {
+			select {
+			case <-progressStop:
+				return
+			case <-ticker.C:
+			}
+			if d := a.probeDone.Load(); d != sent && d < int64(total) {
+				sent = d
+				a.broadcast("probe", map[string]int{"done": int(d), "total": total})
+			}
+		}
+	}()
 
 	results := map[string]core.ProbeResult{}
 	var mu sync.Mutex
@@ -1315,11 +1348,6 @@ func (a *App) Ping(profileID string) {
 		if ms <= 0 {
 			ms = -1
 		}
-		mu.Lock()
-		results[r.ID] = r
-		done++
-		d := done
-		mu.Unlock()
 		a.pingsMu.Lock()
 		a.pings[r.ID] = ms
 		if r.Reason != "" {
@@ -1327,37 +1355,37 @@ func (a *App) Ping(profileID string) {
 		}
 		a.pingsMu.Unlock()
 		a.broadcast("ping", map[string]any{"id": r.ID, "ms": ms, "reason": r.Reason})
-		if d%10 == 0 || d == total {
-			a.broadcast("probe", map[string]int{"done": d, "total": total})
-		}
+		mu.Lock()
+		results[r.ID] = r
+		mu.Unlock()
+		a.probeDone.Add(1)
 	})
-	if errors.Is(err, context.Canceled) {
-		a.pingsMu.Lock()
-		for _, n := range nodes {
-			if a.pings[n.ID] == 0 {
-				delete(a.pings, n.ID)
-			}
+	close(progressStop)
+	<-progressDone
+	// servers that were not checked (stopped, error) must not stay "measuring"
+	a.pingsMu.Lock()
+	for _, n := range nodes {
+		if a.pings[n.ID] == 0 {
+			delete(a.pings, n.ID)
 		}
-		a.pingsMu.Unlock()
+	}
+	a.pingsMu.Unlock()
+	finish()
+	switch {
+	case errors.Is(err, context.Canceled):
 		a.broadcast("probe", map[string]any{"done": total, "total": total, "stopped": true})
-		a.pushState()
-		a.savePings()
-		return
-	}
-	if err != nil {
-		// servers that were not checked must not stay "measuring"
-		a.pingsMu.Lock()
+	case err != nil:
+		a.broadcast("probe", map[string]any{"done": total, "total": total, "error": err.Error()})
+	default:
+		core.WriteReport(filepath.Join(a.dataDir, "diagnostics.txt"), nodes, results)
+		ok := 0
 		for _, n := range nodes {
-			if a.pings[n.ID] == 0 {
-				delete(a.pings, n.ID)
+			if results[n.ID].Delay > 0 {
+				ok++
 			}
 		}
-		a.pingsMu.Unlock()
-		a.broadcast("probe", map[string]any{"done": total, "total": total, "error": humanizeError(err)})
-		a.pushState()
-		return
+		a.broadcast("probe", map[string]int{"done": total, "total": total, "ok": ok})
 	}
-	core.WriteReport(filepath.Join(a.dataDir, "diagnostics.txt"), nodes, results)
 	a.savePings()
 	// the final results in one piece, in case a window missed an event
 	a.pushState()

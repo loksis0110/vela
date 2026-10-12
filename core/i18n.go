@@ -113,6 +113,7 @@ var english = map[string]string{
 	"операция отменена":                               "the operation was cancelled",
 	"сервер не принял TLS-соединение (проверьте SNI)": "the server refused the TLS connection (check the SNI)",
 	"сервер ответил ошибкой":                          "the server answered with an error",
+	"нет подключения к интернету":                     "no internet connection",
 	"слишком много данных для QR-кода":                "too much data for a QR code",
 	"шифрование %s не поддерживается":                 "the %s cipher is not supported",
 	"obfs %s не поддерживается":                       "obfs %s is not supported",

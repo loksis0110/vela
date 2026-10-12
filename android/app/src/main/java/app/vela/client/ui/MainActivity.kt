@@ -6,6 +6,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.drawable.ColorDrawable
+import android.app.UiModeManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -96,6 +99,13 @@ class MainModel : ViewModel() {
     val refreshing = MutableStateFlow(false)
     val clipBusy = MutableStateFlow(false)
 
+    /** The «Add» window; kept here so adding that ends after a rotation still closes it. */
+    val addOpen = MutableStateFlow(false)
+    val addText = MutableStateFlow("")
+
+    /** Something from the «Add» window or a confirmed link is being added. */
+    val adding = MutableStateFlow(false)
+
     /** Connection state whose side effects (IP check, speed reset) are done. */
     var handledState: ConnState? = null
 
@@ -110,10 +120,9 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(Vela.Ink.toArgb()),
-            navigationBarStyle = SystemBarStyle.dark(Vela.Ink.toArgb()),
-        )
+        val theme = Store.state.value.theme
+        val systemDark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        applyWindowTheme(theme, if (theme == "system") systemDark else theme == "dark")
         super.onCreate(savedInstanceState)
         Lang.applyToCore()
         // only a fresh launch: rotation or a theme change must not repeat a shared
@@ -132,6 +141,35 @@ class MainActivity : ComponentActivity() {
         setContent {
             val st by Store.state.collectAsStateWithLifecycle()
             VelaTheme(st.theme) { App(model) }
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Android may end the process any time now: nothing changed may be lost
+        Store.flush()
+    }
+
+    /**
+     * Colors of the window behind the content and of the system bars. On
+     * Android 12+ the system also learns the theme chosen in Vela, so the
+     * splash screen of the next start is light or dark accordingly.
+     */
+    fun applyWindowTheme(theme: String, dark: Boolean) {
+        val p = if (dark) NightPalette else DayPalette
+        window.setBackgroundDrawable(ColorDrawable(p.ink.toArgb()))
+        val bar = if (dark) SystemBarStyle.dark(p.ink.toArgb()) else SystemBarStyle.light(p.ink.toArgb(), p.text.toArgb())
+        enableEdgeToEdge(statusBarStyle = bar, navigationBarStyle = bar)
+        if (Build.VERSION.SDK_INT >= 31) {
+            val mode = when (theme) {
+                "light" -> UiModeManager.MODE_NIGHT_NO
+                "dark" -> UiModeManager.MODE_NIGHT_YES
+                else -> UiModeManager.MODE_NIGHT_AUTO
+            }
+            if (Store.prefs.getInt(NIGHT_MODE, -1) != mode) {
+                runCatching { getSystemService(UiModeManager::class.java)?.setApplicationNightMode(mode) }
+                    .onSuccess { Store.prefs.edit().putInt(NIGHT_MODE, mode).apply() }
+            }
         }
     }
 
@@ -191,6 +229,7 @@ class MainActivity : ComponentActivity() {
         const val ACTION_CONNECT = "app.vela.client.CONNECT"
         private const val CLIP_STAMP = "clipStamp"
         private const val CLIP_HASH = "clipHash"
+        private const val NIGHT_MODE = "nightMode"
     }
 }
 
@@ -242,14 +281,18 @@ private fun App(model: MainModel) {
 
     val activity = context as? ComponentActivity
     val dark = Vela.isDark
-    LaunchedEffect(dark) {
-        val bar = if (dark) SystemBarStyle.dark(Vela.Ink.toArgb()) else SystemBarStyle.light(Vela.Ink.toArgb(), Vela.Text.toArgb())
-        activity?.enableEdgeToEdge(statusBarStyle = bar, navigationBarStyle = bar)
+    LaunchedEffect(dark, app.theme) {
+        (activity as? MainActivity)?.applyWindowTheme(app.theme, dark)
     }
 
     var screen by rememberSaveable { mutableStateOf(Screen.Home) }
-    var addOpen by rememberSaveable { mutableStateOf(false) }
-    var addText by rememberSaveable { mutableStateOf("") }
+    val addOpen by model.addOpen.collectAsStateWithLifecycle()
+    val addText by model.addText.collectAsStateWithLifecycle()
+    val adding by model.adding.collectAsStateWithLifecycle()
+    fun openAdd(text: String = "") {
+        model.addText.value = text
+        model.addOpen.value = true
+    }
     var privacyOpen by remember { mutableStateOf(false) }
     var askNotifications by remember { mutableStateOf(false) }
     var language by remember { mutableStateOf(Lang.choice(context)) }
@@ -346,8 +389,7 @@ private fun App(model: MainModel) {
                 model.confirm.value = offer
             } else if (!item.isLink) {
                 // shared text the core doesn't recognize (or a backup): let the user look at it
-                addText = item.text
-                addOpen = true
+                openAdd(item.text)
             } else {
                 model.linkError.value = result.exceptionOrNull()?.message ?: str(R.string.link_nothing)
             }
@@ -386,12 +428,12 @@ private fun App(model: MainModel) {
                     app = app, status = status, pings = pings,
                     onToggle = {
                         when (status.state) {
-                            ConnState.Disconnected -> if (app.profiles.isEmpty()) addOpen = true else connect()
+                            ConnState.Disconnected -> if (app.profiles.isEmpty()) openAdd() else connect()
                             ConnState.Connected, ConnState.Connecting -> VpnManager.stop(context)
                             ConnState.Disconnecting -> {}
                         }
                     },
-                    onServers = { if (app.profiles.isEmpty()) addOpen = true else screen = Screen.Servers },
+                    onServers = { if (app.profiles.isEmpty()) openAdd() else screen = Screen.Servers },
                     onSettings = { screen = Screen.Settings },
                     onRouting = { r ->
                         if (r != app.settings.routing) {
@@ -412,7 +454,7 @@ private fun App(model: MainModel) {
                 Screen.Servers -> ServersScreen(
                     app = app, status = status, pings = pings, reasons = reasons, probe = probe,
                     onBack = { screen = Screen.Home },
-                    onAdd = { addText = ""; addOpen = true },
+                    onAdd = { openAdd() },
                     onPing = { id ->
                         model.launch {
                             VpnManager.pingAll(id)
@@ -448,7 +490,8 @@ private fun App(model: MainModel) {
                             model.refreshing.value = true
                             try {
                                 runCatching { Store.refresh(p.id) }
-                                    .onSuccess { toast(str(R.string.refresh_done)); if (p.id == Store.state.value.activeProfile) reconnectIfNeeded() }
+                                    // the running VPN is reloaded by the store, only if the servers changed
+                                    .onSuccess { toast(str(R.string.refresh_done)) }
                                     .onFailure { toast(it.message ?: str(R.string.refresh_failed)) }
                             } finally {
                                 model.refreshing.value = false
@@ -487,7 +530,7 @@ private fun App(model: MainModel) {
                             .onSuccess { share = Triple(str(R.string.backup_title), str(R.string.backup_hint), it) }
                             .onFailure { toast(it.message ?: str(R.string.error_generic)) }
                     },
-                    onImport = { addText = ""; addOpen = true },
+                    onImport = { openAdd() },
                     sub = app.sub,
                     onSub = { Store.setSubPrefs(it) },
                     connectOnLaunch = app.connectOnLaunch,
@@ -550,16 +593,22 @@ private fun App(model: MainModel) {
             offer = offer,
             onDismiss = { model.confirm.value = null },
             onConfirm = { preview, done ->
+                model.adding.value = true
                 model.launch {
-                    runCatching { addOffer(offer, preview) }
-                        .onSuccess { msg ->
-                            model.confirm.compareAndSet(offer, null)
-                            toast(msg)
-                            done(null)
-                        }
-                        .onFailure { done(it.message ?: str(R.string.error_generic)) }
+                    try {
+                        runCatching { addOffer(offer, preview) }
+                            .onSuccess { msg ->
+                                model.confirm.compareAndSet(offer, null)
+                                toast(msg)
+                                done(null)
+                            }
+                            .onFailure { done(it.message ?: str(R.string.error_generic)) }
+                    } finally {
+                        model.adding.value = false
+                    }
                 }
             },
+            working = adding,
         )
     }
 
@@ -576,18 +625,24 @@ private fun App(model: MainModel) {
     if (addOpen) {
         AddDialog(
             initial = addText,
-            onDismiss = { addOpen = false },
+            onDismiss = { model.addOpen.value = false },
             onSubmit = { text, done ->
+                model.adding.value = true
                 model.launch {
-                    runCatching { Store.import(text) }
-                        .onSuccess { msg ->
-                            addOpen = false
-                            toast(msg)
-                            done(null)
-                        }
-                        .onFailure { done(it.message ?: str(R.string.error_generic)) }
+                    try {
+                        runCatching { Store.import(text) }
+                            .onSuccess { msg ->
+                                model.addOpen.value = false
+                                toast(msg)
+                                done(null)
+                            }
+                            .onFailure { done(it.message ?: str(R.string.error_generic)) }
+                    } finally {
+                        model.adding.value = false
+                    }
                 }
             },
+            working = adding,
         )
     }
 

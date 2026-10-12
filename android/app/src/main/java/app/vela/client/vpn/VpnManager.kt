@@ -6,9 +6,12 @@ import android.net.VpnService
 import androidx.core.content.ContextCompat
 import app.vela.client.Lang
 import app.vela.client.R
+import app.vela.client.data.Node
 import app.vela.client.data.Store
 import app.vela.velacore.Velacore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -24,6 +27,8 @@ import java.net.HttpURLConnection
 import java.net.Proxy
 import java.net.URL
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 enum class ConnState { Disconnected, Connecting, Connected, Disconnecting }
 
@@ -97,10 +102,14 @@ object VpnManager {
 
     // ------------------------------------------------------------ controller
 
-    private fun request(method: String, path: String, body: String? = null, timeoutMs: Int = 8000): String? {
+    private fun request(
+        method: String, path: String, body: String? = null, timeoutMs: Int = 8000,
+        tracked: MutableSet<HttpURLConnection>? = null,
+    ): String? {
         val port = controllerPort
         if (port == 0) return null
         val conn = URL("http://127.0.0.1:$port$path").openConnection(Proxy.NO_PROXY) as HttpURLConnection
+        tracked?.add(conn)
         return try {
             conn.requestMethod = method
             conn.connectTimeout = 2000
@@ -115,6 +124,7 @@ object VpnManager {
         } catch (_: Exception) {
             null
         } finally {
+            tracked?.remove(conn)
             conn.disconnect()
         }
     }
@@ -225,17 +235,26 @@ object VpnManager {
     /** Progress of the server check: done to total, or null when idle. */
     val probe = MutableStateFlow<Pair<Int, Int>?>(null)
 
-    /**
-     * Makes a real request through every server of a profile. While the VPN is
-     * off a temporary core does it and reports the reason for each failure;
-     * while connected the running core is asked through its controller.
-     */
     @Volatile private var stopRequested = false
+
+    /** Controller requests of a running check, closed by «Stop». */
+    private val probeRequests: MutableSet<HttpURLConnection> = ConcurrentHashMap.newKeySet()
 
     /** Stops the server check; servers not checked yet keep no result. */
     fun stopProbe() {
         stopRequested = true
         runCatching { Velacore.stopProbe() }
+        // requests through the running core would otherwise run to their timeout
+        probeRequests.toList().forEach { runCatching { it.disconnect() } }
+    }
+
+    /** Delay of one server through the running core, or -1. */
+    private fun probeThroughCore(nodeId: String, timeoutMs: Int, track: Boolean = false): Int {
+        val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=$timeoutMs"
+        return request(
+            "GET", "/proxies/${Velacore.nodeTag(nodeId)}/delay?$q", timeoutMs = timeoutMs + 3000,
+            tracked = if (track) probeRequests else null,
+        )?.let { runCatching { JSONObject(it).optInt("delay", -1) }.getOrDefault(-1) } ?: -1
     }
 
     /** Checks one server (through the running core when it's connected). */
@@ -249,9 +268,7 @@ object VpnManager {
         var reason = ""
         var got = true
         if (status.value.state == ConnState.Connected && profile.id == st.activeProfile) {
-            val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
-            ms = request("GET", "/proxies/${Velacore.nodeTag(node.id)}/delay?$q", timeoutMs = 11000)
-                ?.let { JSONObject(it).optInt("delay", -1) } ?: -1
+            ms = probeThroughCore(node.id, 8000)
             if (ms <= 0) reason = Lang.str(R.string.reason_no_answer)
         } else {
             val json = JSONArray().put(node.raw).toString()
@@ -270,59 +287,116 @@ object VpnManager {
         Store.savePings()
     }
 
-    suspend fun pingAll(profileId: String? = null) = coroutineScope {
+    /**
+     * Checks every server of a profile. Results arrive in bursts (hundreds
+     * within a second when many hosts are dead), so they are collected and
+     * shown a few times a second: the list stays smooth with 500+ servers.
+     */
+    suspend fun pingAll(profileId: String? = null): Unit = coroutineScope {
         if (probe.value != null) return@coroutineScope
         stopRequested = false
         val st = Store.state.value
         val profile = st.profiles.firstOrNull { it.id == (profileId ?: st.activeProfile) } ?: st.active ?: return@coroutineScope
         val nodes = profile.nodes
+        if (nodes.isEmpty()) return@coroutineScope
         val connected = status.value.state == ConnState.Connected && profile.id == st.activeProfile
+        val total = nodes.size
         Store.pings.update { it + nodes.associate { n -> n.id to 0 } }
         Store.reasons.update { it - nodes.map { n -> n.id }.toSet() }
-        var done = 0
-        probe.value = 0 to nodes.size
+        probe.value = 0 to total
+
+        val pending = ArrayList<Triple<String, Int, String>>()
+        val done = AtomicInteger(0)
         fun report(id: String, ms: Int, reason: String) {
             if (stopRequested && ms <= 0) return
-            Store.pings.update { it + (id to (if (ms > 0) ms else -1)) }
-            if (ms <= 0 && reason.isNotEmpty()) Store.reasons.update { it + (id to reason) }
-            synchronized(this@VpnManager) { done++ }
-            probe.value = done to nodes.size
+            synchronized(pending) { pending += Triple(id, if (ms > 0) ms else -1, reason) }
+        }
+        fun flush() {
+            val batch = synchronized(pending) {
+                if (pending.isEmpty()) return
+                ArrayList(pending).also { pending.clear() }
+            }
+            Store.pings.update { m -> HashMap(m).apply { batch.forEach { (id, ms, _) -> put(id, ms) } } }
+            val failed = batch.filter { it.second <= 0 && it.third.isNotEmpty() }
+            if (failed.isNotEmpty()) Store.reasons.update { m -> HashMap(m).apply { failed.forEach { (id, _, r) -> put(id, r) } } }
+            probe.value = done.addAndGet(batch.size).coerceAtMost(total) to total
+        }
+        val ticker = launch {
+            while (true) {
+                delay(150)
+                flush()
+            }
         }
         try {
-            if (connected) {
-                val gate = Semaphore(12)
-                nodes.map { node ->
-                    async(Dispatchers.IO) {
-                        gate.withPermit {
-                            if (stopRequested) return@withPermit
-                            val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
-                            val ms = request("GET", "/proxies/${Velacore.nodeTag(node.id)}/delay?$q", timeoutMs = 11000)
-                                ?.let { JSONObject(it).optInt("delay", -1) } ?: -1
-                            report(node.id, ms, if (ms > 0) "" else Lang.str(R.string.reason_no_answer))
-                        }
-                    }
-                }.awaitAll()
-            } else {
-                withContext(Dispatchers.IO) {
-                    val json = JSONArray().apply { nodes.forEach { put(it.raw) } }.toString()
-                    val ok = runCatching {
-                        Velacore.probeNodes(json, 9000, 12) { id, delay, reason, _ -> report(id, delay, reason) }
-                    }
-                    if (ok.isFailure) {
-                        // temporary core unavailable: fall back to TCP reachability
-                        nodes.forEach { n ->
-                            if (n.isUdp) report(n.id, -1, Lang.str(R.string.reason_only_connected))
-                            else Velacore.tcpPing(n.server, n.port).let { report(n.id, it, if (it > 0) "" else Lang.str(R.string.reason_unreachable)) }
-                        }
-                    }
-                }
+            withContext(Dispatchers.IO) {
+                if (connected) probeConnected(nodes, ::report) else probeOffline(nodes, ::report)
             }
         } finally {
+            ticker.cancel()
+            flush()
             // stopped: servers that weren't checked must not stay "measuring"
             val ids = nodes.map { it.id }.toSet()
             Store.pings.update { m -> m.filterNot { it.key in ids && it.value == 0 } }
             probe.value = null
             Store.savePings()
         }
+    }
+
+    /** Checks with a temporary core; the core itself spreads the work sensibly. */
+    private suspend fun probeOffline(nodes: List<Node>, report: (String, Int, String) -> Unit): Unit = coroutineScope {
+        val json = JSONArray().apply { nodes.forEach { put(it.raw) } }.toString()
+        val ok = runCatching {
+            Velacore.probeNodes(json, 9000, 12) { id, delay, reason, _ -> report(id, delay, reason) }
+        }
+        if (ok.isSuccess || stopRequested) return@coroutineScope
+        // temporary core unavailable: fall back to TCP reachability
+        val gate = Semaphore(16)
+        nodes.map { n ->
+            async {
+                gate.withPermit {
+                    if (stopRequested) return@withPermit
+                    if (n.isUdp) {
+                        report(n.id, -1, Lang.str(R.string.reason_only_connected))
+                    } else {
+                        val ms = Velacore.tcpPing(n.server, n.port)
+                        report(n.id, ms, if (ms > 0) "" else Lang.str(R.string.reason_unreachable))
+                    }
+                }
+            }
+        }.awaitAll()
+    }
+
+    /**
+     * Checks through the running core (its controller), the way the core does it
+     * for a temporary one: at most 3 checks per server address at a time and 24
+     * in all; an address that failed 3 times without a single answer isn't
+     * waited for again and again.
+     */
+    private suspend fun probeConnected(nodes: List<Node>, report: (String, Int, String) -> Unit): Unit = coroutineScope {
+        class Endpoint {
+            val gate = Semaphore(3)
+            val fails = AtomicInteger(0)
+            val oks = AtomicInteger(0)
+        }
+        val all = Semaphore(24)
+        val endpoints = HashMap<String, Endpoint>()
+        val noAnswer = Lang.str(R.string.reason_no_answer)
+        nodes.map { node ->
+            val ep = endpoints.getOrPut("${node.server}:${node.port}") { Endpoint() }
+            async {
+                ep.gate.withPermit {
+                    all.withPermit {
+                        if (stopRequested) return@withPermit
+                        if (ep.fails.get() >= 3 && ep.oks.get() == 0) {
+                            report(node.id, -1, noAnswer)
+                            return@withPermit
+                        }
+                        val ms = probeThroughCore(node.id, 6000, track = true)
+                        if (ms > 0) ep.oks.incrementAndGet() else if (!stopRequested) ep.fails.incrementAndGet()
+                        report(node.id, ms, if (ms > 0) "" else noAnswer)
+                    }
+                }
+            }
+        }.awaitAll()
     }
 }
