@@ -1,6 +1,7 @@
 package core
 
 import (
+	"container/heap"
 	"context"
 	"encoding/json"
 	"errors"
@@ -73,73 +74,15 @@ func StartBox(config string, logPath string) (*box.Box, context.CancelFunc, erro
 }
 
 // ProbeNodes makes a real request through every node and reports each result
-// through onResult as soon as it is known. When instance is nil, a temporary
-// core without any inbounds is started, so this works while disconnected.
+// through onResult as soon as it is known; onResult may be called from
+// several goroutines at once, never after ProbeNodes returns. When ctx is
+// cancelled the servers not checked yet get no result. When instance is nil,
+// a temporary core without any inbounds is started, so this works while
+// disconnected; servers the running instance doesn't have (added after it
+// started, left out by the settings) are checked with a temporary core too.
 func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout time.Duration, parallel int, onResult func(ProbeResult)) error {
 	if len(nodes) == 0 {
 		return nil
-	}
-	// servers the core refused to create: reported without a check
-	rejected := map[string]error{}
-	if instance == nil {
-		var outbounds []map[string]any
-		seen := map[string]bool{}
-		for _, n := range nodes {
-			if n.Link != "" {
-				if fresh, err := ParseLink(n.Link); err == nil {
-					n.Outbound = fresh.Outbound
-				}
-			}
-			tag := NodeTag(n)
-			if n.Outbound == nil || seen[tag] {
-				continue // duplicate tags would fail the whole core
-			}
-			seen[tag] = true
-			ob := map[string]any{}
-			for k, v := range n.Outbound {
-				ob[k] = v
-			}
-			ob["tag"] = tag
-			outbounds = append(outbounds, ob)
-		}
-		probe, cancel, err := startProbeBox(outbounds)
-		if err != nil {
-			// one broken server must not fail all checks: find the ones the
-			// core rejects by halving the list, report them, check the rest
-			var good []map[string]any
-			var split func(list []map[string]any)
-			split = func(list []map[string]any) {
-				if len(list) == 0 || ctx.Err() != nil {
-					return
-				}
-				part, partCancel, partErr := startProbeBox(list)
-				if partErr == nil {
-					part.Close()
-					partCancel()
-					good = append(good, list...)
-					return
-				}
-				if len(list) == 1 {
-					rejected[list[0]["tag"].(string)] = partErr
-					return
-				}
-				split(list[:len(list)/2])
-				split(list[len(list)/2:])
-			}
-			split(outbounds)
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			probe, cancel, err = startProbeBox(good)
-			if err != nil {
-				return err
-			}
-		}
-		defer func() {
-			probe.Close()
-			cancel()
-		}()
-		instance = probe
 	}
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -147,56 +90,164 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 	if parallel <= 0 {
 		parallel = 8
 	}
-	return probeScheduled(ctx, instance, nodes, rejected, timeout, parallel, onResult)
+	// links are read once more, so parser fixes apply to saved servers
+	fresh := make([]Node, len(nodes))
+	for i, n := range nodes {
+		if n.Link != "" {
+			if f, err := ParseLink(n.Link); err == nil {
+				n.Outbound = f.Outbound
+				if f.Server != "" && f.Port > 0 {
+					n.Server, n.Port = f.Server, f.Port
+				}
+			}
+		}
+		fresh[i] = n
+	}
+	if instance == nil {
+		return probeTemporary(ctx, fresh, timeout, parallel, onResult)
+	}
+	var here, missing []Node
+	for _, n := range fresh {
+		if _, ok := instance.Outbound().Outbound(NodeTag(n)); ok || n.Outbound == nil {
+			here = append(here, n)
+		} else {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) == 0 {
+		return probeScheduled(ctx, instance, here, nil, timeout, parallel, onResult)
+	}
+	var wg sync.WaitGroup
+	var tempErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tempErr = probeTemporary(ctx, missing, timeout, parallel, onResult)
+	}()
+	var err error
+	if len(here) > 0 {
+		err = probeScheduled(ctx, instance, here, nil, timeout, parallel, onResult)
+	}
+	wg.Wait()
+	if err == nil {
+		err = tempErr
+	}
+	return err
+}
+
+// probeTemporary checks nodes with a core started just for that.
+func probeTemporary(ctx context.Context, nodes []Node, timeout time.Duration, parallel int, onResult func(ProbeResult)) error {
+	// servers the core refused to create: reported without a check
+	rejected := map[string]error{}
+	var outbounds []map[string]any
+	seen := map[string]bool{}
+	for _, n := range nodes {
+		tag := NodeTag(n)
+		if n.Outbound == nil || seen[tag] {
+			continue // duplicate tags would fail the whole core
+		}
+		seen[tag] = true
+		ob := map[string]any{}
+		for k, v := range n.Outbound {
+			ob[k] = v
+		}
+		ob["tag"] = tag
+		outbounds = append(outbounds, ob)
+	}
+	probe, cancel, err := startProbeBox(outbounds)
+	if err != nil {
+		// one broken server must not fail all checks: find the ones the
+		// core rejects by halving the list, report them, check the rest
+		var good []map[string]any
+		var split func(list []map[string]any)
+		split = func(list []map[string]any) {
+			if len(list) == 0 || ctx.Err() != nil {
+				return
+			}
+			part, partCancel, partErr := startProbeBox(list)
+			if partErr == nil {
+				part.Close()
+				partCancel()
+				good = append(good, list...)
+				return
+			}
+			if len(list) == 1 {
+				rejected[list[0]["tag"].(string)] = partErr
+				return
+			}
+			split(list[:len(list)/2])
+			split(list[len(list)/2:])
+		}
+		split(outbounds)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		probe, cancel, err = startProbeBox(good)
+		if err != nil {
+			return err
+		}
+	}
+	defer func() {
+		probe.Close()
+		cancel()
+	}()
+	return probeScheduled(ctx, probe, nodes, rejected, timeout, parallel, onResult)
 }
 
 // Probe scheduling. Checking hundreds of servers used to take many minutes:
 // a dead host with 100 entries cost 100 timeouts, and every failure was
 // retried slowly. Now:
 //  1. identical servers are checked once;
-//  2. every TCP endpoint (host:port) gets a quick connect check first, so
-//     closed or unreachable servers fail in about two seconds;
-//  3. real checks run with a short timeout, at most probePerHost at a time
-//     per host; after probeGiveUp timeouts without a single success the rest
-//     of an endpoint's entries are not tested one by one;
-//  4. only failures that look like overload (timeouts, dropped connections)
-//     get a second attempt, one entry per silent endpoint; if that one works
-//     the others are checked too.
+//  2. every TCP endpoint (host:port) gets a quick connect check, so closed
+//     or unreachable servers fail in about three seconds (a lost SYN gets a
+//     second connect attempt, so a working server is not hidden). Real
+//     checks of an endpoint start as soon as it answered: the servers that
+//     answer first (usually the nearest) are checked first;
+//  3. real checks run with a short timeout, a few at a time per backend
+//     (host:port plus SNI, Host header and path: behind one CDN address
+//     there are many unrelated servers) and per host; after probeGiveUp
+//     timeouts of a backend without a single success its other entries
+//     (differing only in keys/passwords) are not tested one by one;
+//  4. a second attempt with the whole timeout goes to failures on backends
+//     that work for other entries (overload) and to one entry of a backend
+//     that dropped connections at once (EOF, reset); if that one works the
+//     others are checked too. A connected but silent server is not retried:
+//     the first attempt already waited for it long enough.
 const (
-	probePerHost      = 3
+	probePerBackend   = 3
+	probePerHost      = 8
 	probeGiveUp       = 3
-	probeDialTimeout  = 2500 * time.Millisecond
+	probeDialTimeout  = 3 * time.Second
+	probeRedial       = time.Second
 	probeFirstTimeout = 6 * time.Second
+	probeDialParallel = 128
 )
 
 type probeItem struct {
 	node     Node // representative of identical servers
 	ids      []string
 	endpoint string // host:port for the connect check, "" for UDP-based servers
+	group    string // backend: endpoint (or host) plus what selects a server behind it
 	result   ProbeResult
 	tested   bool // a real check ran (not given up)
 	done     bool // final result reported
 }
 
+// endpointCheck is the connect check of one host:port.
+type endpointCheck struct {
+	done chan struct{} // closed when err and rtt are set
+	err  string        // "" when the endpoint accepted a connection
+	rtt  time.Duration // how long the connect took
+}
+
 func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, rejected map[string]error,
 	timeout time.Duration, parallel int, onResult func(ProbeResult)) error {
-	firstTimeout := min(timeout, probeFirstTimeout)
-	workers := parallel
-	if len(nodes) > 40 {
-		workers = max(workers, 24)
-	}
-
 	// 1. identical servers
 	var items []*probeItem
 	byKey := map[string]*probeItem{}
 	for _, n := range nodes {
 		ob := n.Outbound
-		if n.Link != "" {
-			if fresh, err := ParseLink(n.Link); err == nil {
-				ob = fresh.Outbound
-			}
-		}
-		key := n.ID
+		key := "id:" + n.ID
 		if ob != nil {
 			if data, err := json.Marshal(ob); err == nil {
 				key = string(data)
@@ -210,8 +261,29 @@ func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, reject
 		if ob != nil && tcpCheckable(ob) && n.Server != "" && n.Port > 0 {
 			it.endpoint = net.JoinHostPort(n.Server, strconv.Itoa(n.Port))
 		}
+		it.group = firstNonEmpty(it.endpoint, n.Server, n.ID) + "|" + backendSignature(ob)
 		byKey[key] = it
 		items = append(items, it)
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	items = interleave(items)
+	groupSize := map[string]int{}
+	for _, it := range items {
+		groupSize[it.group]++
+	}
+	// a single server is checked once with the whole timeout (a second
+	// attempt only after a quick failure such as a dropped connection)
+	firstTimeout := min(timeout, probeFirstTimeout)
+	if len(items) == 1 {
+		firstTimeout = timeout
+	}
+	// dead servers take the whole timeout: many checks run at once, the
+	// limits per backend and per host keep single servers from overload
+	active := parallel
+	if len(items) > 40 {
+		active = max(active, 64)
 	}
 
 	var mu sync.Mutex
@@ -231,97 +303,107 @@ func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, reject
 		}
 	}
 	stopped := func() bool { return ctx.Err() != nil }
+	deadResult := func(msg string) ProbeResult {
+		reason := ExplainError(msg)
+		if strings.HasPrefix(msg, "connect timeout") {
+			reason = T("сервер недоступен из этой сети")
+		}
+		return ProbeResult{Error: msg, Reason: reason}
+	}
 
-	// 2. quick connect check per endpoint
-	direct, hasDirect := instance.Outbound().Outbound(TagDirect)
-	if hasDirect {
-		endpoints := map[string]bool{}
+	// 2. connect checks, in the background: each endpoint's servers are
+	// checked as soon as it answered
+	checks := map[string]*endpointCheck{}
+	var endpoints []string
+	reachDone := make(chan struct{})
+	reachable := true
+	var bg sync.WaitGroup
+	defer bg.Wait() // nothing keeps running after the return
+	if _, ok := instance.Outbound().Outbound(TagDirect); ok {
 		for _, it := range items {
-			if it.endpoint != "" {
-				endpoints[it.endpoint] = true
-			}
-		}
-		dead := map[string]string{}
-		var deadMu sync.Mutex
-		sem := make(chan struct{}, 48)
-		var wg sync.WaitGroup
-		for ep := range endpoints {
-			if stopped() {
-				break
-			}
-			sem <- struct{}{}
-			wg.Add(1)
-			go func(ep string) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				host, portStr, _ := net.SplitHostPort(ep)
-				port, _ := strconv.Atoi(portStr)
-				dctx, cancel := context.WithTimeout(ctx, probeDialTimeout)
-				defer cancel()
-				conn, err := direct.DialContext(dctx, N.NetworkTCP, M.ParseSocksaddrHostPort(host, uint16(port)))
-				if err == nil {
-					conn.Close()
-					return
-				}
-				if stopped() {
-					return
-				}
-				msg := err.Error()
-				if errors.Is(dctx.Err(), context.DeadlineExceeded) {
-					msg = "connect timeout: " + msg
-				}
-				deadMu.Lock()
-				dead[ep] = msg
-				deadMu.Unlock()
-			}(ep)
-		}
-		wg.Wait()
-		if stopped() {
-			return ctx.Err()
-		}
-		for _, it := range items {
-			if msg, ok := dead[it.endpoint]; ok && it.endpoint != "" {
-				reason := ExplainError(msg)
-				if strings.HasPrefix(msg, "connect timeout") {
-					reason = T("сервер недоступен из этой сети")
-				}
-				finish(it, ProbeResult{Error: msg, Reason: reason})
+			if it.endpoint != "" && checks[it.endpoint] == nil {
+				checks[it.endpoint] = &endpointCheck{done: make(chan struct{})}
+				endpoints = append(endpoints, it.endpoint)
 			}
 		}
 	}
+	if len(endpoints) > 0 {
+		direct, _ := instance.Outbound().Outbound(TagDirect)
+		// meanwhile: is there internet at all? (dead servers are reported
+		// once this is known)
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			reachable = dialerReachable(ctx, direct)
+			close(reachDone)
+		}()
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			sem := make(chan struct{}, probeDialParallel)
+			var wg sync.WaitGroup
+			for _, ep := range endpoints {
+				c := checks[ep]
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					c.err = "context canceled"
+					close(c.done)
+					continue
+				}
+				wg.Add(1)
+				go func(ep string, c *endpointCheck) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					host, portStr, _ := net.SplitHostPort(ep)
+					port, _ := strconv.Atoi(portStr)
+					// a name that didn't resolve (maybe a resolver hit by
+					// the burst of lookups) is left to the real check
+					start := time.Now()
+					if err := dialCheck(ctx, direct, M.ParseSocksaddrHostPort(host, uint16(port))); err != nil && !dnsError(err.Error()) {
+						c.err = err.Error()
+					}
+					c.rtt = time.Since(start)
+					close(c.done)
+				}(ep, c)
+			}
+			wg.Wait()
+		}()
+	} else {
+		close(reachDone)
+	}
 
-	// per-host limit and per-endpoint statistics
-	hostSem := map[string]chan struct{}{}
-	type epStat struct{ timeouts, ok int }
-	stats := map[string]*epStat{}
-	gate := func(host string, size int) chan struct{} {
+	// per-backend and per-host limits, per-backend statistics
+	gates := map[string]chan struct{}{}
+	type groupStat struct{ timeouts, ok, inflight int }
+	stats := map[string]*groupStat{}
+	gate := func(key string, size int) chan struct{} {
 		mu.Lock()
 		defer mu.Unlock()
-		k := fmt.Sprintf("%s#%d", host, size)
-		g := hostSem[k]
+		k := fmt.Sprintf("%s#%d", key, size)
+		g := gates[k]
 		if g == nil {
 			g = make(chan struct{}, size)
-			hostSem[k] = g
+			gates[k] = g
 		}
 		return g
 	}
-	stat := func(ep string) *epStat {
-		st := stats[ep]
+	stat := func(group string) *groupStat {
+		st := stats[group]
 		if st == nil {
-			st = &epStat{}
-			stats[ep] = st
+			st = &groupStat{}
+			stats[group] = st
 		}
 		return st
 	}
-	epKey := func(it *probeItem) string {
-		if it.endpoint != "" {
-			return it.endpoint
-		}
-		return it.node.Server
-	}
 
-	test := func(it *probeItem, limit time.Duration) ProbeResult {
-		res := ProbeResult{}
+	test := func(it *probeItem, limit time.Duration) (res ProbeResult) {
+		defer func() {
+			// a panic in a protocol implementation must not take the app down
+			if r := recover(); r != nil {
+				res = ProbeResult{Error: fmt.Sprint("internal error: ", r), Reason: T("ошибка соединения")}
+			}
+		}()
 		if err := rejected[NodeTag(it.node)]; err != nil {
 			res.Error = err.Error()
 			res.Reason = T("сервер не удалось разобрать")
@@ -334,7 +416,7 @@ func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, reject
 			return res
 		}
 		tctx, cancel := context.WithTimeout(ctx, limit)
-		delay, err := urltest.URLTest(tctx, TestURL, outbound)
+		delay, err := urltest.URLTest(tctx, TestURL, boundedDialer{outbound})
 		timedOut := errors.Is(tctx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err != nil {
@@ -349,45 +431,97 @@ func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, reject
 		return res
 	}
 
-	// run checks items with the given limits; decide is called with each
-	// result and may report it
-	run := func(list []*probeItem, workers, perHost int, limit time.Duration, giveUp bool, decide func(*probeItem, ProbeResult)) {
-		sem := make(chan struct{}, workers)
+	// run checks items, at most active at a time; before (optional) runs
+	// first and may settle an item; decide is called with each result and
+	// may report it. Items waiting for their turn don't take a slot.
+	run := func(list []*probeItem, active, perBackend, perHost int, limit time.Duration, giveUp bool,
+		before func(*probeItem) bool, decide func(*probeItem, ProbeResult)) {
+		// servers that answered the connect check sooner go first; UDP-based
+		// ones (no connect check) have slots of their own, so a list of
+		// silent ones can't hold back the others
+		tcpSlots := newSlotPool(active)
+		udpSlots := newSlotPool(active)
+		spawn := make(chan struct{}, 4096) // bounds the waiting goroutines
 		var wg sync.WaitGroup
 		for _, it := range list {
 			if stopped() {
 				break
 			}
-			sem <- struct{}{}
+			spawn <- struct{}{}
 			wg.Add(1)
 			go func(it *probeItem) {
 				defer wg.Done()
-				defer func() { <-sem }()
-				g := gate(it.node.Server, perHost)
-				select {
-				case g <- struct{}{}:
-				case <-ctx.Done():
+				defer func() { <-spawn }()
+				if before != nil && !before(it) {
 					return
 				}
-				defer func() { <-g }()
-				ep := epKey(it)
-				if giveUp {
-					mu.Lock()
-					st := stat(ep)
-					silent := st.ok == 0 && st.timeouts >= probeGiveUp
-					mu.Unlock()
-					if silent {
-						return // not tested: decided after the second pass
+				// always in this order (backend, host, slot): no deadlock
+				for _, g := range []chan struct{}{gate("b:"+it.group, perBackend), gate("h:"+it.node.Server, perHost)} {
+					select {
+					case g <- struct{}{}:
+						defer func(g chan struct{}) { <-g }(g)
+					case <-ctx.Done():
+						return
 					}
 				}
+				counted := false
+				for giveUp {
+					mu.Lock()
+					st := stat(it.group)
+					if st.ok == 0 && st.timeouts >= probeGiveUp {
+						mu.Unlock()
+						return // not tested: decided after the second pass
+					}
+					// a backend that timed out and never answered: wait for
+					// the checks under way before starting another one
+					if st.ok > 0 || st.timeouts == 0 || st.inflight == 0 {
+						st.inflight++
+						counted = true
+						mu.Unlock()
+						break
+					}
+					mu.Unlock()
+					select {
+					case <-time.After(50 * time.Millisecond):
+					case <-ctx.Done():
+						return
+					}
+				}
+				release := func() {
+					if counted {
+						mu.Lock()
+						stat(it.group).inflight--
+						mu.Unlock()
+					}
+				}
+				pool, prio := udpSlots, time.Duration(0)
+				if c := checks[it.endpoint]; c != nil {
+					pool = tcpSlots
+					select {
+					case <-c.done:
+						prio = c.rtt
+					default:
+					}
+				} else if it.endpoint != "" {
+					pool = tcpSlots
+				}
+				if !pool.acquire(ctx, prio) {
+					release()
+					return
+				}
 				r := test(it, limit)
+				pool.release()
+				mu.Lock()
+				if counted {
+					stat(it.group).inflight--
+				}
 				if stopped() && r.Delay == 0 {
+					mu.Unlock()
 					return // stopped by the user: not a server failure
 				}
-				mu.Lock()
 				it.tested = true
 				it.result = r
-				st := stat(ep)
+				st := stat(it.group)
 				if r.Delay > 0 {
 					st.ok++
 				} else if transientError(r.Error) {
@@ -401,39 +535,86 @@ func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, reject
 	}
 
 	// 3. first pass
-	var pending []*probeItem
-	for _, it := range items {
-		if !it.done {
-			pending = append(pending, it)
+	waitEndpoint := func(it *probeItem) bool {
+		c := checks[it.endpoint]
+		if c == nil {
+			return true
 		}
+		select {
+		case <-c.done:
+		case <-ctx.Done():
+			return false
+		}
+		if c.err == "" {
+			return true
+		}
+		select {
+		case <-reachDone:
+		case <-ctx.Done():
+			return false
+		}
+		if reachable && !stopped() {
+			finish(it, deadResult(c.err))
+		}
+		return false // without internet: decided after this pass
 	}
-	run(pending, workers, probePerHost, firstTimeout, true, func(it *probeItem, r ProbeResult) {
-		if r.Delay > 0 || !transientError(r.Error) {
+	run(items, active, probePerBackend, probePerHost, firstTimeout, true, waitEndpoint, func(it *probeItem, r ProbeResult) {
+		// a silent server alone on its backend gets no second attempt
+		// (step 4): its result is final right away
+		if r.Delay > 0 || !transientError(r.Error) || groupSize[it.group] == 1 && timeoutError(r.Error) {
 			finish(it, r)
 		}
 	})
+	bg.Wait()
 	if stopped() {
 		return ctx.Err()
+	}
+	if !reachable {
+		// the well-known addresses didn't answer either: when no server
+		// accepted a connection, there is no internet at all
+		dead := 0
+		for _, ep := range endpoints {
+			if checks[ep].err != "" {
+				dead++
+			}
+		}
+		offline := len(endpoints) >= 2 && dead == len(endpoints)
+		for _, it := range items {
+			if c := checks[it.endpoint]; c != nil && c.err != "" {
+				if offline {
+					finish(it, ProbeResult{Error: "network is unreachable", Reason: T("нет подключения к интернету")})
+				} else {
+					finish(it, deadResult(c.err))
+				}
+			}
+		}
 	}
 
 	// 4. second pass: overload-looking failures
 	mu.Lock()
-	byEp := map[string][]*probeItem{}
+	byGroup := map[string][]*probeItem{}
+	var groups []string // in list order
 	for _, it := range items {
 		if !it.done {
-			byEp[epKey(it)] = append(byEp[epKey(it)], it)
+			if byGroup[it.group] == nil {
+				groups = append(groups, it.group)
+			}
+			byGroup[it.group] = append(byGroup[it.group], it)
 		}
 	}
 	var retry, later []*probeItem
-	for ep, list := range byEp {
-		if stats[ep] != nil && stats[ep].ok > 0 {
-			retry = append(retry, list...) // the host works: these were unlucky
+	for _, group := range groups {
+		list := byGroup[group]
+		if st := stats[group]; st != nil && st.ok > 0 {
+			retry = append(retry, list...) // the backend works: these were unlucky
 			continue
 		}
-		// a silent endpoint: one more try for one of its entries
-		rep := 0
+		// a backend that never answered: running into the whole limit is
+		// final (the connect worked, the server is silent: blocked or dead),
+		// a quick drop (EOF, reset) gets one more try for one entry
+		rep := -1
 		for i, it := range list {
-			if it.tested {
+			if it.tested && !timeoutError(it.result.Error) {
 				rep = i
 				break
 			}
@@ -447,35 +628,35 @@ func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, reject
 		}
 	}
 	mu.Unlock()
-	run(retry, 12, 2, timeout, false, func(it *probeItem, r ProbeResult) {
+	run(retry, 24, probePerBackend, probePerHost/2, timeout, false, nil, func(it *probeItem, r ProbeResult) {
 		finish(it, r)
 	})
 	if stopped() {
 		return ctx.Err()
 	}
 
-	// 5. entries of endpoints that answered the second attempt
+	// 5. entries of backends that answered the second attempt
 	var third []*probeItem
 	mu.Lock()
 	for _, it := range later {
-		if st := stats[epKey(it)]; st != nil && st.ok > 0 {
+		if st := stats[it.group]; st != nil && st.ok > 0 {
 			third = append(third, it)
 		}
 	}
 	mu.Unlock()
-	run(third, 12, 2, firstTimeout, false, func(it *probeItem, r ProbeResult) {
+	run(third, 24, probePerBackend, probePerHost/2, firstTimeout, false, nil, func(it *probeItem, r ProbeResult) {
 		finish(it, r)
 	})
 	if stopped() {
 		return ctx.Err()
 	}
-	// everything else on silent endpoints fails like its tested neighbours
+	// everything else on silent backends fails like its tested neighbours
 	mu.Lock()
 	failed := map[string]ProbeResult{}
 	for _, it := range items {
 		if it.done || it.tested {
 			if it.result.Delay == 0 && it.result.Error != "" {
-				failed[epKey(it)] = it.result
+				failed[it.group] = it.result
 			}
 		}
 	}
@@ -489,7 +670,7 @@ func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, reject
 	for _, it := range rest {
 		r := it.result
 		if !it.tested || r.Error == "" {
-			r = failed[epKey(it)]
+			r = failed[it.group]
 		}
 		if r.Error == "" {
 			r = ProbeResult{Error: "timeout", Reason: ExplainError("timeout")}
@@ -497,6 +678,313 @@ func probeScheduled(ctx context.Context, instance *box.Box, nodes []Node, reject
 		finish(it, r)
 	}
 	return ctx.Err()
+}
+
+// slotPool hands out a fixed number of slots, to the waiter with the lowest
+// priority value first (in arrival order among equals).
+type slotPool struct {
+	mu      sync.Mutex
+	free    int
+	seq     int
+	waiters slotWaiters
+}
+
+type slotWaiter struct {
+	prio    time.Duration
+	seq     int
+	index   int
+	granted bool
+	ready   chan struct{}
+}
+
+type slotWaiters []*slotWaiter
+
+func (w slotWaiters) Len() int { return len(w) }
+func (w slotWaiters) Less(i, j int) bool {
+	return w[i].prio < w[j].prio || w[i].prio == w[j].prio && w[i].seq < w[j].seq
+}
+func (w slotWaiters) Swap(i, j int) {
+	w[i], w[j] = w[j], w[i]
+	w[i].index, w[j].index = i, j
+}
+func (w *slotWaiters) Push(x any) {
+	sw := x.(*slotWaiter)
+	sw.index = len(*w)
+	*w = append(*w, sw)
+}
+func (w *slotWaiters) Pop() any {
+	old := *w
+	sw := old[len(old)-1]
+	*w = old[:len(old)-1]
+	return sw
+}
+
+func newSlotPool(size int) *slotPool { return &slotPool{free: size} }
+
+// acquire waits for a slot; false when ctx ended first.
+func (p *slotPool) acquire(ctx context.Context, prio time.Duration) bool {
+	p.mu.Lock()
+	if p.free > 0 && len(p.waiters) == 0 {
+		p.free--
+		p.mu.Unlock()
+		return true
+	}
+	p.seq++
+	w := &slotWaiter{prio: prio, seq: p.seq, ready: make(chan struct{})}
+	heap.Push(&p.waiters, w)
+	p.mu.Unlock()
+	select {
+	case <-w.ready:
+		return true
+	case <-ctx.Done():
+		p.mu.Lock()
+		granted := w.granted
+		if !granted {
+			heap.Remove(&p.waiters, w.index)
+		}
+		p.mu.Unlock()
+		if granted {
+			p.release() // handed over just now: pass it on
+		}
+		return false
+	}
+}
+
+func (p *slotPool) release() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.waiters) > 0 {
+		w := heap.Pop(&p.waiters).(*slotWaiter)
+		w.granted = true
+		close(w.ready)
+		return
+	}
+	p.free++
+}
+
+// boundedDialer returns from DialContext when ctx ends even if the
+// outbound doesn't watch it: a WebSocket, gRPC or TLS handshake with a
+// server that accepted the connection and went silent (typical for blocked
+// servers) would wait for its own 15-second timeout. The late connection
+// is closed.
+type boundedDialer struct{ N.Dialer }
+
+func (d boundedDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		conn, err := d.Dialer.DialContext(ctx, network, destination)
+		done <- result{conn, err}
+	}()
+	select {
+	case r := <-done:
+		return r.conn, r.err
+	case <-ctx.Done():
+		go func() {
+			if r := <-done; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
+// Upstream lets sing-box see the outbound (multiplex settings).
+func (d boundedDialer) Upstream() any { return d.Dialer }
+
+// interleave orders items so that consecutive ones belong to different
+// backends: lists grouped by server would otherwise keep all workers
+// waiting for the limit of one backend.
+func interleave(items []*probeItem) []*probeItem {
+	byGroup := map[string][]*probeItem{}
+	var groups []string
+	for _, it := range items {
+		if byGroup[it.group] == nil {
+			groups = append(groups, it.group)
+		}
+		byGroup[it.group] = append(byGroup[it.group], it)
+	}
+	out := make([]*probeItem, 0, len(items))
+	for round := 0; len(out) < len(items); round++ {
+		for _, g := range groups {
+			if list := byGroup[g]; round < len(list) {
+				out = append(out, list[round])
+			}
+		}
+	}
+	return out
+}
+
+// dialCheck opens (and closes) a TCP connection. A second attempt starts
+// after probeRedial if the first one hasn't finished: a lost SYN is only
+// retransmitted after a second or three, which would look like a dead host.
+func dialCheck(ctx context.Context, dialer N.Dialer, dest M.Socksaddr) error {
+	dctx, cancel := context.WithTimeout(ctx, probeDialTimeout)
+	defer cancel()
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan result, 2)
+	dial := func() {
+		conn, err := dialer.DialContext(dctx, N.NetworkTCP, dest)
+		results <- result{conn, err}
+	}
+	go dial()
+	started, got := 1, 0
+	timer := time.NewTimer(probeRedial)
+	defer timer.Stop()
+	defer func() {
+		// an attempt still under way ends with dctx; close what it opens
+		if pending := started - got; pending > 0 {
+			go func() {
+				for i := 0; i < pending; i++ {
+					if r := <-results; r.conn != nil {
+						r.conn.Close()
+					}
+				}
+			}()
+		}
+	}()
+	var firstErr error
+	for got < started {
+		select {
+		case <-timer.C:
+			if started == 1 && got == 0 {
+				started++
+				go dial()
+			}
+		case r := <-results:
+			got++
+			if r.err == nil {
+				r.conn.Close()
+				return nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			if dctx.Err() == nil {
+				if !transientError(r.err.Error()) {
+					return r.err // refused, no such host: no second try
+				}
+				if started == 1 {
+					started++ // dropped at once: try again right away
+					go dial()
+				}
+			}
+		}
+	}
+	if errors.Is(dctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("connect timeout: %w", firstErr)
+	}
+	return firstErr
+}
+
+// reachabilityTargets are well-known addresses (no DNS needed) that answer
+// TCP connects from almost anywhere.
+var reachabilityTargets = []string{"77.88.8.8:53", "1.1.1.1:443", "8.8.8.8:443", "9.9.9.9:443"}
+
+// dialerReachable reports whether any well-known address accepts a TCP
+// connection through the dialer.
+func dialerReachable(ctx context.Context, dialer N.Dialer) bool {
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	ok := make(chan bool, len(reachabilityTargets))
+	for _, target := range reachabilityTargets {
+		go func(target string) {
+			conn, err := dialer.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr(target))
+			if err == nil {
+				conn.Close()
+			}
+			ok <- err == nil
+		}(target)
+	}
+	for range reachabilityTargets {
+		if <-ok {
+			return true
+		}
+	}
+	return false
+}
+
+// NetworkReachable reports whether the internet works without the VPN: a
+// TCP connect to well-known addresses through the "direct" outbound of the
+// running core (instance), or of this process when instance is nil. Apps
+// use it to tell a dead server from a dead network.
+func NetworkReachable(ctx context.Context, instance *box.Box) bool {
+	if instance != nil {
+		if direct, ok := instance.Outbound().Outbound(TagDirect); ok {
+			return dialerReachable(ctx, direct)
+		}
+	}
+	return dialerReachable(ctx, systemDialer{})
+}
+
+type systemDialer struct{}
+
+func (systemDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, network, destination.String())
+}
+
+func (systemDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	var lc net.ListenConfig
+	return lc.ListenPacket(ctx, "udp", "")
+}
+
+// credentialKeys are settings that differ between users of one server.
+var credentialKeys = map[string]bool{
+	"uuid": true, "password": true, "id": true, "users": true, "username": true, "user": true,
+	"alter_id": true, "alterId": true, "flow": true, "email": true, "level": true, "auth": true, "auth_str": true,
+}
+
+// backendSignature describes a server without its credentials: entries
+// with the same signature on one address are the same server for different
+// users, entries with another SNI, Host header or path may be other servers.
+func backendSignature(ob map[string]any) string {
+	if ob == nil {
+		return ""
+	}
+	data, err := json.Marshal(withoutCredentials(ob))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func withoutCredentials(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			if !credentialKeys[k] {
+				out[k] = withoutCredentials(val)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = withoutCredentials(val)
+		}
+		return out
+	}
+	return v
+}
+
+// dnsError reports a failed name lookup.
+func dnsError(e string) bool {
+	s := strings.ToLower(e)
+	return strings.Contains(s, "no such host") || strings.Contains(s, "lookup ") || strings.Contains(s, "dns")
+}
+
+// timeoutError reports a check that ran into its time limit.
+func timeoutError(e string) bool {
+	s := strings.ToLower(e)
+	return strings.Contains(s, "timeout") || strings.Contains(s, "deadline exceeded")
 }
 
 // transientError tells failures that may pass on a second try (overloaded
@@ -513,13 +1001,22 @@ func transientError(e string) bool {
 	return false
 }
 
-// tcpCheckable reports whether a server is reached over TCP, so a plain
-// connect to its port says whether it is up at all.
+// tcpCheckable reports whether a server is reached over TCP directly, so a
+// plain connect to its address and port says whether it is up at all.
+// Servers reached through another server (detour, Xray dialerProxy) are
+// not: their own address may be closed to everyone but the relay.
 func tcpCheckable(ob map[string]any) bool {
 	typ, _ := ob["type"].(string)
+	if d, _ := ob["detour"].(string); d != "" {
+		return false
+	}
 	switch typ {
 	case "hysteria", "hysteria2", "tuic", "wireguard":
 		return false
+	case "naive":
+		if q, _ := ob["quic"].(bool); q {
+			return false
+		}
 	case EngineXray:
 		outs, _ := ob["outbounds"].([]any)
 		if len(outs) == 0 {
@@ -529,9 +1026,17 @@ func tcpCheckable(ob map[string]any) bool {
 		if p, _ := first["protocol"].(string); p == "hysteria" || p == "wireguard" {
 			return false
 		}
+		if ps, _ := first["proxySettings"].(map[string]any); ps != nil {
+			return false
+		}
 		ss, _ := first["streamSettings"].(map[string]any)
+		if so, _ := ss["sockopt"].(map[string]any); so != nil {
+			if d, _ := so["dialerProxy"].(string); d != "" {
+				return false
+			}
+		}
 		network, _ := ss["network"].(string)
-		if network == "kcp" || network == "mkcp" || network == "quic" {
+		if network == "kcp" || network == "mkcp" || network == "quic" || network == "hysteria" {
 			return false
 		}
 		if network == "xhttp" || network == "splithttp" {
@@ -546,6 +1051,9 @@ func tcpCheckable(ob map[string]any) bool {
 		return true
 	}
 	if tr, ok := ob["transport"].(map[string]any); ok && tr["type"] == "quic" {
+		return false
+	}
+	if opts, _ := ob["plugin_opts"].(string); strings.Contains(opts, "mode=quic") {
 		return false
 	}
 	return true
@@ -645,7 +1153,7 @@ func ProbeTag(ctx context.Context, instance *box.Box, tag string, timeout time.D
 	}
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	delay, err := urltest.URLTest(tctx, TestURL, outbound)
+	delay, err := urltest.URLTest(tctx, TestURL, boundedDialer{outbound})
 	if err != nil {
 		return 0, err
 	}
