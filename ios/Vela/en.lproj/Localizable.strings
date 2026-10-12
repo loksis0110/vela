@@ -10,6 +10,7 @@
 "DNS через VPN" = "DNS through VPN";
 "QR из фото" = "QR from photo";
 "VPN не подключён" = "VPN is not connected";
+"VPN отключился: %@" = "VPN disconnected: %@";
 "Vela %@. Открытый исходный код под лицензией GPL-3.0. Vela не собирает аналитику и никому не передаёт данные о вашем трафике: статистика хранится только на этом устройстве." = "Vela %@. Open source under the GPL-3.0 license. Vela collects no analytics and shares nothing about your traffic: statistics stay on this device.";
 "Vela подключится сама, когда вы её откроете" = "Vela connects by itself when you open it";
 "Vela хранит серверы, настройки и статистику трафика только на этом устройстве и исключает их из резервных копий. Приложение не собирает аналитику, не показывает рекламу и не отправляет данные о посещаемых сайтах ни нам, ни третьим лицам. Трафик идёт на сервер, который вы добавили сами." = "Vela keeps servers, settings and traffic statistics only on this device and excludes them from backups. The app collects no analytics, shows no ads and sends nothing about the sites you visit to us or to third parties. Traffic goes to the server you added yourself.";
@@ -24,6 +25,7 @@
 "Автовыбор" = "Auto";
 "Автопереключение при сбое" = "Switch on failure";
 "Б" = "B";
+"Без VPN" = "Without VPN";
 "Блокировать" = "Block";
 "Блокировать рекламу" = "Block ads";
 "Буфер обмена пуст" = "The clipboard is empty";
@@ -55,6 +57,7 @@
 "Готово" = "Done";
 "График трафика, пик %@" = "Traffic graph, peak %@";
 "Данные на %@. Свежие цифры появятся, когда VPN будет включён." = "Data as of %@. Fresh numbers appear when the VPN is on.";
+"Действие" = "Action";
 "Действует до" = "Valid until";
 "Диагностика" = "Diagnostics";
 "Диагностика подключения" = "Connection diagnostics";
@@ -72,6 +75,7 @@
 "Если VPN не подключается, нажмите «Подключить», дождитесь ошибки и откройте этот отчёт. Скопируйте его и пришлите разработчику. Ключей и адресов серверов в нём нет." = "If the VPN doesn't connect, tap “Connect”, wait for the error and open this report. Copy it and send it to the developer. It contains no keys or server addresses.";
 "Если сервер перестал отвечать, Vela сама перейдёт на рабочий" = "If the server stops responding, Vela moves to a working one";
 "Есть совпадения в других подписках:" = "There are matches in other subscriptions:";
+"Ещё" = "More";
 "Журнал доступен, пока VPN подключён." = "The log is available while the VPN is connected.";
 "Журнал запуска:" = "Start log:";
 "Журнал пуст." = "The log is empty.";

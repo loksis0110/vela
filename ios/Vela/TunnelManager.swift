@@ -132,6 +132,8 @@ final class TunnelManager: ObservableObject {
                 startWatchdog(fresh: startedHere)
                 startedHere = false
                 Task {
+                    // settings changed while the tunnel was (re)connecting
+                    if self.reloadPending { await self.reload() }
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
                     await self.refreshIP()
                 }
@@ -147,9 +149,11 @@ final class TunnelManager: ObservableObject {
             if was != .disconnected { ip = nil; ipError = nil }
             if was != .disconnected, !userStopped {
                 // the tunnel stopped by itself: tell the user why
-                Task { await self.explainDisconnect() }
+                Task { await self.explainDisconnect(wasConnected: was == .connected) }
             }
             userStopped = false
+            reloadPending = false
+            appliedConfig = nil
             up = 0; down = 0; total = 0; activeNode = nil
             history = []
             connectionCount = 0
@@ -164,7 +168,7 @@ final class TunnelManager: ObservableObject {
     /// Why the last connection failed (for the diagnostics report).
     @Published private(set) var lastFailure: String?
 
-    private func explainDisconnect() async {
+    private func explainDisconnect(wasConnected: Bool) async {
         guard let m = manager else { return }
         let err: Error? = await withCheckedContinuation { c in
             m.connection.fetchLastDisconnectError { c.resume(returning: $0) }
@@ -180,7 +184,8 @@ final class TunnelManager: ObservableObject {
         }
         guard let text else { return }
         lastFailure = text
-        error = LF("Не удалось подключиться: %@", text)
+        // a working connection that dropped is not "couldn't connect"
+        error = wasConnected ? LF("VPN отключился: %@", text) : LF("Не удалось подключиться: %@", text)
     }
 
     /// Everything useful for finding out why the VPN doesn't work.
@@ -241,11 +246,19 @@ final class TunnelManager: ObservableObject {
     }
 
     private func ensureManager() async throws -> NETunnelProviderManager {
-        let m = manager ?? NETunnelProviderManager()
+        // a fresh copy from iOS: the one in memory may be stale (changed in
+        // Settings, by the widget) or removed, and saving it would fail
+        let all = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
+        let ours = all.filter { ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == Self.tunnelBundleID }
+        let m = ours.first ?? all.first ?? NETunnelProviderManager()
+        // duplicates left by quick double taps in 1.4.0
+        for extra in ours.dropFirst() { try? await extra.removeFromPreferences() }
         let proto = (m.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
         proto.providerBundleIdentifier = Self.tunnelBundleID
         proto.serverAddress = "Vela"
         proto.disconnectOnSleep = false
+        // the widget and the Control Center control read it (no shared App Group)
+        proto.providerConfiguration = ["alwaysOn": Store.shared.state.alwaysOn]
         m.protocolConfiguration = proto
         m.localizedDescription = "Vela"
         m.isEnabled = true
@@ -262,20 +275,46 @@ final class TunnelManager: ObservableObject {
         return m
     }
 
+    /// A start in progress: a second tap must not create a second VPN profile.
+    private var starting = false
+    /// Settings changed while the tunnel was connecting: applied once it's up.
+    private var reloadPending = false
+    /// Hash of the config the running core has, so the same one isn't sent again.
+    private var appliedConfig: Int?
+
     func connect() async {
+        guard !starting else { return }
+        starting = true
+        defer { starting = false }
         error = nil
         notice = nil
         userStopped = false
         startedHere = true
+        reloadPending = false
         do {
+            // checked first: without servers nothing is saved or changed
+            let newPort = Int.random(in: 20000 ... 60000)
+            let newSecret = Store.randomID(16)
+            let config = try Store.shared.buildConfig(port: newPort, secret: newSecret)
             let m = try await ensureManager()
-            port = Int.random(in: 20000 ... 60000)
-            secret = Store.randomID(16)
-            let config = try Store.shared.buildConfig(port: port, secret: secret)
-            try m.connection.startVPNTunnel(options: ["configContent": config as NSString, "lang": Lang.code as NSString])
+            // the extension keeps the config of the last start for On Demand,
+            // so the stored port changes only together with it
+            let oldPort = port, oldSecret = secret
+            port = newPort
+            secret = newSecret
+            do {
+                try m.connection.startVPNTunnel(options: ["configContent": config as NSString, "lang": Lang.code as NSString])
+                appliedConfig = config.hashValue
+            } catch {
+                port = oldPort
+                secret = oldSecret
+                throw error
+            }
         } catch let e as NEVPNError where e.code == .configurationReadWriteFailed {
+            startedHere = false
             error = L("Разрешите Vela добавить конфигурацию VPN")
         } catch {
+            startedHere = false
             self.error = error.localizedDescription
         }
     }
@@ -283,42 +322,81 @@ final class TunnelManager: ObservableObject {
     func disconnect() {
         userStopped = true
         guard let m = manager else { return }
-        if m.isOnDemandEnabled {
-            // otherwise iOS would connect again right away
-            m.isOnDemandEnabled = false
-            Task {
-                try? await m.saveToPreferences()
-                m.connection.stopVPNTunnel()
+        Task {
+            // On Demand (set here, by the widget or in Settings) would connect
+            // again right away; the copy in memory may be stale, so refresh it
+            try? await m.loadFromPreferences()
+            if m.isOnDemandEnabled {
+                m.isOnDemandEnabled = false
+                await Self.save(m)
             }
-        } else {
             m.connection.stopVPNTunnel()
+        }
+    }
+
+    /// Saves a VPN configuration; a stale copy is refreshed and saved again.
+    private static func save(_ m: NETunnelProviderManager) async {
+        do {
+            try await m.saveToPreferences()
+        } catch {
+            let onDemand = m.isOnDemandEnabled
+            try? await m.loadFromPreferences()
+            m.isOnDemandEnabled = onDemand
+            try? await m.saveToPreferences()
         }
     }
 
     /// Applies «Постоянный VPN» to the saved VPN configuration.
     func applyAlwaysOn() async {
         guard let m = manager else { return }
-        let want = Store.shared.state.alwaysOn && state != .disconnected
-        guard m.isOnDemandEnabled != want else { return }
+        try? await m.loadFromPreferences()
+        let always = Store.shared.state.alwaysOn
+        let want = always && state != .disconnected
+        var changed = m.isOnDemandEnabled != want
         m.isOnDemandEnabled = want
-        try? await m.saveToPreferences()
+        // the flag for the widget; the protocol is left alone while the tunnel
+        // runs (iOS may restart it), connect() writes it then
+        if state == .disconnected, let proto = m.protocolConfiguration as? NETunnelProviderProtocol,
+           proto.providerConfiguration?["alwaysOn"] as? Bool != always {
+            proto.providerConfiguration = ["alwaysOn": always]
+            m.protocolConfiguration = proto
+            changed = true
+        }
+        if changed { await Self.save(m) }
     }
 
     /// Applies new settings or another profile without dropping the tunnel.
     func reload() async {
+        if state == .connecting { reloadPending = true }
         guard state == .connected, let session = manager?.connection as? NETunnelProviderSession else { return }
+        reloadPending = false
         do {
             let config = try Store.shared.buildConfig(port: port, secret: secret)
+            // the same config again would only restart the core for nothing
+            guard config.hashValue != appliedConfig else { return }
             try session.sendProviderMessage(Data(config.utf8)) { [weak self] reply in
-                guard let reply, let text = String(data: reply, encoding: .utf8) else { return }
-                Task { @MainActor in self?.error = text }
+                guard let reply, let text = String(data: reply, encoding: .utf8), !text.isEmpty else { return }
+                // the extension went back to the previous config
+                Task { @MainActor in
+                    self?.appliedConfig = nil
+                    self?.error = text
+                }
             }
+            appliedConfig = config.hashValue
         } catch {
             self.error = error.localizedDescription
         }
     }
 
     // MARK: - Controller
+
+    /// One session for the controller: a new URLSession per request (every
+    /// second for the stats) is never freed.
+    private nonisolated static let controllerSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [:]
+        return URLSession(configuration: config)
+    }()
 
     private func request(_ method: String, _ path: String, body: [String: Any]? = nil, timeout: TimeInterval = 8) async -> [String: Any]? {
         guard port != 0, let url = URL(string: "http://127.0.0.1:\(port)\(path)") else { return nil }
@@ -329,9 +407,12 @@ final class TunnelManager: ObservableObject {
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        let config = URLSessionConfiguration.ephemeral
-        config.connectionProxyDictionary = [:]
-        guard let (data, resp) = try? await URLSession(configuration: config).data(for: req),
+        return await Self.fetch(req)
+    }
+
+    /// Off the main thread: /connections can be large with many connections.
+    private nonisolated static func fetch(_ req: URLRequest) async -> [String: Any]? {
+        guard let (data, resp) = try? await controllerSession.data(for: req),
               let http = resp as? HTTPURLResponse, http.statusCode < 300 else { return nil }
         if data.isEmpty { return [:] }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]

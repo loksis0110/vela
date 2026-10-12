@@ -28,11 +28,12 @@ struct HomeView: View {
     @Binding var showServers: Bool
     @Binding var showSettings: Bool
     @Binding var showAdd: Bool
+    // owned by RootView, which closes them before showing an app link offer
+    @Binding var showStats: Bool
+    @Binding var showConnections: Bool
+    @Binding var showDiag: Bool
     /// Text pasted on the clipboard banner.
     let onPaste: (String) -> Void
-    @State private var showDiag = false
-    @State private var showStats = false
-    @State private var showConnections = false
 
     var body: some View {
         ScrollView {
@@ -48,7 +49,7 @@ struct HomeView: View {
                     HStack(spacing: 10) {
                         let ip = ToolText.ip(tunnel.ip, busy: tunnel.ipBusy, error: tunnel.ipError)
                         ToolCard(label: L("Мой IP"), value: ip.0, meta: ip.1, busy: tunnel.ipBusy) { Task { await tunnel.refreshIP() } }
-                        let sp = ToolText.speed(tunnel.speed)
+                        let sp = ToolText.speed(tunnel.speed, viaVPN: tunnel.state == .connected)
                         ToolCard(label: L("Скорость"), value: sp.0, meta: sp.1, busy: tunnel.speed.running) { Task { await tunnel.runSpeedTest() } }
                     }
                     HStack(spacing: 10) {
@@ -87,7 +88,7 @@ struct HomeView: View {
             Button { showSettings = true } label: {
                 Image(systemName: "gearshape").font(.system(size: 20)).foregroundStyle(Palette.muted).frame(width: 44, height: 44)
             }
-            .accessibilityLabel("Настройки")
+            .accessibilityLabel(L("Настройки"))
         }
         .padding(.top, 8)
     }
@@ -152,9 +153,17 @@ struct HomeView: View {
             .sensoryFeedbackIfAvailable(tunnel.state)
 
             Text(statusText.0).font(.system(size: 22, weight: .semibold)).foregroundStyle(statusText.1).padding(.top, 10)
-            TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                Text(subtitle(ctx.date)).font(.subheadline).foregroundStyle(Palette.muted).monospacedDigit()
+            Group {
+                // the clock ticks only while connected
+                if tunnel.state == .connected {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text(subtitle(ctx.date)).font(.subheadline).foregroundStyle(Palette.muted).monospacedDigit()
+                    }
+                } else {
+                    Text(subtitle(Date())).font(.subheadline).foregroundStyle(Palette.muted)
+                }
             }
+            .lineLimit(1).minimumScaleFactor(0.8)
             .frame(height: 20).padding(.top, 4)
             if tunnel.state == .connected {
                 HStack(spacing: 28) {
@@ -274,7 +283,9 @@ struct HomeView: View {
             }
             return ("✦", L("Автовыбор"), LF("%@, серверов: %@", p.displayName, "\(p.nodes.count)"), false)
         }
-        let n = p.nodes.first { $0.id == st.selectedNode }!
+        guard let n = p.nodes.first(where: { $0.id == st.selectedNode }) else {
+            return ("✦", L("Автовыбор"), p.displayName, false)
+        }
         var parts = [n.proto, n.security, p.displayName].filter { !$0.isEmpty }
         if let ms = store.pings[n.id], ms > 0 { parts.append("\(ms) " + L("мс")) }
         return (Fmt.badge(n.name), Fmt.splitFlag(n.name).rest, parts.joined(separator: ", "), n.isXray)
@@ -308,7 +319,7 @@ struct HomeView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(selected ? Palette.star : Palette.text)
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .minimumScaleFactor(0.6)
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 6).padding(.vertical, 11)
                 .background(selected ? Palette.hull : .clear, in: RoundedRectangle(cornerRadius: 18, style: .continuous))

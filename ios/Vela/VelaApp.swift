@@ -50,6 +50,9 @@ struct RootView: View {
     @State private var showServers = false
     @State private var showSettings = false
     @State private var showAdd = false
+    @State private var showStats = false
+    @State private var showConnections = false
+    @State private var showDiag = false
     @State private var addText = ""
     @State private var toast: String?
     @State private var toastID = UUID()
@@ -59,7 +62,8 @@ struct RootView: View {
     @State private var alertText: String?
 
     var body: some View {
-        HomeView(showServers: $showServers, showSettings: $showSettings, showAdd: $showAdd, onPaste: pasted)
+        HomeView(showServers: $showServers, showSettings: $showSettings, showAdd: $showAdd,
+                 showStats: $showStats, showConnections: $showConnections, showDiag: $showDiag, onPaste: pasted)
             .sheet(isPresented: $showServers) {
                 ServersView(showAdd: $showAdd)
                     .sheet(isPresented: $showAdd) { AddSheet(initial: addText, onDone: done) }
@@ -112,16 +116,25 @@ struct RootView: View {
             alertText = L("В ссылке нет подписки или серверов")
             return
         }
-        present(found)
+        guard let fresh = store.newPart(of: found) else {
+            // all of it is already in Vela: the provider's button then just
+            // refreshes the subscription, nothing to confirm
+            add(found)
+            return
+        }
+        present(fresh)
     }
 
     /// Shows the confirmation; sheets are closed first, since an alert
     /// can't appear over them.
     private func present(_ found: ImportOffer) {
-        let covered = showServers || showSettings || showAdd
+        let covered = showServers || showSettings || showAdd || showStats || showConnections || showDiag
         showServers = false
         showSettings = false
         showAdd = false
+        showStats = false
+        showConnections = false
+        showDiag = false
         if covered {
             Task {
                 try? await Task.sleep(nanoseconds: 650_000_000)
@@ -177,7 +190,9 @@ struct RootView: View {
         }
         // subscriptions are refreshed while the app is open, as often as set
         while !Task.isCancelled {
-            await store.refreshDue()
+            // the provider changed the servers of the one in use: the tunnel
+            // gets the new list (an old server may be gone)
+            if await store.refreshDue(), tunnel.state == .connected { await tunnel.reload() }
             try? await Task.sleep(nanoseconds: 10 * 60 * 1_000_000_000)
         }
     }
@@ -254,6 +269,8 @@ struct AddSheet: View {
         }
         .tint(Palette.star)
         .presentationDetents([.medium, .large])
+        // a swipe down mid-import would lose its result message
+        .interactiveDismissDisabled(busy)
         .onAppear { text = initial }
         .fullScreenCover(isPresented: $scanning) {
             QRScannerSheet { code in append(code.trimmingCharacters(in: .whitespacesAndNewlines)) }

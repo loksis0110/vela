@@ -12,8 +12,8 @@ settings:
   base:
     # Put your Apple Developer Team ID here (or pass DEVELOPMENT_TEAM=... to xcodebuild)
     DEVELOPMENT_TEAM: ""
-    MARKETING_VERSION: "1.4.0"
-    CURRENT_PROJECT_VERSION: "9"
+    MARKETING_VERSION: "1.4.1"
+    CURRENT_PROJECT_VERSION: "10"
     SWIFT_VERSION: "5.9"
     APP_GROUP_IDENTIFIER: group.app.vela.client
     ENABLE_BITCODE: NO

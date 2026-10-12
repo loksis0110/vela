@@ -135,6 +135,8 @@ struct ServersView: View {
                         .padding(.horizontal, 14).padding(.vertical, 7)
                         .background(sel ? Palette.hull : .clear, in: Capsule())
                         .overlay(Capsule().stroke(sel ? Palette.line : Palette.hull))
+                        .accessibilityLabel(p.displayName + ", " + LF("Серверов: %@", "\(p.nodes.count)"))
+                        .accessibilityAddTraits(sel ? .isSelected : [])
                 }
                 Button("+ Подписка") { showAdd = true }
                     .font(.system(size: 14))
@@ -173,18 +175,11 @@ struct ServersView: View {
                          color: days < 3 ? Palette.flare : nil)
                 }
             }
-            HStack(spacing: 14) {
-                Button(refreshing ? L("Обновляем…") : L("Обновить")) { Task { await refresh() } }.disabled(refreshing)
-                if store.state.profiles.filter({ $0.kind == "subscription" }).count > 1 {
-                    Button("Все") { Task { await refreshAll() } }.disabled(refreshing)
-                }
-                Button("Имя") { renameText = p.customName ?? p.name; renaming = p }
-                Button("QR") { share(p.name, p.url) }
-                if let url = URL(string: p.supportURL), !p.supportURL.isEmpty {
-                    Button("Поддержка") { openURL(url) }
-                }
-                Spacer()
-                Button("Удалить") { confirmDelete = p }
+            // all buttons in a row when they fit; on narrow screens (iPhone SE,
+            // large text) the rarer ones go into a menu instead of being cut off
+            ViewThatFits(in: .horizontal) {
+                cardActions(p, compact: false)
+                cardActions(p, compact: true)
             }
             .buttonStyle(.borderless)
             .font(.system(size: 14))
@@ -194,6 +189,36 @@ struct ServersView: View {
         .padding(14)
         .background(Palette.deep, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Palette.hull))
+    }
+
+    private func cardActions(_ p: Profile, compact: Bool) -> some View {
+        let support = URL(string: p.supportURL).flatMap { p.supportURL.isEmpty ? nil : $0 }
+        return HStack(spacing: 14) {
+            Button(refreshing ? L("Обновляем…") : L("Обновить")) { Task { await refresh() } }.disabled(refreshing)
+            if store.state.profiles.filter({ $0.kind == "subscription" }).count > 1 {
+                Button("Все") { Task { await refreshAll() } }.disabled(refreshing)
+            }
+            Button("QR") { share(p.name, p.url) }
+            if compact {
+                Spacer(minLength: 0)
+                Menu {
+                    Button { renameText = p.customName ?? p.name; renaming = p } label: { Label("Имя", systemImage: "pencil") }
+                    if let support {
+                        Button { openURL(support) } label: { Label("Поддержка", systemImage: "questionmark.circle") }
+                    }
+                    Button(role: .destructive) { confirmDelete = p } label: { Label("Удалить", systemImage: "trash") }
+                } label: {
+                    Image(systemName: "ellipsis.circle").font(.system(size: 17)).frame(width: 32, height: 28)
+                }
+                .accessibilityLabel(L("Ещё"))
+            } else {
+                Button("Имя") { renameText = p.customName ?? p.name; renaming = p }
+                if let support { Button("Поддержка") { openURL(support) } }
+                Spacer(minLength: 8)
+                Button("Удалить") { confirmDelete = p }
+            }
+        }
+        .lineLimit(1)
     }
 
     private func info(_ label: String, _ value: String, color: Color? = nil) -> some View {
@@ -307,6 +332,12 @@ struct ServersView: View {
 
     private func check() async {
         guard let p = profile else { return }
+        // the running core can't check another subscription (the error would
+        // land on the home screen behind this sheet)
+        if tunnel.state != .disconnected, p.id != store.state.activeProfile {
+            message = L("Чтобы проверить другую подписку, отключитесь")
+            return
+        }
         await tunnel.pingAll(p.id)
         let ok = p.nodes.filter { (store.pings[$0.id] ?? 0) > 0 }.count
         message = LF("Работают %@ из %@", "\(ok)", "\(p.nodes.count)")
