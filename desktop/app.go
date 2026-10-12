@@ -177,6 +177,10 @@ func NewApp(dataDir string) *App {
 		a.state.HWID = randomID() + randomID()
 		a.saveLocked()
 	}
+	if a.state.WasConnected && a.state.Settings.Mode == "proxy" {
+		// the last run ended without disconnecting
+		recoverSystemProxy(a.state.Settings.ProxyPort)
+	}
 	a.applyFetchOptions()
 	return a
 }
@@ -238,13 +242,16 @@ func (a *App) load() {
 		return
 	}
 	var st State
-	if json.Unmarshal(data, &st) == nil {
-		def := core.DefaultSettings()
-		if st.Settings.Mode == "" {
-			st.Settings = def
-		}
-		a.state = st
+	if err := json.Unmarshal(data, &st); err != nil {
+		// unreadable: kept aside so the subscriptions can be recovered by
+		// hand, instead of being overwritten by an empty state
+		os.WriteFile(a.statePath()+".broken", data, 0o600)
+		return
 	}
+	if st.Settings.Mode == "" {
+		st.Settings = core.DefaultSettings()
+	}
+	a.state = st
 }
 
 // saveLocked must be called with a.mu held.
@@ -309,6 +316,9 @@ func (a *App) Snapshot() Snapshot {
 	for i, p := range a.state.Profiles {
 		cp := *p
 		cp.Nodes = append([]core.Node(nil), p.Nodes...)
+		if cp.Kind == "manual" && cp.CustomName == "" {
+			cp.Name = tr("Мои серверы") // follows the language
+		}
 		profiles[i] = &cp
 	}
 	var offer *Offer
@@ -339,7 +349,9 @@ func (a *App) Snapshot() Snapshot {
 // ---------------------------------------------------------------- events
 
 func (a *App) subscribe() chan []byte {
-	ch := make(chan []byte, 16)
+	// room for a burst: a check of hundreds of servers sends an event per
+	// server within moments, and a dropped one would leave a row "measuring"
+	ch := make(chan []byte, 512)
 	a.subsMu.Lock()
 	a.subs[ch] = struct{}{}
 	a.subsMu.Unlock()
@@ -412,7 +424,7 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 
 	subURLs, linksText := core.SplitImport(text)
 	var parts, failures []string
-	var lastProfile string
+	var firstProfile string // becomes active when there is none
 
 	// subscriptions are downloaded in parallel
 	type fetched struct {
@@ -445,7 +457,9 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 		}
 		applySubscription(p, r.sub)
 		a.dedupeNameLocked(p)
-		lastProfile = p.ID
+		if firstProfile == "" {
+			firstProfile = p.ID
+		}
 		a.saveLocked()
 		a.mu.Unlock()
 		if isNew {
@@ -482,7 +496,9 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 				p.Nodes = append(p.Nodes, n)
 				added++
 			}
-			lastProfile = p.ID
+			if firstProfile == "" {
+				firstProfile = p.ID
+			}
 			a.saveLocked()
 			a.mu.Unlock()
 			if added == 0 {
@@ -496,13 +512,13 @@ func (a *App) Import(ctx context.Context, text string) (string, error) {
 		}
 	}
 
-	if lastProfile == "" {
+	if firstProfile == "" {
 		return "", errors.New(strings.Join(failures, "; "))
 	}
 	a.mu.Lock()
 	// the first subscription becomes active; later ones are added alongside
 	if prevActive == "" || a.findProfile(prevActive) == nil {
-		a.state.ActiveProfile = lastProfile
+		a.state.ActiveProfile = firstProfile
 		a.state.SelectedNode = "auto"
 	}
 	a.saveLocked()
@@ -903,7 +919,12 @@ func (a *App) connect() error {
 	}
 	if p == nil || len(p.Nodes) == 0 {
 		a.mu.Unlock()
-		return errors.New(tr("сначала добавьте сервер или подписку"))
+		msg := tr("сначала добавьте сервер или подписку")
+		if p != nil {
+			msg = tr("В подписке нет серверов. Обновите её или выберите другую")
+		}
+		a.setStatus("disconnected", capitalize(msg), "no_servers")
+		return errors.New(msg)
 	}
 	settings := a.state.Settings
 	// warnings and errors only: «info» writes a line per connection (gigabytes a day)
@@ -978,7 +999,8 @@ func (a *App) connect() error {
 		// the kill switch lets the new tunnel through (and drops the old one)
 		if err := a.attachTunnel(); err != nil {
 			a.mu.Lock()
-			a.status.KillSwitchError = tr("Kill switch не нашёл адаптер Vela, интернет может быть заблокирован: ") + err.Error()
+			a.status.KillSwitch = false
+			a.status.KillSwitchError = tr("Kill switch выключен: не удалось найти адаптер Vela. ") + err.Error()
 			a.mu.Unlock()
 		}
 	}
@@ -986,6 +1008,28 @@ func (a *App) connect() error {
 	go a.statsLoop(stop)
 	go a.watchdog(stop)
 	go a.selfCheck(selected)
+	return nil
+}
+
+// wantsConnection reports whether the user is connected or connecting, or
+// tried to and needs admin rights for it.
+func (a *App) wantsConnection() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.intent || a.status.State != "disconnected" || a.status.ErrorCode == "need_admin"
+}
+
+// Toggle connects, or disconnects when the VPN is on, starting, or wanted
+// but down: after a failed connect the kill switch blocks the internet
+// until the user disconnects.
+func (a *App) Toggle() error {
+	a.mu.Lock()
+	off := a.status.State == "disconnected" && !a.status.Blocked
+	a.mu.Unlock()
+	if off {
+		return a.Connect()
+	}
+	a.Disconnect()
 	return nil
 }
 
@@ -1047,6 +1091,13 @@ func (a *App) disconnect() {
 func (a *App) Reconnect() {
 	a.lifecycle.Lock()
 	defer a.lifecycle.Unlock()
+	a.mu.Lock()
+	wanted := a.intent
+	a.mu.Unlock()
+	if !wanted {
+		// the user disconnected while this reconnect was waiting
+		return
+	}
 	a.disconnect()
 	a.connect()
 }
@@ -1075,6 +1126,15 @@ func humanizeError(err error) string {
 
 // ---------------------------------------------------------------- controller
 
+// ctrlClient talks to the local controller of the running core. One shared
+// client: a new transport per call (statsLoop calls every second) leaves a
+// kept-alive connection and two goroutines behind each time.
+var ctrlClient = &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{
+	Proxy:               nil,
+	MaxIdleConnsPerHost: 4,
+	IdleConnTimeout:     30 * time.Second,
+}}
+
 func (a *App) controller(method, path string, body any, out any) error {
 	a.mu.Lock()
 	port, secret := a.ctrlPort, a.ctrlSecret
@@ -1094,12 +1154,13 @@ func (a *App) controller(method, path string, body any, out any) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{Proxy: nil}}
-	resp, err := client.Do(req)
+	resp, err := ctrlClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	// the rest of the body is read so the connection can be reused
+	defer io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("controller: %d", resp.StatusCode)
 	}
@@ -1298,6 +1359,8 @@ func (a *App) Ping(profileID string) {
 	}
 	core.WriteReport(filepath.Join(a.dataDir, "diagnostics.txt"), nodes, results)
 	a.savePings()
+	// the final results in one piece, in case a window missed an event
+	a.pushState()
 }
 
 // FastestFirst returns ids of servers that worked in the last check, best

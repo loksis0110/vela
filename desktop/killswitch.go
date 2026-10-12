@@ -16,8 +16,8 @@ type firewall interface {
 	Active() bool
 }
 
-// killSwitchWanted reports whether the filters must be on. Must be called
-// with a.mu held.
+// killSwitchWantedLocked reports whether the filters must be on. Must be
+// called with a.mu held.
 func (a *App) killSwitchWantedLocked() bool {
 	return a.state.Prefs.KillSwitch && a.state.Settings.Mode == "tun" && a.intent && killSwitchSupported()
 }
@@ -38,7 +38,10 @@ func (a *App) syncKillSwitch() {
 		err = a.fw.Enable(allowLAN)
 		if err == nil && !wasOn && running {
 			// turned on while connected: let the tunnel through at once
-			err = a.attachTunnelLocked()
+			if err = a.attachTunnelLocked(); err != nil {
+				// the filters would block the VPN itself
+				a.fw.Disable()
+			}
 		}
 	} else if wasOn {
 		a.fw.Disable()
@@ -58,13 +61,20 @@ func (a *App) syncKillSwitch() {
 }
 
 // attachTunnel permits the VPN interface of the core that just started.
+// When the adapter can't be found the filters are removed: they would block
+// the VPN itself (its routes still carry the traffic), and a "connected" VPN
+// without internet is worse than a kill switch that is off.
 func (a *App) attachTunnel() error {
 	a.fwMu.Lock()
 	defer a.fwMu.Unlock()
 	if !a.fw.Active() {
 		return nil
 	}
-	return a.attachTunnelLocked()
+	err := a.attachTunnelLocked()
+	if err != nil {
+		a.fw.Disable()
+	}
+	return err
 }
 
 func (a *App) attachTunnelLocked() error {

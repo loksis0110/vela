@@ -6,6 +6,7 @@ struct Constellation: View {
     let state: ConnState
     @State private var drawn: CGFloat = 0
     @State private var spin = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private let stars: [CGPoint] = [
         .init(x: 128, y: 42), .init(x: 128, y: 176), .init(x: 196, y: 160),
@@ -79,10 +80,11 @@ struct Constellation: View {
             .frame(width: 260 * k, height: 260 * k)
         }
         .aspectRatio(1, contentMode: .fit)
-        .onAppear { drawn = active ? 1 : 0; spin = state == .connecting }
+        .onAppear { drawn = active ? 1 : 0; spin = state == .connecting && !reduceMotion }
         .onChange(of: state) { new in
             drawn = (new == .connecting || new == .connected) ? 1 : 0
-            spin = new == .connecting
+            // no endless spinning with «Reduce Motion»
+            spin = new == .connecting && !reduceMotion
         }
         .accessibilityHidden(true)
     }

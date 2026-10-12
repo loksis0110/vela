@@ -269,10 +269,12 @@ func (f *wfpFirewall) Enable(allowLAN bool) error {
 		if allowLAN == (len(f.lanFilters) > 0) {
 			return nil
 		}
-		return f.transaction(func() error {
+		// the ids change only when the transaction is committed
+		var ids []uint64
+		err := f.transaction(func() error {
 			if allowLAN {
-				ids, err := f.permitLAN(12)
-				f.lanFilters = ids
+				var err error
+				ids, err = f.permitLAN(12)
 				return err
 			}
 			for _, id := range f.lanFilters {
@@ -280,9 +282,12 @@ func (f *wfpFirewall) Enable(allowLAN bool) error {
 					return err
 				}
 			}
-			f.lanFilters = nil
 			return nil
 		})
+		if err == nil {
+			f.lanFilters = ids
+		}
+		return err
 	}
 
 	session := uintptr(0)
@@ -356,9 +361,10 @@ func (f *wfpFirewall) SetTunnel(luid uint64) error {
 	if luid == f.tunLUID && len(f.tunFilters) > 0 {
 		return nil
 	}
-	return f.transaction(func() error {
-		ids, err := f.permitInterface(luid, 12)
-		if err != nil {
+	var ids []uint64
+	err := f.transaction(func() error {
+		var err error
+		if ids, err = f.permitInterface(luid, 12); err != nil {
 			return err
 		}
 		for _, id := range f.tunFilters {
@@ -366,9 +372,12 @@ func (f *wfpFirewall) SetTunnel(luid uint64) error {
 				return err
 			}
 		}
-		f.tunFilters, f.tunLUID = ids, luid
 		return nil
 	})
+	if err == nil {
+		f.tunFilters, f.tunLUID = ids, luid
+	}
+	return err
 }
 
 // Disable removes every filter by closing the dynamic session.

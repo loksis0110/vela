@@ -47,7 +47,6 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -108,9 +107,15 @@ fun ServersScreen(
     var proto by rememberSaveable { mutableStateOf("") }
     var country by rememberSaveable { mutableStateOf("") }
     var protoMenu by remember { mutableStateOf(false) }
-    // another subscription may have no such country or protocol
-    LaunchedEffect(viewId) { proto = ""; country = "" }
     var countryMenu by remember { mutableStateOf(false) }
+
+    /** Another subscription may have no such country or protocol: its filters start empty. */
+    fun show(id: String) {
+        if (id == viewId) return
+        viewId = id
+        proto = ""
+        country = ""
+    }
 
     fun matches(n: Node): Boolean {
         val q = query.trim().lowercase()
@@ -169,7 +174,7 @@ fun ServersScreen(
                             .clip(RoundedCornerShape(50))
                             .background(if (sel) Vela.Hull else Color.Transparent)
                             .border(1.dp, if (sel) Vela.Line else Vela.Hull, RoundedCornerShape(50))
-                            .clickable { viewId = p.id }
+                            .clickable { show(p.id) }
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                     )
                 }
@@ -216,8 +221,8 @@ fun ServersScreen(
                 ),
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
             )
-            val protocols = profile.nodes.map { it.protocol }.filter { it.isNotBlank() }.distinct().sorted()
-            val flags = profile.nodes.mapNotNull { splitFlag(it.name).first }.distinct().sortedBy { countryName(it) }
+            val protocols = remember(profile.nodes) { profile.nodes.map { it.protocol }.filter { it.isNotBlank() }.distinct().sorted() }
+            val flags = remember(profile.nodes) { profile.nodes.mapNotNull { splitFlag(it.name).first }.distinct().sortedBy { countryName(it) } }
             ChipRow {
                 Chip(stringResource(R.string.filter_favorites), onlyFav) { onlyFav = !onlyFav }
                 Chip(stringResource(R.string.filter_working), onlyOk) { onlyOk = !onlyOk }
@@ -274,6 +279,25 @@ fun ServersScreen(
             ?.let { stringResource(R.string.now_using, splitFlag(it.name).second) }
         val autoMeta = stringResource(R.string.auto_select_meta)
         val onlyFavorites = stringResource(R.string.auto_only_favorites)
+        // hundreds of servers: filtered and sorted only when something they depend on changes,
+        // not on every second of the traffic counter
+        val visible = remember(profile.nodes, query, onlyFav, onlyOk, proto, country, app.favorites, if (onlyOk) pings else null) {
+            profile.nodes.filter { matches(it) }
+        }
+        val ordered = remember(visible, fastestFirst, app.favorites, if (fastestFirst) pings else null) {
+            if (fastestFirst) {
+                visible.sortedBy { n ->
+                    val ms = pings[n.id]
+                    when {
+                        ms == null || ms == 0 -> 1_000_000
+                        ms < 0 -> 10_000_000
+                        else -> ms
+                    }
+                }
+            } else {
+                visible.sortedByDescending { it.id in app.favorites }
+            }
+        }
         LazyColumn(contentPadding = PaddingValues(start = 10.dp, end = 10.dp, bottom = 24.dp)) {
             if (announce != null) {
                 item(key = "announce") {
@@ -300,19 +324,6 @@ fun ServersScreen(
                     meta2 = if (app.favorites.any { f -> profile.nodes.any { it.id == f } }) onlyFavorites else null,
                 )
             }
-            val visible = profile.nodes.filter { matches(it) }
-            val ordered = if (fastestFirst) {
-                visible.sortedBy { n ->
-                    val ms = pings[n.id]
-                    when {
-                        ms == null || ms == 0 -> 1_000_000
-                        ms < 0 -> 10_000_000
-                        else -> ms
-                    }
-                }
-            } else {
-                visible.sortedByDescending { it.id in app.favorites }
-            }
             if (visible.size != profile.nodes.size) {
                 item {
                     Text(
@@ -335,7 +346,7 @@ fun ServersScreen(
                             color = Vela.Muted, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 4.dp),
                         )
                         elsewhere.forEach { o ->
-                            TextButton(onClick = { viewId = o.id }) { Text("${o.name} · ${o.nodes.count { matches(it) }}") }
+                            TextButton(onClick = { show(o.id) }) { Text("${o.name} · ${o.nodes.count { matches(it) }}") }
                         }
                     }
                 }

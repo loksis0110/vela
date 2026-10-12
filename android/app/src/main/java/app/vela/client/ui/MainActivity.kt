@@ -35,11 +35,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -49,8 +47,12 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.viewModelScope
 import app.vela.client.Lang
 import app.vela.client.R
 import app.vela.client.data.Store
@@ -59,9 +61,12 @@ import app.vela.client.vpn.ConnState
 import app.vela.client.vpn.SpeedState
 import app.vela.client.vpn.VpnManager
 import app.vela.velacore.Velacore
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -70,15 +75,35 @@ import java.security.MessageDigest
 /** Text that arrived from outside: a tapped link or the share sheet. */
 data class Incoming(val text: String, val isLink: Boolean)
 
-class MainActivity : ComponentActivity() {
-    /** A tapped app link or shared text, waiting to be confirmed. */
-    private val incoming = MutableStateFlow<Incoming?>(null)
+/**
+ * What must outlive the activity when Android recreates it (rotation, language,
+ * dark mode): a link waiting for confirmation, and work started from the screen
+ * (adding, refreshing, checking servers) that would otherwise be cancelled.
+ */
+class MainModel : ViewModel() {
+    /** A tapped app link or shared text, waiting to be looked at. */
+    val incoming = MutableStateFlow<Incoming?>(null)
 
     /** Something importable found in the clipboard. */
-    private val clipOffer = MutableStateFlow<ImportOffer?>(null)
+    val clipOffer = MutableStateFlow<ImportOffer?>(null)
 
     /** Set when the widget or tile asks to connect but VPN permission is missing. */
-    private val connectRequest = MutableStateFlow(false)
+    val connectRequest = MutableStateFlow(false)
+
+    /** An app link or shared text waiting for «Add». */
+    val confirm = MutableStateFlow<ImportOffer?>(null)
+    val linkError = MutableStateFlow<String?>(null)
+    val refreshing = MutableStateFlow(false)
+    val clipBusy = MutableStateFlow(false)
+
+    /** Connection state whose side effects (IP check, speed reset) are done. */
+    var handledState: ConnState? = null
+
+    fun launch(block: suspend CoroutineScope.() -> Unit): Job = viewModelScope.launch(block = block)
+}
+
+class MainActivity : ComponentActivity() {
+    private val model by lazy { ViewModelProvider(this)[MainModel::class.java] }
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(Lang.wrap(newBase))
@@ -105,8 +130,8 @@ class MainActivity : ComponentActivity() {
             }
         }
         setContent {
-            val st by Store.state.collectAsState()
-            VelaTheme(st.theme) { App(incoming, clipOffer, connectRequest) }
+            val st by Store.state.collectAsStateWithLifecycle()
+            VelaTheme(st.theme) { App(model) }
         }
     }
 
@@ -123,17 +148,16 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         when (intent?.action) {
-            ACTION_CONNECT -> connectRequest.value = true
-            Intent.ACTION_VIEW -> intent.dataString?.takeIf { it.isNotBlank() }?.let { incoming.value = Incoming(it.trim(), true) }
-            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }?.let {
-                incoming.value = Incoming(it.trim(), false)
-            }
+            ACTION_CONNECT -> model.connectRequest.value = true
+            Intent.ACTION_VIEW -> intent.dataString?.takeIf { it.isNotBlank() }?.let { model.incoming.value = Incoming(it.trim(), true) }
+            Intent.ACTION_SEND -> runCatching { intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() }.getOrNull()
+                ?.takeIf { it.isNotBlank() }?.let { model.incoming.value = Incoming(it.trim(), false) }
         }
     }
 
     /** Offers a subscription or server link copied in a browser or messenger. */
     private fun checkClipboard() {
-        if (Store.state.value.noClipboard || incoming.value != null || clipOffer.value != null) return
+        if (Store.state.value.noClipboard || model.incoming.value != null || model.clipOffer.value != null || model.confirm.value != null) return
         val cm = getSystemService(ClipboardManager::class.java) ?: return
         val desc = runCatching { cm.primaryClipDescription }.getOrNull() ?: return
         val textual = desc.hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN) ||
@@ -156,7 +180,7 @@ class MainActivity : ComponentActivity() {
             if (offer.isEmpty) return@launch
             // offered once; asking again about the same text would be annoying
             Store.prefs.edit().putString(CLIP_HASH, hash).apply()
-            if (incoming.value == null) clipOffer.value = offer
+            if (model.incoming.value == null && model.confirm.value == null) model.clipOffer.value = offer
         }
     }
 
@@ -194,26 +218,26 @@ private suspend fun addOffer(offer: ImportOffer, preview: JSONObject?): String {
 }
 
 @Composable
-private fun App(
-    incoming: MutableStateFlow<Incoming?>,
-    clipOffer: MutableStateFlow<ImportOffer?>,
-    connectRequest: MutableStateFlow<Boolean>,
-) {
+private fun App(model: MainModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val scope = rememberCoroutineScope()
-    val app by Store.state.collectAsState()
-    val status by VpnManager.status.collectAsState()
-    val pings by Store.pings.collectAsState()
-    val reasons by Store.reasons.collectAsState()
-    val probe by VpnManager.probe.collectAsState()
-    val clip by clipOffer.collectAsState()
-    val wantConnect by connectRequest.collectAsState()
-    val history by VpnManager.history.collectAsState()
-    val ip by VpnManager.ip.collectAsState()
-    val ipBusy by VpnManager.ipBusy.collectAsState()
-    val ipError by VpnManager.ipError.collectAsState()
-    val speed by VpnManager.speed.collectAsState()
-    val dismissed by Store.dismissedAnnounce.collectAsState()
+    // only while the app is on screen: nothing is redrawn in the background
+    val app by Store.state.collectAsStateWithLifecycle()
+    val status by VpnManager.status.collectAsStateWithLifecycle()
+    val pings by Store.pings.collectAsStateWithLifecycle()
+    val reasons by Store.reasons.collectAsStateWithLifecycle()
+    val probe by VpnManager.probe.collectAsStateWithLifecycle()
+    val clip by model.clipOffer.collectAsStateWithLifecycle()
+    val wantConnect by model.connectRequest.collectAsStateWithLifecycle()
+    val history by VpnManager.history.collectAsStateWithLifecycle()
+    val ip by VpnManager.ip.collectAsStateWithLifecycle()
+    val ipBusy by VpnManager.ipBusy.collectAsStateWithLifecycle()
+    val ipError by VpnManager.ipError.collectAsStateWithLifecycle()
+    val speed by VpnManager.speed.collectAsStateWithLifecycle()
+    val dismissed by Store.dismissedAnnounce.collectAsStateWithLifecycle()
+    val confirm by model.confirm.collectAsStateWithLifecycle()
+    val linkError by model.linkError.collectAsStateWithLifecycle()
+    val refreshing by model.refreshing.collectAsStateWithLifecycle()
+    val clipBusy by model.clipBusy.collectAsStateWithLifecycle()
     var share by remember { mutableStateOf<Triple<String, String, String>?>(null) }
 
     val activity = context as? ComponentActivity
@@ -227,33 +251,41 @@ private fun App(
     var addOpen by rememberSaveable { mutableStateOf(false) }
     var addText by rememberSaveable { mutableStateOf("") }
     var privacyOpen by remember { mutableStateOf(false) }
-    var refreshing by remember { mutableStateOf(false) }
-    var confirm by remember { mutableStateOf<ImportOffer?>(null) }
-    var linkError by remember { mutableStateOf<String?>(null) }
-    var clipBusy by remember { mutableStateOf(false) }
     var askNotifications by remember { mutableStateOf(false) }
     var language by remember { mutableStateOf(Lang.choice(context)) }
     val lastClip = remember { arrayOfNulls<ImportOffer>(1) }
 
-    fun toast(msg: String) = Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+    fun toast(msg: String) = Toast.makeText(context.applicationContext, msg, Toast.LENGTH_SHORT).show()
     fun str(id: Int, vararg args: Any): String = context.getString(id, *args)
 
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     val reminderPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) Reminders.onSubscriptionsChanged(context)
     }
-    val vpnPermission = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK) VpnManager.start(context)
-        else toast(str(R.string.vpn_permission_needed))
-    }
 
     fun notificationsAllowed() = Build.VERSION.SDK_INT < 33 ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
+    fun startVpn() {
+        VpnManager.start(context)
+        // the connection notification (status, «Disconnect») needs this on Android 13+;
+        // asked after the VPN dialog, never on top of it
+        if (!notificationsAllowed()) runCatching { notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }
+    }
+
+    val vpnPermission = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK && VpnManager.prepare(context) == null) startVpn()
+        else toast(str(R.string.vpn_permission_needed))
+    }
+
     fun connect() {
-        if (!notificationsAllowed()) notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        val ask = VpnManager.prepare(context)
-        if (ask != null) vpnPermission.launch(ask) else VpnManager.start(context)
+        val ask = runCatching { VpnManager.prepare(context) }.getOrElse {
+            toast(str(R.string.vpn_permission_needed))
+            return
+        }
+        // some devices have no VPN dialog at all
+        if (ask == null) startVpn()
+        else runCatching { vpnPermission.launch(ask) }.onFailure { toast(str(R.string.vpn_permission_needed)) }
     }
 
     fun reconnectIfNeeded() {
@@ -271,17 +303,20 @@ private fun App(
 
     LaunchedEffect(wantConnect) {
         if (wantConnect) {
-            connectRequest.value = false
+            model.connectRequest.value = false
             if (VpnManager.status.value.state == ConnState.Disconnected && app.profiles.isNotEmpty()) connect()
         }
     }
 
-    // what websites see changes with the connection
+    // what websites see changes with the connection; only on a real change,
+    // not when the screen is rotated (that kept wiping the speed test result)
     LaunchedEffect(status.state) {
-        when (status.state) {
+        val state = status.state
+        if (model.handledState == state) return@LaunchedEffect
+        when (state) {
             ConnState.Connected -> {
                 delay(1200)
-                VpnManager.refreshIp()
+                model.launch { VpnManager.refreshIp() }
             }
             ConnState.Disconnected -> {
                 VpnManager.ip.value = null
@@ -290,38 +325,40 @@ private fun App(
             else -> {}
         }
         if (!VpnManager.speed.value.running) VpnManager.speed.value = SpeedState()
+        model.handledState = state
     }
 
     // a tapped app link or shared text: confirm what it adds
     LaunchedEffect(Unit) {
-        incoming.collect { item ->
-            if (item == null) return@collect
-            incoming.value = null
-            clipOffer.value = null
+        model.incoming.filterNotNull().collect { item ->
+            model.clipOffer.value = null
             val result = withContext(Dispatchers.Default) {
                 runCatching {
                     if (item.isLink) ImportOffer.from(Velacore.parseDeepLink(item.text))
                     else ImportOffer.from(Velacore.detectImport(item.text))
                 }
             }
+            // taken only now: if the activity is recreated meanwhile, the new one looks at it again
+            model.incoming.compareAndSet(item, null)
             val offer = result.getOrNull()
             if (offer != null && !offer.isEmpty) {
-                confirm = offer
+                model.linkError.value = null
+                model.confirm.value = offer
             } else if (!item.isLink) {
                 // shared text the core doesn't recognize (or a backup): let the user look at it
                 addText = item.text
                 addOpen = true
             } else {
-                linkError = result.exceptionOrNull()?.message ?: str(R.string.link_nothing)
+                model.linkError.value = result.exceptionOrNull()?.message ?: str(R.string.link_nothing)
             }
         }
     }
 
     // added in the meantime (e.g. through the link itself): nothing to offer any more
     LaunchedEffect(app.profiles) {
-        val offer = clipOffer.value ?: return@LaunchedEffect
+        val offer = model.clipOffer.value ?: return@LaunchedEffect
         val rest = withContext(Dispatchers.Default) { offer.withoutKnown() }
-        if (rest.isEmpty && clipOffer.value == offer) clipOffer.value = null
+        if (rest.isEmpty && model.clipOffer.value == offer) model.clipOffer.value = null
     }
 
     // reminders need the notification permission (Android 13+): ask once, politely
@@ -365,8 +402,8 @@ private fun App(
                     onDismissError = { VpnManager.status.value = VpnManager.status.value.copy(error = null) },
                     onDismissNotice = { VpnManager.status.value = VpnManager.status.value.copy(notice = null) },
                     history = history, ip = ip, ipBusy = ipBusy, ipError = ipError, speed = speed,
-                    onIp = { scope.launch { VpnManager.refreshIp() } },
-                    onSpeed = { scope.launch { VpnManager.runSpeedTest() } },
+                    onIp = { model.launch { VpnManager.refreshIp() } },
+                    onSpeed = { model.launch { VpnManager.runSpeedTest() } },
                     announce = Store.visibleAnnounce(app.active, dismissed),
                     onDismissAnnounce = { app.active?.let { Store.dismissAnnounce(it.id, it.announce) } },
                     onStats = { screen = Screen.Stats },
@@ -377,19 +414,22 @@ private fun App(
                     onBack = { screen = Screen.Home },
                     onAdd = { addText = ""; addOpen = true },
                     onPing = { id ->
-                        scope.launch {
+                        model.launch {
                             VpnManager.pingAll(id)
                             val p = Store.state.value.profiles.firstOrNull { it.id == id }
                             if (p != null) toast(str(R.string.probe_result, p.nodes.count { (Store.pings.value[it.id] ?: 0) > 0 }, p.nodes.size))
                         }
                     },
                     onRefreshAll = {
-                        scope.launch {
-                            refreshing = true
-                            runCatching { Store.refreshAll() }
-                                .onSuccess { toast(it) }
-                                .onFailure { toast(it.message ?: str(R.string.refresh_failed)) }
-                            refreshing = false
+                        if (!model.refreshing.value) model.launch {
+                            model.refreshing.value = true
+                            try {
+                                runCatching { Store.refreshAll() }
+                                    .onSuccess { toast(it) }
+                                    .onFailure { toast(it.message ?: str(R.string.refresh_failed)) }
+                            } finally {
+                                model.refreshing.value = false
+                            }
                         }
                     },
                     onRename = { p, name -> Store.rename(p.id, name) },
@@ -397,19 +437,22 @@ private fun App(
                         val sameProfile = profileId == app.activeProfile
                         Store.select(profileId, nodeId)
                         if (status.state == ConnState.Connected) {
-                            scope.launch {
+                            model.launch {
                                 if (!sameProfile || !VpnManager.switchTo(nodeId)) reconnectIfNeeded()
                             }
                         }
                         screen = Screen.Home
                     },
                     onRefresh = { p ->
-                        scope.launch {
-                            refreshing = true
-                            runCatching { Store.refresh(p.id) }
-                                .onSuccess { toast(str(R.string.refresh_done)); if (p.id == app.activeProfile) reconnectIfNeeded() }
-                                .onFailure { toast(it.message ?: str(R.string.refresh_failed)) }
-                            refreshing = false
+                        if (!model.refreshing.value) model.launch {
+                            model.refreshing.value = true
+                            try {
+                                runCatching { Store.refresh(p.id) }
+                                    .onSuccess { toast(str(R.string.refresh_done)); if (p.id == Store.state.value.activeProfile) reconnectIfNeeded() }
+                                    .onFailure { toast(it.message ?: str(R.string.refresh_failed)) }
+                            } finally {
+                                model.refreshing.value = false
+                            }
                         }
                     },
                     onDeleteProfile = { p ->
@@ -426,7 +469,7 @@ private fun App(
                     onFavorite = { id, on -> Store.setFavorite(id, on) },
                     onShare = { title, text -> share = Triple(title, str(R.string.share_hint), text) },
                     onStopProbe = { VpnManager.stopProbe() },
-                    onPingOne = { pid, nid -> scope.launch { VpnManager.pingOne(pid, nid) } },
+                    onPingOne = { pid, nid -> model.launch { VpnManager.pingOne(pid, nid) } },
                     onSort = { Store.setSortByPing(it) },
                 )
                 Screen.Settings -> SettingsScreen(
@@ -484,16 +527,19 @@ private fun App(
                 ClipboardPrompt(
                     offer = offer, busy = clipBusy,
                     onAdd = {
-                        clipBusy = true
-                        scope.launch {
-                            runCatching { addOffer(offer, null) }
-                                .onSuccess { toast(it) }
-                                .onFailure { toast(it.message ?: str(R.string.error_generic)) }
-                            clipBusy = false
-                            clipOffer.value = null
+                        model.clipBusy.value = true
+                        model.launch {
+                            try {
+                                runCatching { addOffer(offer, null) }
+                                    .onSuccess { toast(it) }
+                                    .onFailure { toast(it.message ?: str(R.string.error_generic)) }
+                            } finally {
+                                model.clipBusy.value = false
+                                model.clipOffer.value = null
+                            }
                         }
                     },
-                    onDismiss = { clipOffer.value = null },
+                    onDismiss = { model.clipOffer.value = null },
                 )
             }
         }
@@ -502,12 +548,12 @@ private fun App(
     confirm?.let { offer ->
         ImportConfirmDialog(
             offer = offer,
-            onDismiss = { confirm = null },
+            onDismiss = { model.confirm.value = null },
             onConfirm = { preview, done ->
-                scope.launch {
+                model.launch {
                     runCatching { addOffer(offer, preview) }
                         .onSuccess { msg ->
-                            confirm = null
+                            model.confirm.compareAndSet(offer, null)
                             toast(msg)
                             done(null)
                         }
@@ -519,11 +565,11 @@ private fun App(
 
     linkError?.let { err ->
         AlertDialog(
-            onDismissRequest = { linkError = null },
+            onDismissRequest = { model.linkError.value = null },
             containerColor = Vela.Deep,
             title = { Text(stringResource(R.string.link_error_title)) },
             text = { Text(err) },
-            confirmButton = { TextButton(onClick = { linkError = null }) { Text(stringResource(R.string.ok)) } },
+            confirmButton = { TextButton(onClick = { model.linkError.value = null }) { Text(stringResource(R.string.ok)) } },
         )
     }
 
@@ -532,7 +578,7 @@ private fun App(
             initial = addText,
             onDismiss = { addOpen = false },
             onSubmit = { text, done ->
-                scope.launch {
+                model.launch {
                     runCatching { Store.import(text) }
                         .onSuccess { msg ->
                             addOpen = false

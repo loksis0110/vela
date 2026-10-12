@@ -35,7 +35,7 @@ type ProbeResult struct {
 	ID    string `json:"id"`
 	Delay int    `json:"delay"` // ms, 0 when failed
 	Error string `json:"error,omitempty"`
-	// Human readable reason in Russian.
+	// Human readable reason in the language set by SetLanguage.
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -74,38 +74,70 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 	if len(nodes) == 0 {
 		return nil
 	}
+	// servers the core refused to create: reported without a check
+	rejected := map[string]error{}
 	if instance == nil {
-		var outbounds []any
+		var outbounds []map[string]any
+		seen := map[string]bool{}
 		for _, n := range nodes {
-			if fresh, err := ParseLink(n.Link); err == nil && n.Link != "" {
-				n.Outbound = fresh.Outbound
+			if n.Link != "" {
+				if fresh, err := ParseLink(n.Link); err == nil {
+					n.Outbound = fresh.Outbound
+				}
 			}
-			if n.Outbound == nil {
-				continue
+			tag := NodeTag(n)
+			if n.Outbound == nil || seen[tag] {
+				continue // duplicate tags would fail the whole core
 			}
+			seen[tag] = true
 			ob := map[string]any{}
 			for k, v := range n.Outbound {
 				ob[k] = v
 			}
-			ob["tag"] = NodeTag(n)
+			ob["tag"] = tag
 			outbounds = append(outbounds, ob)
 		}
-		outbounds = append(outbounds, map[string]any{"type": "direct", "tag": TagDirect})
-		cfg, _ := json.Marshal(map[string]any{
-			"log":       map[string]any{"disabled": true},
-			"dns":       map[string]any{"servers": []any{probeDNS()}},
-			"outbounds": outbounds,
-			"route":     map[string]any{"final": TagDirect, "default_domain_resolver": "local"},
-		})
-		probe, cancel, err := StartBox(string(cfg), "")
+		probe, cancel, err := startProbeBox(outbounds)
 		if err != nil {
-			return err
+			// one broken server must not fail all checks: find the ones the
+			// core rejects by halving the list, report them, check the rest
+			var good []map[string]any
+			var split func(list []map[string]any)
+			split = func(list []map[string]any) {
+				if len(list) == 0 || ctx.Err() != nil {
+					return
+				}
+				part, partCancel, partErr := startProbeBox(list)
+				if partErr == nil {
+					part.Close()
+					partCancel()
+					good = append(good, list...)
+					return
+				}
+				if len(list) == 1 {
+					rejected[list[0]["tag"].(string)] = partErr
+					return
+				}
+				split(list[:len(list)/2])
+				split(list[len(list)/2:])
+			}
+			split(outbounds)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			probe, cancel, err = startProbeBox(good)
+			if err != nil {
+				return err
+			}
 		}
 		defer func() {
 			probe.Close()
 			cancel()
 		}()
 		instance = probe
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
 	}
 	if parallel <= 0 {
 		parallel = 8
@@ -128,6 +160,11 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 	}
 	test := func(n Node) ProbeResult {
 		res := ProbeResult{ID: n.ID}
+		if err := rejected[NodeTag(n)]; err != nil {
+			res.Error = err.Error()
+			res.Reason = T("сервер не удалось разобрать")
+			return res
+		}
 		outbound, ok := instance.Outbound().Outbound(NodeTag(n))
 		if !ok {
 			res.Error = "outbound not found"
@@ -212,6 +249,25 @@ func ProbeNodes(ctx context.Context, instance *box.Box, nodes []Node, timeout ti
 	return ctx.Err()
 }
 
+// startProbeBox starts a core without inbounds for latency checks.
+func startProbeBox(outbounds []map[string]any) (*box.Box, context.CancelFunc, error) {
+	list := make([]any, 0, len(outbounds)+1)
+	for _, ob := range outbounds {
+		list = append(list, ob)
+	}
+	list = append(list, map[string]any{"type": "direct", "tag": TagDirect})
+	cfg, err := json.Marshal(map[string]any{
+		"log":       map[string]any{"disabled": true},
+		"dns":       map[string]any{"servers": []any{probeDNS()}},
+		"outbounds": list,
+		"route":     map[string]any{"final": TagDirect, "default_domain_resolver": "local"},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return StartBox(string(cfg), "")
+}
+
 // probeDNS resolves server domain names for the temporary core. Mobile apps
 // can't rely on the system resolver from Go, so a public resolver is used.
 func probeDNS() map[string]any {
@@ -221,10 +277,13 @@ func probeDNS() map[string]any {
 	return map[string]any{"type": "local", "tag": "local"}
 }
 
-// ExplainError turns a core error into a short Russian explanation.
+// ExplainError turns a core error into a short explanation in the language
+// set by SetLanguage.
 func ExplainError(e string) string {
 	s := strings.ToLower(e)
 	switch {
+	case strings.Contains(s, "context canceled"), strings.Contains(s, "operation was canceled"):
+		return T("операция отменена")
 	case strings.Contains(s, "no such host"):
 		return T("не удалось найти адрес сервера")
 	case strings.Contains(s, "unrecognized remote public key"):
@@ -241,6 +300,10 @@ func ExplainError(e string) string {
 		return T("сервер отклонил ключ доступа (UUID/пароль)")
 	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline exceeded"):
 		return T("сервер не ответил вовремя")
+	case strings.Contains(s, "handshake failure"), strings.Contains(s, "protocol version"), strings.Contains(s, "unrecognized name"):
+		return T("сервер не принял TLS-соединение (проверьте SNI)")
+	case strings.Contains(s, "status code"), strings.Contains(s, "unexpected status"):
+		return T("сервер ответил ошибкой")
 	case strings.Contains(s, "eof"), strings.Contains(s, "reset by peer"), strings.Contains(s, "closed pipe"), strings.Contains(s, "forcibly closed"):
 		return T("сервер разорвал соединение")
 	}

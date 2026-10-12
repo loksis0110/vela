@@ -26,6 +26,7 @@ object Reminders {
     private const val ACTION_ALARM = "app.vela.client.REMINDER"
     private const val DAY = 86_400L
     private const val SHOWN = "alertsShown"
+    private const val STALE = 3 * DAY
 
     /** Creates (or renames, after a language change) the notification channel. */
     fun ensureChannel(context: Context) {
@@ -37,6 +38,9 @@ object Reminders {
     }
 
     /** After a subscription was added, refreshed or deleted. */
+    // subscriptions are refreshed in parallel: one check at a time, or the
+    // same alert could be shown twice
+    @Synchronized
     fun onSubscriptionsChanged(context: Context) {
         runCatching {
             check(context, traffic = true)
@@ -45,6 +49,7 @@ object Reminders {
     }
 
     /** Reminders were switched on or off. */
+    @Synchronized
     fun onChanged(context: Context) {
         runCatching {
             if (Store.state.value.noReminders) cancel(context) else onSubscriptionsChanged(context)
@@ -52,6 +57,7 @@ object Reminders {
     }
 
     /** At app start, on the alarm and after a reboot. */
+    @Synchronized
     fun onWake(context: Context) {
         runCatching {
             check(context, traffic = false)
@@ -89,7 +95,13 @@ object Reminders {
                 }
                 if (due != null) {
                     val key = "${p.id}:$due:${p.expire}"
-                    if (key !in shown && canNotify) {
+                    if (key !in shown && left < -STALE) {
+                        // ended long ago (an old subscription, the first start after an
+                        // update): nothing new to tell, stay quiet
+                        shown += key
+                        shown += "${p.id}:e1:${p.expire}"
+                        shown += "${p.id}:e3:${p.expire}"
+                    } else if (key !in shown && canNotify) {
                         notify(context, nm, p, due)
                         shown += key
                         // a later alert makes the earlier ones pointless

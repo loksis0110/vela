@@ -25,13 +25,22 @@ enum VPN {
 
     static func set(_ on: Bool) async throws {
         guard let m = await manager() else { throw VPNError.notSetUp }
+        // «Постоянный VPN» of the app (written into the profile by the app):
+        // On Demand follows it on, and must be off to stay off
+        let alwaysOn = (m.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["alwaysOn"] as? Bool ?? m.isOnDemandEnabled
         if on {
-            if !m.isEnabled {
+            if !m.isEnabled || m.isOnDemandEnabled != alwaysOn {
                 m.isEnabled = true
+                m.isOnDemandEnabled = alwaysOn
                 try await m.saveToPreferences()
             }
             try m.connection.startVPNTunnel()
         } else {
+            if m.isOnDemandEnabled {
+                // otherwise iOS would connect again right away
+                m.isOnDemandEnabled = false
+                try? await m.saveToPreferences()
+            }
             m.connection.stopVPNTunnel()
         }
     }

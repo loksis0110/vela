@@ -52,6 +52,9 @@ import app.vela.client.R
 import app.vela.client.data.Store
 import app.vela.velacore.Velacore
 import kotlinx.coroutines.Dispatchers
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -104,11 +107,16 @@ fun StatsScreen(connected: Boolean, onBack: () -> Unit) {
             runCatching { parseSummary(Velacore.trafficSummary(Store.trafficFile.absolutePath)) }.getOrNull()
         } ?: TrafficSummary(emptyList(), emptyList(), Usage("", 0, 0), Usage("", 0, 0), Usage("", 0, 0))
     }
-    // the core adds new numbers every 30 seconds while connected
+    // the core adds new numbers every 30 seconds while connected; read again
+    // only while the screen is visible
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(connected) {
-        while (connected) {
-            delay(30_000)
-            tick++
+        if (!connected) return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                delay(30_000)
+                tick++
+            }
         }
     }
 

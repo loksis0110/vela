@@ -71,7 +71,8 @@ proxy-groups:
   - {name: PROXY, type: select, proxies: [RU Reality]}
 `
 	res := ParseText(yamlText)
-	if len(res.Nodes) != 5 || len(res.Errors) != 1 {
+	// the obfs plugin is built into sing-box
+	if len(res.Nodes) != 6 || len(res.Errors) != 0 {
 		t.Fatalf("nodes %d errors %v", len(res.Nodes), res.Errors)
 	}
 	if res.Nodes[0].Name != "RU Reality" || res.Nodes[0].Security != "Reality" || res.Nodes[1].Network != "ws" {

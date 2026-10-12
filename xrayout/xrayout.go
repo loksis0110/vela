@@ -23,6 +23,7 @@ import (
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/bufio/deadline"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
@@ -48,8 +49,9 @@ func init() {
 }
 
 var (
-	_ adapter.Outbound  = (*Outbound)(nil)
-	_ adapter.Lifecycle = (*Outbound)(nil)
+	_ adapter.Outbound                = (*Outbound)(nil)
+	_ adapter.Lifecycle               = (*Outbound)(nil)
+	_ adapter.InterfaceUpdateListener = (*Outbound)(nil)
 )
 
 // Outbound sends connections through an Xray outbound handler.
@@ -94,10 +96,17 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 	return globalHub.add(h.key, h.dialer, h.logger, h.handler)
 }
 
-// Close removes the handlers again.
+// Close removes the handlers again. It may be called more than once.
 func (h *Outbound) Close() error {
 	globalHub.remove(h.key, h.handler)
 	return nil
+}
+
+// InterfaceUpdated is called by sing-box after a network change (Wi-Fi to
+// mobile data and back): pooled XHTTP/gRPC connections were made over the
+// old network, so new connections must not wait for them to time out.
+func (h *Outbound) InterfaceUpdated(context.Context) {
+	globalHub.resetTransports(h.handler)
 }
 
 func (h *Outbound) xrayContext(ctx context.Context) (context.Context, *xcore.Instance, error) {
@@ -116,7 +125,8 @@ func (h *Outbound) xrayContext(ctx context.Context) (context.Context, *xcore.Ins
 }
 
 // DialContext opens a TCP connection (or a connected UDP one) through Xray.
-func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (conn net.Conn, err error) {
+	defer recoverError(&err)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
@@ -127,7 +137,13 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		if err != nil {
 			return nil, err
 		}
-		return xcore.Dial(xctx, instance, xnet.TCPDestination(toXrayAddress(destination), xnet.Port(destination.Port)))
+		conn, err := xcore.Dial(xctx, instance, xnet.TCPDestination(toXrayAddress(destination), xnet.Port(destination.Port)))
+		if err != nil {
+			return nil, err
+		}
+		// Xray's connections ignore deadlines; sing-box (DNS over TCP,
+		// sniffing, latency checks) relies on them
+		return deadline.NewConn(conn), nil
 	case N.NetworkUDP:
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 		packetConn, err := h.listenPacket(ctx)
@@ -140,7 +156,8 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 }
 
 // ListenPacket opens a UDP association through Xray.
-func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (conn net.PacketConn, err error) {
+	defer recoverError(&err)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
@@ -154,6 +171,14 @@ func (h *Outbound) listenPacket(ctx context.Context) (*packetConn, error) {
 		return nil, err
 	}
 	return newPacketConn(xctx, instance)
+}
+
+// recoverError turns a panic inside Xray into an error of this connection:
+// one broken server must not take the whole app down.
+func recoverError(err *error) {
+	if r := recover(); r != nil {
+		*err = E.New("xray: panic: ", r)
+	}
 }
 
 func toXrayAddress(destination M.Socksaddr) xnet.Address {

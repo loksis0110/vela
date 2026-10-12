@@ -240,13 +240,18 @@ final class Store: ObservableObject {
             .appendingPathComponent("Vela", isDirectory: true)
         try? FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
         fileURL = dataURL.appendingPathComponent("state.json")
-        if let data = try? Data(contentsOf: fileURL), var st = try? JSONDecoder().decode(AppState.self, from: data) {
-            // duplicates saved by older versions
-            for i in st.profiles.indices {
-                var seen = Set<String>()
-                st.profiles[i].nodes = st.profiles[i].nodes.filter { seen.insert($0.id).inserted }
+        if let data = try? Data(contentsOf: fileURL) {
+            if var st = try? JSONDecoder().decode(AppState.self, from: data) {
+                // duplicates saved by older versions
+                for i in st.profiles.indices {
+                    var seen = Set<String>()
+                    st.profiles[i].nodes = st.profiles[i].nodes.filter { seen.insert($0.id).inserted }
+                }
+                state = st
+            } else {
+                // never overwrite subscriptions that couldn't be read: keep a copy
+                try? data.write(to: dataURL.appendingPathComponent("state-unreadable.json"), options: .atomic)
             }
-            state = st
         }
         if state.hwid.isEmpty {
             state.hwid = Self.randomID(16)
@@ -441,15 +446,23 @@ final class Store: ObservableObject {
         return failed > 0 ? LF("Обновлено подписок: %@ из %@", "\(ids.count - failed)", "\(ids.count)") : L("Все подписки обновлены")
     }
 
-    func refreshDue() async {
-        if state.sub.noAutoUpdate { return }
+    /// Refreshes subscriptions whose time has come. true when the servers of
+    /// the active one changed (the running tunnel needs the new list).
+    @discardableResult
+    func refreshDue() async -> Bool {
+        if state.sub.noAutoUpdate { return false }
+        let before = activeServers
         let now = Int64(Date().timeIntervalSince1970)
         for p in state.profiles where p.kind == "subscription" {
             let hours = state.sub.updateHours > 0 ? state.sub.updateHours : (p.intervalHours > 0 ? p.intervalHours : 12)
             let interval = Int64(hours)
             if now - p.updatedAt > interval * 3600 { try? await refresh(p.id) }
         }
+        return activeServers != before
     }
+
+    /// Servers of the active subscription, to see whether a refresh changed them.
+    var activeServers: [String] { state.active.map { [$0.id] + $0.nodes.map(\.id) } ?? [] }
 
     private nonisolated static func fetchSubscription(_ url: String) async throws -> [String: Any] {
         try await Task.detached(priority: .userInitiated) {

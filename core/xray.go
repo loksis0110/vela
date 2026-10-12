@@ -8,6 +8,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/velaapp/vela/xrayout"
+	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 // EngineXray marks servers that run on the embedded Xray core because
@@ -95,7 +98,11 @@ func xrayStream(q url.Values, network, security, host string) (map[string]any, e
 			enc["value"] = seed
 		}
 		masks := []any{map[string]any{"type": "mkcp-legacy", "settings": enc}}
-		if ht := strings.ToLower(q.Get("headerType")); ht != "" && ht != "none" {
+		ht := strings.ToLower(q.Get("headerType"))
+		if ht == "wechat-video" {
+			ht = "wechat" // the old name, still in most links
+		}
+		if ht != "" && ht != "none" {
 			h := map[string]any{"header": ht}
 			if ht == "dns" && hostHeader != "" {
 				h["value"] = hostHeader
@@ -142,10 +149,7 @@ func xrayStream(q url.Values, network, security, host string) (map[string]any, e
 	if sni == "" && net.ParseIP(host) == nil {
 		sni = host
 	}
-	fp := strings.ToLower(q.Get("fp"))
-	if fp == "" || fp == "none" {
-		fp = "chrome"
-	}
+	fp := xrayFingerprint(q.Get("fp"))
 	switch security {
 	case "", "none":
 		stream["security"] = "none"
@@ -194,6 +198,44 @@ func xrayStream(q url.Values, network, security, host string) (map[string]any, e
 	return stream, nil
 }
 
+// xrayFingerprint maps "fp" to a fingerprint Xray knows: an unknown one
+// would stop the whole connection from starting.
+func xrayFingerprint(fp string) string {
+	fp = strings.ToLower(strings.TrimSpace(fp))
+	if fp == "" || fp == "none" || fp == "unsafe" || fp == "hellogolang" || xtls.GetFingerprint(fp) == nil {
+		return "chrome"
+	}
+	return fp
+}
+
+// sanitizeXrayOutbound fixes settings of imported Xray configs that the
+// current Xray rejects outright, so one old server doesn't break the
+// whole connection: "allowInsecure" was removed, unknown fingerprints.
+func sanitizeXrayOutbound(ob map[string]any) {
+	ss, _ := ob["streamSettings"].(map[string]any)
+	if ss == nil {
+		return
+	}
+	for _, key := range []string{"tlsSettings", "realitySettings"} {
+		t, _ := ss[key].(map[string]any)
+		if t == nil {
+			continue
+		}
+		delete(t, "allowInsecure")
+		if fp, ok := t["fingerprint"].(string); ok && fp != "" {
+			t["fingerprint"] = xrayFingerprint(fp)
+		}
+	}
+}
+
+// checkXray asks the Xray engine whether it accepts the outbounds.
+func checkXray(outbounds []any) error {
+	if err := xrayout.Check(outbounds); err != nil {
+		return errorf("Xray не принимает настройки сервера: %v", err)
+	}
+	return nil
+}
+
 // xrayNode builds a node that runs on the Xray engine.
 func xrayNode(protocol, xrayProtocol, host string, port int, settings map[string]any, q url.Values, network, security, name string) (Node, error) {
 	stream, err := xrayStream(q, network, security, host)
@@ -205,6 +247,9 @@ func xrayNode(protocol, xrayProtocol, host string, port int, settings map[string
 		"tag":            "proxy",
 		"settings":       settings,
 		"streamSettings": stream,
+	}
+	if err := checkXray([]any{out}); err != nil {
+		return Node{}, err
 	}
 	nw, _ := stream["network"].(string)
 	return Node{Name: name, Protocol: protocol, Server: host, Port: port,

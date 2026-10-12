@@ -27,10 +27,47 @@ func registerURLSchemes() {
 	}
 	command := `"` + exe + `" "%1"`
 	for _, scheme := range append(append([]string{}, core.DeepLinkSchemes...), "sub") {
-		if scheme != "vela" && schemeOwnedByOther(scheme) {
-			continue
+		if scheme != "vela" {
+			if machineHandler(scheme) {
+				// a program installed for the whole computer handles it: our
+				// per-user key would hide it
+				removeOwnScheme(scheme)
+				continue
+			}
+			if schemeOwnedByOther(scheme) {
+				continue
+			}
 		}
 		registerScheme(scheme, exe, command)
+	}
+}
+
+// machineHandler reports whether another program registered the scheme for
+// all users (HKEY_LOCAL_MACHINE).
+func machineHandler(scheme string) bool {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Classes\`+scheme+`\shell\open\command`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	command, _, _ := k.GetStringValue("")
+	return strings.TrimSpace(command) != "" && !strings.Contains(strings.ToLower(commandExe(command)), "vela")
+}
+
+// removeOwnScheme deletes the per-user key of a scheme if Vela created it.
+func removeOwnScheme(scheme string) {
+	base := `Software\Classes\` + scheme
+	k, err := registry.OpenKey(registry.CURRENT_USER, base, registry.QUERY_VALUE)
+	if err != nil {
+		return
+	}
+	v, _, err := k.GetStringValue("VelaHandler")
+	k.Close()
+	if err != nil || v != "1" {
+		return
+	}
+	for _, sub := range []string{`\shell\open\command`, `\shell\open`, `\shell`, `\DefaultIcon`, ""} {
+		registry.DeleteKey(registry.CURRENT_USER, base+sub)
 	}
 }
 

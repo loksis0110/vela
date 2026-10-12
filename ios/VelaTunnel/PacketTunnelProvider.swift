@@ -46,6 +46,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let text = String(format: tr("Vela не подключилась (%@): %@"), step, error.localizedDescription)
             note("ERROR: " + text)
             log.error("\(text, privacy: .public)")
+            // nothing half-started stays behind for the next start
+            locked { stopService() }
+            commandServer?.close()
+            commandServer = nil
             displayMessage(text) { _ in }
             throw TunnelError(text)
         }
@@ -140,14 +144,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var sources = Bundle.main.urls(forResourcesWithExtension: "srs", subdirectory: nil) ?? []
         sources += Bundle.main.urls(forResourcesWithExtension: "srs", subdirectory: "rules") ?? []
+        // an update may bring new lists of the same size: copy all once per build
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        let fresh = UserDefaults.standard.string(forKey: "rulesBuild") != build
         for source in sources {
             let target = dir.appendingPathComponent(source.lastPathComponent)
             let srcSize = (try? FileManager.default.attributesOfItem(atPath: source.path)[.size] as? Int) ?? -1
             let dstSize = (try? FileManager.default.attributesOfItem(atPath: target.path)[.size] as? Int) ?? -2
-            if srcSize == dstSize { continue }
+            if srcSize == dstSize, !fresh { continue }
             try? FileManager.default.removeItem(at: target)
             try FileManager.default.copyItem(at: source, to: target)
         }
+        UserDefaults.standard.set(build, forKey: "rulesBuild")
     }
 
     func startService() throws {
@@ -187,11 +195,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Port and secret of clash_api in the sing-box config, found without
     /// parsing the whole (possibly large) JSON.
     static func controller(in config: String) -> (port: Int, secret: String)? {
+        // only the clash_api block is searched: a regex over the whole config
+        // would copy it (UTF-16) in the 50 MB of the extension
+        guard let start = config.range(of: "\"clash_api\"") else { return nil }
+        let block = String(config[start.lowerBound...].prefix(600))
         func first(_ pattern: String) -> String? {
             guard let re = try? NSRegularExpression(pattern: pattern),
-                  let m = re.firstMatch(in: config, range: NSRange(config.startIndex..., in: config)),
-                  m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: config) else { return nil }
-            return String(config[r])
+                  let m = re.firstMatch(in: block, range: NSRange(block.startIndex..., in: block)),
+                  m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: block) else { return nil }
+            return String(block[r])
         }
         guard let port = first(#""external_controller"\s*:\s*"[^"]*:(\d+)""#).flatMap({ Int($0) }), port > 0 else { return nil }
         let secret = first(#""clash_api"\s*:\s*\{[^}]*"secret"\s*:\s*"([^"]*)""#) ?? ""
@@ -200,7 +212,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason) async {
         log.info("stopping: \(reason.rawValue)")
-        stopService()
+        // why iOS stopped the tunnel (1 user, 3 no network, 9/10 profile
+        // disabled/removed, 11 another VPN, 16 app update…), for the report
+        note("stop: reason \(reason.rawValue), memory: \(memoryMB()) MB")
+        locked { stopService() }
         if let server = commandServer {
             try? await Task.sleep(nanoseconds: 100 * NSEC_PER_MSEC)
             server.close()
@@ -217,11 +232,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         if config == "vela:memory" { return Data("\(memoryMB())".utf8) }
         if config == "vela:stats" { return Data(VelaextTrafficSummary(trafficURL.path).utf8) }
+        guard config.first(where: { !$0.isWhitespace }) == "{" else { return nil } // unknown command
         trimLog()
-        let previous = configContent
-        configContent = config
         reasserting = true
         defer { reasserting = false }
+        return locked { applyConfig(config) }
+    }
+
+    /// Messages can arrive while another reload or the stop is running.
+    private let serviceLock = NSLock()
+
+    private func locked<T>(_ body: () -> T) -> T {
+        serviceLock.lock()
+        defer { serviceLock.unlock() }
+        return body()
+    }
+
+    /// Starts the core with a new config; on failure the previous one comes back.
+    private func applyConfig(_ config: String) -> Data? {
+        guard commandServer != nil else { return Data(tr("откройте Vela и подключитесь из приложения").utf8) }
+        let previous = configContent
+        configContent = config
         do {
             try startService()
             try? config.write(to: dataURL.appendingPathComponent("tunnel-config.json"), atomically: true, encoding: .utf8)

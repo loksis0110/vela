@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -63,7 +64,10 @@ type hub struct {
 	instance *xcore.Instance
 	counter  atomic.Uint64
 	entries  map[string]*entry
-	last     *entry
+	// last receives Xray's log messages and dials that can't be matched to
+	// an outbound. Atomic: Xray logs while the hub is locked (instance
+	// start, handler changes), so the log handler must never take mu.
+	last atomic.Pointer[entry]
 }
 
 type entry struct {
@@ -92,6 +96,7 @@ func (h *hub) ensure() (*xcore.Instance, error) {
 		return nil, err
 	}
 	if err := instance.Start(); err != nil {
+		_ = instance.Close()
 		return nil, err
 	}
 	internet.UseAlternativeSystemDialer(systemDialer{})
@@ -101,51 +106,143 @@ func (h *hub) ensure() (*xcore.Instance, error) {
 
 func (h *hub) add(key string, d N.Dialer, logger log.ContextLogger, set *handlerSet) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	instance, err := h.ensure()
 	if err != nil {
+		h.mu.Unlock()
 		return E.Cause(err, "start xray")
 	}
 	e := &entry{dialer: d, logger: logger}
 	h.entries[key] = e
-	h.last = e
+	h.last.Store(e)
 	for i, cfg := range set.configs {
-		if err := xcore.AddOutboundHandler(instance, cfg); err != nil {
-			h.removeLocked(key, set.tags[:i])
+		if err := addHandler(instance, cfg); err != nil {
+			settings := h.removeLocked(key, set.tags[:i])
+			h.mu.Unlock()
+			purgeTransportClients(settings)
 			return E.Cause(err, "xray outbound")
 		}
 	}
+	h.mu.Unlock()
 	return nil
+}
+
+// addHandler guards against panics in Xray while it creates a handler.
+func addHandler(instance *xcore.Instance, cfg *xcore.OutboundHandlerConfig) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = E.New("panic: ", r)
+		}
+	}()
+	return xcore.AddOutboundHandler(instance, cfg)
 }
 
 func (h *hub) remove(key string, set *handlerSet) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.removeLocked(key, set.tags)
-}
-
-func (h *hub) removeLocked(key string, tags []string) {
-	if h.instance != nil {
-		if manager, ok := h.instance.GetFeature(xoutbound.ManagerType()).(xoutbound.Manager); ok {
-			for _, tag := range tags {
-				handler := manager.GetHandler(tag)
-				_ = manager.RemoveHandler(context.Background(), tag)
-				if handler != nil {
-					_ = xcommon.Close(handler)
-				}
-			}
+	settings := h.removeLocked(key, set.tags)
+	h.mu.Unlock()
+	purgeTransportClients(settings)
+	if len(settings) > 0 {
+		// dials that were already under way create their clients a moment
+		// later: clean up once more after them
+		for _, d := range []time.Duration{3 * time.Second, 30 * time.Second} {
+			time.AfterFunc(d, func() { purgeTransportClients(settings) })
 		}
 	}
-	if e := h.entries[key]; e != nil && h.last == e {
-		h.last = nil
+}
+
+// removeLocked removes the handlers and returns their stream settings, so
+// the transport clients they created can be dropped (outside the lock).
+func (h *hub) removeLocked(key string, tags []string) []*internet.MemoryStreamConfig {
+	var settings []*internet.MemoryStreamConfig
+	if manager := h.manager(); manager != nil {
+		for _, tag := range tags {
+			handler := manager.GetHandler(tag)
+			if handler == nil {
+				continue
+			}
+			settings = append(settings, handlerStreamSettings(handler))
+			_ = manager.RemoveHandler(context.Background(), tag)
+			_ = xcommon.Close(handler)
+		}
+	}
+	if e := h.entries[key]; e != nil {
+		h.last.CompareAndSwap(e, nil)
 	}
 	delete(h.entries, key)
-	if h.last == nil {
+	if h.last.Load() == nil {
 		for _, e := range h.entries {
-			h.last = e
+			h.last.Store(e)
 			break
 		}
 	}
+	return settings
+}
+
+func (h *hub) manager() xoutbound.Manager {
+	if h.instance == nil {
+		return nil
+	}
+	manager, _ := h.instance.GetFeature(xoutbound.ManagerType()).(xoutbound.Manager)
+	return manager
+}
+
+// resetTransports drops the pooled transport connections (XHTTP, gRPC) of
+// a set of handlers, e.g. after a network change made their sockets dead.
+func (h *hub) resetTransports(set *handlerSet) {
+	var settings []*internet.MemoryStreamConfig
+	h.mu.Lock()
+	if manager := h.manager(); manager != nil {
+		for _, tag := range set.tags {
+			if handler := manager.GetHandler(tag); handler != nil {
+				settings = append(settings, handlerStreamSettings(handler))
+			}
+		}
+	}
+	h.mu.Unlock()
+	purgeTransportClients(settings)
+}
+
+// Stats describes the shared Xray instance (used by tests to find leaks).
+type Stats struct {
+	// Outbounds is the number of sing-box "xray" outbounds started.
+	Outbounds int
+	// Handlers is the number of Xray outbound handlers.
+	Handlers int
+	// TransportClients counts the pooled XHTTP and gRPC clients.
+	TransportClients int
+}
+
+// CurrentStats returns the current numbers.
+func CurrentStats() Stats {
+	h := globalHub
+	h.mu.Lock()
+	s := Stats{Outbounds: len(h.entries)}
+	if manager := h.manager(); manager != nil {
+		s.Handlers = len(manager.ListHandlers(context.Background()))
+	}
+	h.mu.Unlock()
+	s.TransportClients = cachedTransportClients()
+	return s
+}
+
+// Check reports whether the Xray engine accepts these outbounds (the first
+// one is the server, the others its helpers), so a server with a broken
+// config can be rejected when it is imported instead of failing the whole
+// connection later.
+func Check(outbounds []any) error {
+	raws := make([]json.RawMessage, 0, len(outbounds))
+	for _, o := range outbounds {
+		data, err := stdjson.Marshal(o)
+		if err != nil {
+			return err
+		}
+		raws = append(raws, data)
+	}
+	if len(raws) == 0 {
+		return E.New("xray: no outbounds")
+	}
+	_, err := buildHandlers("check", raws)
+	return err
 }
 
 func (h *hub) instanceFor(key string) *xcore.Instance {
@@ -170,7 +267,7 @@ func (h *hub) entryFor(ctx context.Context) *entry {
 			}
 		}
 	}
-	return h.last
+	return h.last.Load()
 }
 
 // systemDialer makes Xray's network connections with sing-box's dialer:
@@ -229,9 +326,7 @@ func (logHandler) Handle(msg xlog.Message) {
 	if !ok || m.Severity > xlog.Severity_Warning {
 		return
 	}
-	globalHub.mu.Lock()
-	e := globalHub.last
-	globalHub.mu.Unlock()
+	e := globalHub.last.Load()
 	if e == nil || e.logger == nil {
 		return
 	}

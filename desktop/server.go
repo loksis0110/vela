@@ -33,9 +33,11 @@ type Server struct {
 
 func NewServer(app *App) *Server {
 	token := randomID() + randomID()
-	// after an update the new Vela keeps the token, so the open window
-	// reconnects to it
+	// after an update or a restart with admin rights the new Vela keeps the
+	// token, so the open window reconnects to it
 	if t := os.Getenv("VELA_UI_TOKEN"); len(t) >= 32 && len(t) <= 128 {
+		token = t
+	} else if t := *tokenArg; len(t) >= 32 && len(t) <= 128 {
 		token = t
 	}
 	os.Unsetenv("VELA_UI_TOKEN")
@@ -68,7 +70,12 @@ func (s *Server) Serve(l net.Listener) error {
 	static := http.FileServer(http.FS(sub))
 	mux.Handle("/", noCache(static))
 	mux.HandleFunc("/show", func(w http.ResponseWriter, r *http.Request) {
-		// another launch of Vela.exe asks us to bring the window back
+		// another (older) launch of Vela.exe asks us to bring the window
+		// back; web pages can't (browsers mark their requests)
+		if fromBrowser(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		showWindow()
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -218,7 +225,17 @@ func (s *Server) Serve(l net.Listener) error {
 		reply(w, "", nil)
 	}))
 	mux.HandleFunc("/api/elevate", s.auth(func(w http.ResponseWriter, r *http.Request) {
-		if err := relaunchElevated(); err != nil {
+		// the new Vela waits for this one to exit, keeps the token (the open
+		// window reconnects to it instead of a second window opening) and
+		// connects only when the user was connecting
+		args := []string{"-restarted", "-token=" + s.token}
+		if s.app.subscribers() > 0 {
+			args = append(args, "-hidden")
+		}
+		if s.app.wantsConnection() {
+			args = append(args, "-connect")
+		}
+		if err := relaunchElevated(args); err != nil {
 			reply(w, "", err)
 			return
 		}
@@ -421,6 +438,16 @@ func (s *Server) Serve(l net.Listener) error {
 	}))
 	srv := &http.Server{Handler: s.guard(mux), ReadHeaderTimeout: 10 * time.Second}
 	return srv.Serve(l)
+}
+
+// fromBrowser reports a request made by a web page rather than by Vela.exe.
+func fromBrowser(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "none", "same-origin":
+	default:
+		return true
+	}
+	return r.Header.Get("Origin") != ""
 }
 
 // guard blocks DNS-rebinding: only requests addressed to our loopback host

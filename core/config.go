@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -65,6 +67,10 @@ type Settings struct {
 	// package names or Windows process names (chrome.exe).
 	AppMode string   `json:"appMode,omitempty"`
 	Apps    []string `json:"apps,omitempty"`
+	// RequireEncryption leaves out servers that would carry traffic
+	// unencrypted (VLESS/Trojan/SOCKS/HTTP without TLS or Reality, VMess
+	// with security none/zero, Shadowsocks "none"), see IsEncrypted.
+	RequireEncryption bool `json:"requireEncryption,omitempty"`
 }
 
 // RoutingRule sends matching traffic direct, through the VPN or blocks it.
@@ -148,10 +154,16 @@ func InstallRules(dir string) error {
 			return err
 		}
 		target := filepath.Join(dir, e.Name())
-		if old, err := os.ReadFile(target); err == nil && len(old) == len(data) {
+		if old, err := os.ReadFile(target); err == nil && bytes.Equal(old, data) {
 			continue
 		}
-		if err := os.WriteFile(target, data, 0o644); err != nil {
+		// a running core may read the file: replace it in one step
+		tmp := target + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, target); err != nil {
+			os.Remove(tmp)
 			return err
 		}
 	}
@@ -180,7 +192,7 @@ func BuildConfig(req BuildRequest) (string, error) {
 	if s.DirectDNS == "" {
 		s.DirectDNS = def.DirectDNS
 	}
-	if s.ProxyPort == 0 {
+	if s.ProxyPort <= 0 || s.ProxyPort > 65535 {
 		s.ProxyPort = def.ProxyPort
 	}
 	if s.LogLevel == "" {
@@ -202,15 +214,27 @@ func BuildConfig(req BuildRequest) (string, error) {
 	var nodeTags []string
 	selected := ""
 	seenTag := map[string]bool{}
+	var firstErr error
+	unencrypted := 0
 	for _, n := range req.Nodes {
 		// re-read the original link so fixes in the parser apply to servers
-		// saved by older app versions
+		// saved by older app versions; a link that no longer parses is left
+		// out (its old outbound could stop the whole core from starting)
 		if n.Link != "" {
-			if fresh, err := ParseLink(n.Link); err == nil {
-				n.Outbound = fresh.Outbound
+			fresh, err := ParseLink(n.Link)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
 			}
+			n.Outbound = fresh.Outbound
 		}
 		if n.Outbound == nil {
+			continue
+		}
+		if s.RequireEncryption && !IsEncrypted(n) {
+			unencrypted++
 			continue
 		}
 		ob := map[string]any{}
@@ -231,6 +255,12 @@ func BuildConfig(req BuildRequest) (string, error) {
 		}
 	}
 	if len(nodeTags) == 0 {
+		switch {
+		case unencrypted > 0:
+			return "", errorf("нет серверов с шифрованием трафика")
+		case firstErr != nil:
+			return "", fmt.Errorf("%s: %w", T("нет серверов для подключения"), firstErr)
+		}
 		return "", errorf("нет серверов для подключения")
 	}
 	selectorItems := append([]string{TagAuto}, nodeTags...)
@@ -250,7 +280,10 @@ func BuildConfig(req BuildRequest) (string, error) {
 		for _, t := range auto {
 			keep[t] = true
 		}
-		for _, id := range req.Favorites {
+		for i, id := range req.Favorites {
+			if i == MaxAutoCandidates {
+				break
+			}
 			keep[NodeTag(Node{ID: id})] = true
 		}
 		var obs []any
@@ -306,11 +339,18 @@ func BuildConfig(req BuildRequest) (string, error) {
 	}
 
 	// --- DNS -----------------------------------------------------------------
-	dnsServers := []any{
-		remoteDNS(s.RemoteDNS),
-		map[string]any{"type": "udp", "tag": "dns-direct", "server": s.DirectDNS},
+	remote, ok := dnsServer("dns-remote", s.RemoteDNS, "tcp")
+	if !ok || remote["type"] == "local" {
+		remote, _ = dnsServer("dns-remote", def.RemoteDNS, "tcp")
 	}
-	dnsRules := []any{}
+	remote["detour"] = TagSelector
+	direct, ok := dnsServer("dns-direct", s.DirectDNS, "udp")
+	if !ok {
+		direct, _ = dnsServer("dns-direct", def.DirectDNS, "udp")
+	}
+	dnsServers := []any{remote, direct}
+	// user rules come first, like in routing
+	dnsRules := userDNSRules(s.Rules)
 	if s.BlockAds {
 		dnsRules = append(dnsRules, map[string]any{"rule_set": []string{"ads"}, "action": "predefined", "rcode": "NOERROR"})
 	}
@@ -331,8 +371,13 @@ func BuildConfig(req BuildRequest) (string, error) {
 	dnsFinal := "dns-remote"
 	if blocked {
 		// blocked sites are resolved through the tunnel (providers' DNS may
-		// return stub addresses for them), everything else locally
-		dnsRules = append(dnsRules, map[string]any{"rule_set": []string{"ru-blocked", "ru-inside"}, "server": "dns-remote"})
+		// return stub addresses for them), everything else locally.
+		// ru-inside also lists IP ranges: matched against the response they
+		// would send every query through the tunnel first (sing-box tries
+		// the server, then checks the answer); matching them against the
+		// source address instead makes this rule match by domain only.
+		dnsRules = append(dnsRules, map[string]any{"rule_set": []string{"ru-blocked", "ru-inside"},
+			"rule_set_ip_cidr_match_source": true, "server": "dns-remote"})
 		dnsFinal = "dns-direct"
 	}
 	desktopApps := req.Platform != PlatformAndroid && req.Platform != PlatformIOS && len(s.Apps) > 0 && s.Mode == "tun"
@@ -368,7 +413,9 @@ func BuildConfig(req BuildRequest) (string, error) {
 			"strict_route": true,
 			"stack":        s.Stack,
 		}
-		if s.IPv6 {
+		if s.IPv6 || mobile {
+			// phones: without an IPv6 address the system sends IPv6 past the
+			// VPN; with IPv6 off it is captured and refused below instead
 			tunIn["address"] = []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"}
 		}
 		if req.Platform == PlatformWindows {
@@ -412,9 +459,14 @@ func BuildConfig(req BuildRequest) (string, error) {
 	rules := []any{
 		map[string]any{"action": "sniff"},
 		map[string]any{"protocol": "dns", "action": "hijack-dns"},
-		map[string]any{"ip_is_private": true, "outbound": TagDirect},
 	}
+	if !s.IPv6 && mobile && s.Mode == "tun" {
+		rules = append(rules, map[string]any{"ip_version": 6, "action": "reject"})
+	}
+	// user rules are checked before everything else (also before the local
+	// network rule: "send 10.0.0.0/8 through the VPN" must work)
 	rules = append(rules, userRules(s.Rules)...)
+	rules = append(rules, map[string]any{"ip_is_private": true, "outbound": TagDirect})
 	final := TagSelector
 	findProcess := false
 	if !mobile && len(s.Apps) > 0 && s.Mode == "tun" {
@@ -601,35 +653,72 @@ func applyFragment(ob map[string]any, mode string) {
 	ob["tls"] = copied
 }
 
+// userRuleMatch converts the match of a user rule into a sing-box rule
+// condition; nil when it is not usable.
+func userRuleMatch(match string) map[string]any {
+	m := strings.TrimSpace(strings.ToLower(match))
+	m = strings.TrimPrefix(strings.TrimPrefix(m, "https://"), "http://")
+	if i := strings.IndexByte(m, '/'); i >= 0 && net.ParseIP(strings.Trim(m[:i], "[]")) == nil {
+		m = m[:i] // drop URL path, keep CIDR
+	}
+	if h, _, err := net.SplitHostPort(m); err == nil {
+		m = h // example.com:443, [2001:db8::1]:443
+	}
+	m = strings.Trim(m, "[]")
+	if m == "" {
+		return nil
+	}
+	rule := map[string]any{}
+	switch {
+	case strings.HasPrefix(m, "*") && strings.HasSuffix(m, "*") && len(m) > 2:
+		rule["domain_keyword"] = []string{strings.Trim(m, "*")}
+	case net.ParseIP(m) != nil:
+		if strings.Contains(m, ":") {
+			rule["ip_cidr"] = []string{m + "/128"}
+		} else {
+			rule["ip_cidr"] = []string{m + "/32"}
+		}
+	case strings.Contains(m, "/"):
+		if _, _, err := net.ParseCIDR(m); err != nil {
+			return nil
+		}
+		rule["ip_cidr"] = []string{m}
+	default:
+		rule["domain_suffix"] = []string{strings.TrimPrefix(strings.TrimPrefix(m, "*."), ".")}
+	}
+	return rule
+}
+
+// userDNSRules resolves domains of user rules where their traffic goes:
+// through the tunnel for "proxy" (a local resolver may return a stub
+// address for a blocked site), locally for "direct".
+func userDNSRules(list []RoutingRule) []any {
+	out := []any{}
+	for _, r := range list {
+		rule := userRuleMatch(r.Match)
+		if rule == nil || rule["ip_cidr"] != nil {
+			continue
+		}
+		switch r.Action {
+		case "proxy":
+			rule["server"] = "dns-remote"
+		case "block":
+			continue
+		default:
+			rule["server"] = "dns-direct"
+		}
+		out = append(out, rule)
+	}
+	return out
+}
+
 // userRules converts routing rules from the settings into sing-box rules.
 func userRules(list []RoutingRule) []any {
 	var out []any
 	for _, r := range list {
-		m := strings.TrimSpace(strings.ToLower(r.Match))
-		m = strings.TrimPrefix(strings.TrimPrefix(m, "https://"), "http://")
-		if i := strings.IndexByte(m, '/'); i >= 0 && net.ParseIP(m[:i]) == nil {
-			m = m[:i] // drop URL path, keep CIDR
-		}
-		if m == "" {
+		rule := userRuleMatch(r.Match)
+		if rule == nil {
 			continue
-		}
-		rule := map[string]any{}
-		switch {
-		case strings.HasPrefix(m, "*") && strings.HasSuffix(m, "*") && len(m) > 2:
-			rule["domain_keyword"] = []string{strings.Trim(m, "*")}
-		case net.ParseIP(m) != nil:
-			if strings.Contains(m, ":") {
-				rule["ip_cidr"] = []string{m + "/128"}
-			} else {
-				rule["ip_cidr"] = []string{m + "/32"}
-			}
-		case strings.Contains(m, "/"):
-			if _, _, err := net.ParseCIDR(m); err != nil {
-				continue
-			}
-			rule["ip_cidr"] = []string{m}
-		default:
-			rule["domain_suffix"] = []string{strings.TrimPrefix(m, "*.")}
 		}
 		switch r.Action {
 		case "block":
@@ -644,29 +733,57 @@ func userRules(list []RoutingRule) []any {
 	return out
 }
 
-// remoteDNS turns "https://1.1.1.1/dns-query", "tls://8.8.8.8" or "1.1.1.1"
-// into a DNS server object that is resolved through the tunnel.
-func remoteDNS(addr string) map[string]any {
-	server := map[string]any{"tag": "dns-remote", "detour": TagSelector}
-	switch {
-	case len(addr) > 8 && addr[:8] == "https://":
-		rest := addr[8:]
-		host, path := rest, "/dns-query"
-		for i := 0; i < len(rest); i++ {
-			if rest[i] == '/' {
-				host, path = rest[:i], rest[i:]
-				break
-			}
-		}
-		server["type"] = "https"
-		server["server"] = host
-		server["path"] = path
-	case len(addr) > 6 && addr[:6] == "tls://":
-		server["type"] = "tls"
-		server["server"] = addr[6:]
-	default:
-		server["type"] = "tcp"
-		server["server"] = addr
+// dnsServer turns a DNS address from the settings into a sing-box DNS
+// server: "https://1.1.1.1/dns-query", "h3://dns.google/dns-query",
+// "tls://8.8.8.8", "quic://dns.adguard-dns.com", "tcp://1.1.1.1",
+// "udp://8.8.8.8:53", "1.1.1.1" (plainType), "[2606:4700::1111]:53" or
+// "local". ok is false for something unusable.
+func dnsServer(tag, addr, plainType string) (map[string]any, bool) {
+	addr = strings.TrimSpace(addr)
+	switch strings.ToLower(addr) {
+	case "":
+		return nil, false
+	case "local", "system":
+		return map[string]any{"type": "local", "tag": tag}, true
 	}
-	return server
+	typ, rest := plainType, addr
+	if scheme, r, ok := strings.Cut(addr, "://"); ok {
+		switch strings.ToLower(scheme) {
+		case "https", "doh":
+			typ = "https"
+		case "h3":
+			typ = "h3"
+		case "tls", "dot":
+			typ = "tls"
+		case "quic", "doq":
+			typ = "quic"
+		case "tcp", "udp":
+			typ = strings.ToLower(scheme)
+		default:
+			return nil, false
+		}
+		rest = r
+	}
+	hostport, path, hasPath := strings.Cut(rest, "/")
+	host, port := strings.Trim(hostport, "[]"), 0
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+		if port, err = strconv.Atoi(p); err != nil || port <= 0 || port > 65535 {
+			return nil, false
+		}
+	}
+	if host == "" || strings.ContainsAny(host, " /@") {
+		return nil, false
+	}
+	server := map[string]any{"type": typ, "tag": tag, "server": host}
+	if port > 0 {
+		server["server_port"] = port
+	}
+	if typ == "https" || typ == "h3" {
+		server["path"] = "/dns-query"
+		if hasPath && path != "" {
+			server["path"] = "/" + path
+		}
+	}
+	return server, true
 }

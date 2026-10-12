@@ -17,7 +17,7 @@ import (
 	"fyne.io/systray"
 )
 
-var Version = "1.4.0"
+var Version = "1.4.1"
 
 //go:embed assets/tray-off.ico
 var trayOff []byte
@@ -33,6 +33,7 @@ var (
 	connectArg = flag.Bool("connect", false, "connect right after start")
 	restartArg = flag.Bool("restarted", false, "started by the updater")
 	fromArg    = flag.String("from", "", "version before the update")
+	tokenArg   = flag.String("token", "", "window token of the previous instance")
 )
 
 func main() {
