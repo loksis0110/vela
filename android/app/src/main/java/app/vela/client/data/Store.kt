@@ -18,8 +18,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import android.util.Log
 import java.io.File
 import java.security.SecureRandom
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class Node(
     val id: String,
@@ -102,7 +105,8 @@ data class Profile(
 private fun JSONArray?.toNodes(): List<Node> {
     if (this == null) return emptyList()
     // the same server twice breaks lists (duplicate keys) and the config
-    return (0 until length()).map { Node.from(getJSONObject(it)) }.distinctBy { it.id }
+    return (0 until length()).mapNotNull { optJSONObject(it)?.let(Node::from) }
+        .filter { it.id.isNotEmpty() }.distinctBy { it.id }
 }
 
 /** User routing rule: domain, *keyword* or IP/CIDR → direct, proxy or block. */
@@ -169,7 +173,7 @@ data class Settings(
 }
 
 private fun JSONArray?.strings(): List<String> =
-    if (this == null) emptyList() else (0 until length()).map { getString(it) }
+    if (this == null) emptyList() else (0 until length()).mapNotNull { i -> opt(i)?.takeIf { it != JSONObject.NULL }?.toString() }
 
 /** Subscription settings. Defaults: auto update as the provider says, HWID on. */
 data class SubPrefs(
@@ -256,7 +260,19 @@ object Store {
             dismissedAnnounce.value = o.keys().asSequence().associateWith { o.getString(it) }
         }
         if (_state.value.hwid.isEmpty()) update { it.copy(hwid = randomId(16)) }
+        relabel()
         applyFetchOptions()
+    }
+
+    /**
+     * «My servers» is named in the app language (1.3 stored the Russian name);
+     * a name the user gave it stays.
+     */
+    fun relabel() {
+        val label = Lang.str(R.string.my_servers)
+        val manual = _state.value.profiles.firstOrNull { it.id == MANUAL_ID } ?: return
+        if (manual.customName.isNotBlank() || manual.name == label) return
+        update { st -> st.copy(profiles = st.profiles.map { if (it.id == MANUAL_ID && it.customName.isBlank()) it.copy(name = label) else it }) }
     }
 
     /** Statistics file written by the traffic recorder of the core. */
@@ -321,26 +337,36 @@ object Store {
     /** Core log of the current connection (shown in Settings). */
     val logFile: File get() = File(dataDir, "core.log")
 
-    private fun load(): AppState = runCatching {
-        val o = JSONObject(file.readText())
-        AppState(
-            profiles = o.optJSONArray("profiles")?.let { arr ->
-                (0 until arr.length()).map { Profile.from(arr.getJSONObject(it)) }
-            } ?: emptyList(),
-            activeProfile = o.optString("activeProfile"),
-            selectedNode = o.optString("selectedNode", "auto"),
-            settings = Settings.from(o.optJSONObject("settings")),
-            wasConnected = o.optBoolean("wasConnected"),
-            favorites = o.optJSONArray("favorites").strings().toSet(),
-            theme = o.optString("theme", "system"),
-            sub = SubPrefs.from(o.optJSONObject("sub")),
-            hwid = o.optString("hwid"),
-            connectOnLaunch = o.optBoolean("connectOnLaunch"),
-            sortByPing = o.optBoolean("sortByPing"),
-            noClipboard = o.optBoolean("noClipboard"),
-            noReminders = o.optBoolean("noReminders"),
-        )
-    }.getOrDefault(AppState())
+    private fun load(): AppState {
+        val main = runCatching { parse(JSONObject(file.readText())) }
+        main.getOrNull()?.let { return it }
+        if (!file.exists()) return AppState()
+        // never overwrite what can't be read: keep it for recovery, then try the
+        // copy a write may have left behind
+        Log.w("VelaStore", "state.json is unreadable", main.exceptionOrNull())
+        runCatching { file.copyTo(File(dataDir, "state.json.bad"), overwrite = true) }
+        return runCatching { parse(JSONObject(File(dataDir, "state.json.tmp").readText())) }.getOrDefault(AppState())
+    }
+
+    private fun parse(o: JSONObject) = AppState(
+        // one broken entry must not cost the whole list
+        profiles = o.optJSONArray("profiles")?.let { arr ->
+            (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.let { runCatching { Profile.from(it) }.getOrNull() } }
+                .filter { it.id.isNotEmpty() }.distinctBy { it.id }
+        } ?: emptyList(),
+        activeProfile = o.optString("activeProfile"),
+        selectedNode = o.optString("selectedNode", "auto").ifEmpty { "auto" },
+        settings = runCatching { Settings.from(o.optJSONObject("settings")) }.getOrDefault(Settings()),
+        wasConnected = o.optBoolean("wasConnected"),
+        favorites = o.optJSONArray("favorites").strings().toSet(),
+        theme = o.optString("theme", "system"),
+        sub = runCatching { SubPrefs.from(o.optJSONObject("sub")) }.getOrDefault(SubPrefs()),
+        hwid = o.optString("hwid"),
+        connectOnLaunch = o.optBoolean("connectOnLaunch"),
+        sortByPing = o.optBoolean("sortByPing"),
+        noClipboard = o.optBoolean("noClipboard"),
+        noReminders = o.optBoolean("noReminders"),
+    )
 
     private fun loadPings() {
         runCatching {
@@ -361,24 +387,47 @@ object Store {
     @Synchronized
     private fun update(block: (AppState) -> AppState) {
         val next = block(_state.value)
+        if (next == _state.value) return
         _state.value = next
-        val o = JSONObject()
-            .put("profiles", JSONArray().apply { next.profiles.forEach { put(it.toJson()) } })
-            .put("activeProfile", next.activeProfile)
-            .put("selectedNode", next.selectedNode)
-            .put("settings", next.settings.toJson())
-            .put("wasConnected", next.wasConnected)
-            .put("favorites", JSONArray(next.favorites.toList()))
-            .put("theme", next.theme)
-            .put("sub", next.sub.toJson())
-            .put("hwid", next.hwid)
-            .put("connectOnLaunch", next.connectOnLaunch)
-            .put("sortByPing", next.sortByPing)
-            .put("noClipboard", next.noClipboard)
-            .put("noReminders", next.noReminders)
-        val tmp = File(file.parentFile, "state.json.tmp")
-        tmp.writeText(o.toString())
-        tmp.renameTo(file)
+        // written off the calling thread (often the UI); bursts of changes are
+        // coalesced and the newest state always ends up on disk
+        if (writeQueued.compareAndSet(false, true)) {
+            writer.execute {
+                writeQueued.set(false)
+                write(_state.value)
+            }
+        }
+    }
+
+    private val writer = Executors.newSingleThreadExecutor { r -> Thread(r, "vela-store").apply { isDaemon = true } }
+    private val writeQueued = AtomicBoolean(false)
+
+    private fun write(st: AppState) {
+        try {
+            val o = JSONObject()
+                .put("profiles", JSONArray().apply { st.profiles.forEach { put(it.toJson()) } })
+                .put("activeProfile", st.activeProfile)
+                .put("selectedNode", st.selectedNode)
+                .put("settings", st.settings.toJson())
+                .put("wasConnected", st.wasConnected)
+                .put("favorites", JSONArray(st.favorites.toList()))
+                .put("theme", st.theme)
+                .put("sub", st.sub.toJson())
+                .put("hwid", st.hwid)
+                .put("connectOnLaunch", st.connectOnLaunch)
+                .put("sortByPing", st.sortByPing)
+                .put("noClipboard", st.noClipboard)
+                .put("noReminders", st.noReminders)
+            val tmp = File(dataDir, "state.json.tmp")
+            tmp.writeText(o.toString())
+            if (!tmp.renameTo(file)) {
+                tmp.copyTo(file, overwrite = true)
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+            // full storage and the like: the app keeps working with what is in memory
+            Log.e("VelaStore", "can't save the state", e)
+        }
     }
 
     /** True when this subscription URL is already added. */

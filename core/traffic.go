@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,15 +38,19 @@ type trafficFile struct {
 
 var trafficMu sync.Mutex
 
-func loadTraffic(path string) trafficFile {
+func loadTraffic(path string) (trafficFile, error) {
 	f := trafficFile{Days: map[string][2]int64{}}
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &f)
-		if f.Days == nil {
-			f.Days = map[string][2]int64{}
-		}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return f, nil // no statistics yet
 	}
-	return f
+	if err := json.Unmarshal(data, &f); err != nil {
+		return trafficFile{Days: map[string][2]int64{}}, err
+	}
+	if f.Days == nil {
+		f.Days = map[string][2]int64{}
+	}
+	return f, nil
 }
 
 // AddTraffic adds bytes to the day of now in the statistics file.
@@ -55,7 +60,11 @@ func AddTraffic(path string, up, down int64, now time.Time) error {
 	}
 	trafficMu.Lock()
 	defer trafficMu.Unlock()
-	f := loadTraffic(path)
+	f, err := loadTraffic(path)
+	if err != nil {
+		// keep a damaged file for recovery instead of overwriting it
+		_ = os.Rename(path, path+".damaged")
+	}
 	day := now.Format("2006-01-02")
 	v := f.Days[day]
 	v[0] += max(up, 0)
@@ -72,8 +81,26 @@ func AddTraffic(path string, up, down int64, now time.Time) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	return writeFileAtomic(path, data)
+}
+
+// writeFileAtomic replaces a file so that a crash or power loss leaves
+// either the old or the new content, never an empty file.
+func writeFileAtomic(path string, data []byte) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -82,7 +109,7 @@ func AddTraffic(path string, up, down int64, now time.Time) error {
 // LoadTrafficSummary reads the statistics file.
 func LoadTrafficSummary(path string, now time.Time) TrafficSummary {
 	trafficMu.Lock()
-	f := loadTraffic(path)
+	f, _ := loadTraffic(path)
 	trafficMu.Unlock()
 	var s TrafficSummary
 	months := map[string]*TrafficDay{}
@@ -119,6 +146,14 @@ func LoadTrafficSummary(path string, now time.Time) TrafficSummary {
 	return s
 }
 
+// controllerClient is shared: the connections screen polls every second, a
+// new transport per call would leave a kept-alive connection behind each time.
+var controllerClient = &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+	Proxy:               nil,
+	MaxIdleConnsPerHost: 4,
+	IdleConnTimeout:     30 * time.Second,
+}}
+
 // controllerGet calls the local Clash API of a running core.
 func controllerGet(ctx context.Context, method string, port int, secret, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, method, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
@@ -128,8 +163,7 @@ func controllerGet(ctx context.Context, method string, port int, secret, path st
 	if secret != "" {
 		req.Header.Set("Authorization", "Bearer "+secret)
 	}
-	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
-	resp, err := client.Do(req)
+	resp, err := controllerClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -177,11 +211,20 @@ func StartTrafficRecorder(port int, secret, path string) *TrafficRecorder {
 	go func() {
 		defer close(r.done)
 		var lastUp, lastDown int64
-		sample := func() {
+		read := func() (clashConnections, bool) {
 			var c clashConnections
 			qctx, qcancel := context.WithTimeout(context.Background(), 4*time.Second)
 			defer qcancel()
-			if controllerGet(qctx, http.MethodGet, port, secret, "/connections", &c) != nil {
+			return c, controllerGet(qctx, http.MethodGet, port, secret, "/connections", &c) == nil
+		}
+		// the totals so far were counted by an earlier recorder of the same
+		// core (or are the first moments of a fresh one): start from them
+		if c, ok := read(); ok {
+			lastUp, lastDown = c.UploadTotal, c.DownloadTotal
+		}
+		sample := func() {
+			c, ok := read()
+			if !ok {
 				return
 			}
 			up, down := c.UploadTotal-lastUp, c.DownloadTotal-lastDown
@@ -248,7 +291,7 @@ func ListConnections(port int, secret string) ([]Connection, error) {
 		host := x.Metadata.Host
 		dest := x.Metadata.DestinationIP
 		if x.Metadata.DestinationPort != "" {
-			dest = dest + ":" + x.Metadata.DestinationPort
+			dest = net.JoinHostPort(dest, x.Metadata.DestinationPort)
 		}
 		if host == "" {
 			host = x.Metadata.DestinationIP

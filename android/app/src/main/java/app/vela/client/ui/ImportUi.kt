@@ -257,22 +257,29 @@ fun AddDialog(initial: String, onDismiss: () -> Unit, onSubmit: (String, (String
                 error?.let { Text(it, color = Vela.Danger, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp)) }
                 Row(Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.Start) {
                     TextButton(onClick = {
-                        val clip = context.getSystemService(ClipboardManager::class.java).primaryClip
-                        val pasted = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+                        val pasted = runCatching {
+                            val clip = context.getSystemService(ClipboardManager::class.java)?.primaryClip
+                            clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+                        }.getOrNull()
                         if (pasted.isNullOrBlank()) error = clipEmpty else text = pasted.trim()
                     }) { Text(stringResource(R.string.add_from_clipboard), color = Vela.Star) }
                 }
                 Row {
                     TextButton(onClick = {
-                        scanner.launch(
-                            ScanOptions()
-                                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                                .setPrompt(scanPrompt)
-                                .setBeepEnabled(false)
-                                .setOrientationLocked(false),
-                        )
+                        runCatching {
+                            scanner.launch(
+                                ScanOptions()
+                                    .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                    .setPrompt(scanPrompt)
+                                    .setBeepEnabled(false)
+                                    .setOrientationLocked(false),
+                            )
+                        }.onFailure { error = noQr }
                     }) { Text(stringResource(R.string.add_scan_qr), color = Vela.Star) }
-                    TextButton(onClick = { picker.launch("image/*") }) { Text(stringResource(R.string.add_qr_photo), color = Vela.Star) }
+                    // some devices (and work profiles) have no picture picker
+                    TextButton(onClick = { runCatching { picker.launch("image/*") }.onFailure { error = noQr } }) {
+                        Text(stringResource(R.string.add_qr_photo), color = Vela.Star)
+                    }
                 }
             }
         },

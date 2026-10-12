@@ -53,11 +53,13 @@ object Lang {
             lm.applicationLocales = if (lang == "system") LocaleList.getEmptyLocaleList() else LocaleList.forLanguageTags(lang)
             cached = null
             applyToCore()
+            (activity.application as? VelaApp)?.onLanguageChanged()
             // Android recreates the activity itself
         } else {
-            activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, lang).apply()
+            activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, lang).commit()
             cached = null
             applyToCore()
+            (activity.application as? VelaApp)?.onLanguageChanged()
             activity.recreate()
         }
     }

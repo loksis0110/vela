@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/base64"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -81,7 +82,7 @@ func ParseDeepLink(raw string) (ImportRequest, error) {
 		}
 		name := ""
 		if i := strings.Index(rest, "#"); i >= 0 {
-			name, _ = url.PathUnescape(rest[i+1:])
+			name = unescapeName(rest[i+1:])
 		}
 		return ImportRequest{Subscriptions: []string{strings.TrimSpace(decoded)}, Name: name}, nil
 	}
@@ -92,8 +93,10 @@ func ParseDeepLink(raw string) (ImportRequest, error) {
 	name := ""
 	// the name often sits in the fragment
 	body := rest
+	fragment := ""
 	if i := strings.LastIndex(body, "#"); i >= 0 {
-		name, _ = url.PathUnescape(body[i+1:])
+		fragment = body[i+1:]
+		name = unescapeName(fragment)
 		body = body[:i]
 	}
 	// ?url=...&name=...
@@ -111,9 +114,26 @@ func ParseDeepLink(raw string) (ImportRequest, error) {
 	}
 	// <action>/<target>
 	if _, target, ok := strings.Cut(body, "/"); ok && target != "" {
+		if fragment != "" && isProxyLink(target) {
+			// vela://import/vless://...#Server: the name belongs to the server
+			return linksRequest(target+"#"+fragment, "")
+		}
 		return targetRequest(target, name)
 	}
+	// streisand://<base64 of a link>
+	if decoded, ok := tryBase64(body); ok {
+		if decoded = strings.TrimSpace(decoded); isHTTP(decoded) || isProxyLink(decoded) {
+			return targetRequest(decoded, name)
+		}
+	}
 	return ImportRequest{}, errorf("в ссылке нет подписки")
+}
+
+func unescapeName(s string) string {
+	if n, err := url.PathUnescape(s); err == nil {
+		return strings.TrimSpace(n)
+	}
+	return strings.TrimSpace(s)
 }
 
 func targetRequest(target, name string) (ImportRequest, error) {
@@ -161,17 +181,12 @@ func DetectImport(text string) ImportRequest {
 		return ImportRequest{}
 	}
 	// a single app link
-	if !strings.ContainsAny(text, " \n\r\t") {
-		if scheme, _, ok := strings.Cut(text, "://"); ok {
-			s := strings.ToLower(scheme)
-			for _, known := range append(DeepLinkSchemes, "sub") {
-				if s == known {
-					if req, err := ParseDeepLink(text); err == nil {
-						return req
-					}
-					return ImportRequest{}
-				}
+	if single := trimURL(text); !strings.ContainsAny(single, " \n\r\t") {
+		if scheme, _, ok := strings.Cut(single, "://"); ok && isDeepLinkScheme(scheme) {
+			if req, err := ParseDeepLink(single); err == nil {
+				return req
 			}
+			return ImportRequest{}
 		}
 	}
 	subs, rest := SplitImport(text)
@@ -198,26 +213,141 @@ func DetectImport(text string) ImportRequest {
 	return req
 }
 
-// looksLikeSubscription filters out ordinary web pages copied by the user:
-// subscription URLs have a long token in the path or query.
-func looksLikeSubscription(u *url.URL) bool {
-	p := strings.Trim(u.Path, "/")
-	segments := strings.Split(p, "/")
-	last := segments[len(segments)-1]
-	if strings.Contains(strings.ToLower(p), "sub") || strings.Contains(strings.ToLower(u.Host), "sub") {
+func isDeepLinkScheme(scheme string) bool {
+	s := strings.ToLower(scheme)
+	if s == "sub" {
 		return true
 	}
-	if len(last) >= 10 && !strings.Contains(last, ".") {
-		return true
-	}
-	for _, v := range u.Query() {
-		for _, s := range v {
-			if len(s) >= 16 {
-				return true
-			}
+	for _, known := range DeepLinkSchemes {
+		if s == known {
+			return true
 		}
 	}
 	return false
+}
+
+// Sites people often copy links from; their URLs carry ids that look like
+// subscription tokens.
+var commonSites = []string{
+	"google.", "youtube.com", "youtu.be", "github.com", "gitlab.com",
+	"reddit.com", "wikipedia.org", "t.me", "telegram.", "vk.com", "vk.ru", "yandex.", "ya.ru",
+	"mail.ru", "ok.ru", "dzen.ru", "rutube.ru", "instagram.com", "facebook.com", "twitter.com",
+	"x.com", "tiktok.com", "apple.com", "microsoft.com", "live.com", "office.com", "amazon.",
+	"ozon.ru", "wildberries.ru", "avito.ru", "aliexpress.", "notion.", "figma.com", "dropbox.com",
+	"medium.com", "substack.com", "habr.com", "stackoverflow.com", "linkedin.com", "spotify.com",
+	"discord.com", "discord.gg", "zoom.us", "twitch.tv", "pinterest.", "imgur.com", "bit.ly",
+}
+
+func isCommonSite(host string) bool {
+	host = strings.ToLower(host)
+	for _, site := range commonSites {
+		if strings.HasSuffix(site, ".") {
+			if strings.HasPrefix(host, site) || strings.Contains(host, "."+site) {
+				return true
+			}
+		} else if host == site || strings.HasSuffix(host, "."+site) {
+			return true
+		}
+	}
+	return false
+}
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// tokenLike tells random tokens (Marzban, 3x-ui, Remnawave ids, UUIDs)
+// from words, numbers and article slugs ("post-2024-01-15-title").
+func tokenLike(s string, minLen int) bool {
+	if len(s) < minLen {
+		return false
+	}
+	if uuidPattern.MatchString(s) {
+		return true
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-' || c == '_' || c == '=') {
+			return false
+		}
+	}
+	// at least one part mixes letters with digits or both letter cases
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '-' || r == '_' }) {
+		var lower, upper, digit bool
+		for _, c := range part {
+			switch {
+			case c >= 'a' && c <= 'z':
+				lower = true
+			case c >= 'A' && c <= 'Z':
+				upper = true
+			case c >= '0' && c <= '9':
+				digit = true
+			}
+		}
+		if (lower || upper) && digit || lower && upper && len(part) >= 8 {
+			return true
+		}
+	}
+	return false
+}
+
+var subscriptionID = regexp.MustCompile(`^[A-Za-z0-9_=-]{6,}$`)
+
+// subscriptionWords are path segments and host labels subscription panels use.
+var subscriptionWords = map[string]bool{
+	"sub": true, "subs": true, "subscribe": true, "subscription": true, "vpn": true, "proxy": true,
+}
+
+// looksLikeSubscription filters out ordinary web pages copied by the user:
+// subscription URLs have a token (not a word or an article slug) in the
+// path or in a token-like query parameter.
+func looksLikeSubscription(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	if strings.HasSuffix(host, "githubusercontent.com") {
+		// free server lists published as files on GitHub
+		p := strings.ToLower(u.Path)
+		for _, w := range []string{"sub", "v2ray", "vless", "vmess", "vpn", "proxy", "config", "clash", "sing", "xray", "hysteria"} {
+			if strings.Contains(p, w) {
+				return true
+			}
+		}
+		return false
+	}
+	if isCommonSite(host) {
+		return false
+	}
+	keyword := false
+	for _, label := range strings.FieldsFunc(strings.ToLower(u.Hostname()), func(r rune) bool { return r == '.' || r == '-' }) {
+		if subscriptionWords[label] || strings.HasPrefix(label, "sub") && strings.Trim(label[3:], "0123456789") == "" {
+			keyword = true
+		}
+	}
+	shortToken, longToken := false, false
+	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i, seg := range segments {
+		if subscriptionWords[strings.ToLower(seg)] {
+			keyword = true
+		}
+		// "/sub/<id>": panels let admins pick readable ids
+		if l := strings.ToLower(seg); (l == "sub" || l == "subs") && i+1 < len(segments) && subscriptionID.MatchString(segments[i+1]) {
+			return true
+		}
+		if tokenLike(seg, 16) {
+			longToken = true
+		} else if tokenLike(seg, 8) {
+			shortToken = true
+		}
+	}
+	for key, values := range u.Query() {
+		switch strings.ToLower(key) {
+		case "token", "key", "sub", "subid", "uuid", "auth", "secret", "access_token", "apikey":
+			for _, v := range values {
+				if tokenLike(v, 8) {
+					return true
+				}
+			}
+		}
+	}
+	// panels often listen on their own port (2096, 8443, ...)
+	odd := u.Port() != "" && u.Port() != "443" && u.Port() != "80"
+	return longToken || (shortToken && (keyword || odd))
 }
 
 func looksLikeBase64(s string) bool {

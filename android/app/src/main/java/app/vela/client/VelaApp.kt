@@ -53,7 +53,13 @@ class VelaApp : Application() {
         super.onConfigurationChanged(newConfig)
         // the system language may have changed: texts of notifications, widget, core
         Lang.onConfigurationChanged()
-        Reminders.ensureChannel(this)
+        onLanguageChanged()
+    }
+
+    /** Texts shown outside of the activity follow a new app language. */
+    fun onLanguageChanged() {
+        runCatching { Reminders.ensureChannel(this) }
+        runCatching { Store.relabel() }
         runCatching { VelaWidget.updateAll(this) }
     }
 }
