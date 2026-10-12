@@ -309,7 +309,9 @@ func TestProbeStop(t *testing.T) {
 	var nodes []Node
 	ok, _ := ParseLink(link + "#ok")
 	nodes = append(nodes, ok)
-	for i := 0; i < 30; i++ {
+	// fewer than the per-host limit: the working server (same host here)
+	// must get its turn before the stop
+	for i := 0; i < probePerHost-2; i++ {
 		n, _ := ParseLink(fmt.Sprintf("vless://11111111-2222-3333-4444-%012d@127.0.0.1:%d?type=ws&path=%%2F%d&security=none#s%d",
 			i, silent.Addr().(*net.TCPAddr).Port, i, i))
 		nodes = append(nodes, n)
