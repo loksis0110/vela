@@ -658,8 +658,8 @@ final class Store: ObservableObject {
     // MARK: - Server check
 
     /// Set by «Остановить»: failures that arrive after it are not real.
-    private let stopFlag = StopFlag()
-    var stopRequested: Bool {
+    private nonisolated let stopFlag = StopFlag()
+    nonisolated var stopRequested: Bool {
         get { stopFlag.value }
         set { stopFlag.value = newValue }
     }

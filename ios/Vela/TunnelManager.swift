@@ -361,6 +361,9 @@ final class TunnelManager: ObservableObject {
             let newPort = Int.random(in: 20000 ... 60000)
             let newSecret = Store.randomID(16)
             let config = try Store.shared.buildConfig(port: newPort, secret: newSecret)
+            // a change of the VPN profile still running (a quick Disconnect
+            // and Connect) would make this save fail as stale
+            _ = await profileWork?.value
             let m = try await ensureManager()
             // the extension keeps the config of the last start for On Demand,
             // so the stored port changes only together with it
