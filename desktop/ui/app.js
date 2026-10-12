@@ -93,8 +93,7 @@ function connectEvents() {
       const d = msg.data;
       pings[d.id] = d.ms;
       if (d.reason) reasons[d.id] = d.reason; else delete reasons[d.id];
-      renderPings();
-      renderCurrent();
+      queuePing(d.id);
     } else if (msg.type === "speed") {
       onSpeed(msg.data);
     } else if (msg.type === "probe") {
@@ -256,8 +255,9 @@ function renderStatus() {
   const hero = $("#hero");
   hero.dataset.state = status.state;
   $("#statusText").textContent = t(stateKey[status.state] || "state.disconnected");
+  const ksBlocked = status.blocked && status.state === "disconnected";
   $("#toggleLabel").textContent =
-    status.state === "connected" ? t("toggle.disconnect") :
+    status.state === "connected" || ksBlocked ? t("toggle.disconnect") :
     status.state === "connecting" ? t("toggle.cancel") :
     status.state === "disconnecting" ? t("toggle.disconnecting") : t("toggle.connect");
   $("#toggle").setAttribute("aria-label", $("#toggleLabel").textContent);
@@ -290,7 +290,7 @@ function renderStatus() {
       act.hidden = false;
       act.textContent = t("banner.restart");
       act.onclick = elevate;
-    } else if (status.errorCode === "server_unreachable" && window.innerWidth < 900) {
+    } else if ((status.errorCode === "server_unreachable" || status.errorCode === "no_servers") && window.innerWidth < 900) {
       act.hidden = false;
       act.textContent = t("banner.pickServer");
       act.onclick = () => openSheet("servers");
@@ -478,17 +478,41 @@ function rank(ms) {
   return 1e7; // failed
 }
 
+function renderPingRow(el) {
+  const id = el.dataset.ping;
+  const pi = pingInfo(pings[id]);
+  setText(el, pi.text);
+  const cls = "ping " + pi.cls;
+  if (el.className !== cls) el.className = cls;
+  const title = reasons[id] || "";
+  if (el.title !== title) el.title = title;
+  const why = el.parentNode && el.parentNode.querySelector("[data-reason]");
+  if (why) setText(why, pings[id] === -1 && reasons[id] ? reasons[id] : "");
+}
+
 function renderPings() {
-  $$("[data-ping]").forEach((el) => {
-    const id = el.dataset.ping;
-    const pi = pingInfo(pings[id]);
-    el.textContent = pi.text;
-    el.className = "ping " + pi.cls;
-    el.title = reasons[id] || "";
-  });
-  $$("[data-reason]").forEach((el) => {
-    const id = el.dataset.reason;
-    el.textContent = pings[id] === -1 && reasons[id] ? reasons[id] : "";
+  $$("#nodeList [data-ping]").forEach(renderPingRow);
+}
+
+// a check of hundreds of servers sends an event per server: the rows are
+// updated once per frame, and only those that changed
+let pingQueue = new Set(), pingFrame = 0;
+function queuePing(id) {
+  pingQueue.add(id);
+  if (pingFrame) return;
+  pingFrame = requestAnimationFrame(() => {
+    pingFrame = 0;
+    const ids = pingQueue;
+    pingQueue = new Set();
+    if (ids.size > 60) renderPings();
+    else {
+      const list = $("#nodeList");
+      for (const id of ids) {
+        const el = list.querySelector(`[data-ping="${CSS.escape(id)}"]`);
+        if (el) renderPingRow(el);
+      }
+    }
+    renderCurrent();
   });
 }
 
@@ -1148,7 +1172,8 @@ async function toggle() {
   if (!snap) return;
   if (!activeProfile() && snap.profiles.length === 0) return openAdd();
   try {
-    if (status.state === "disconnected") await api("connect");
+    // blocked by the kill switch after a failed connect: «Disconnect» opens the internet
+    if (status.state === "disconnected" && !status.blocked) await api("connect");
     else await api("disconnect");
   } catch (e) { toast(e.message, true); }
 }
@@ -1163,6 +1188,7 @@ function openSheet(id) {
   if (id === "servers" && el.classList.contains("docked")) return;
   // one overlay sheet at a time
   $$(".sheet").forEach((s) => { if (s !== el && !s.classList.contains("docked")) s.hidden = true; });
+  if (el.hidden && !sheetOpener) sheetOpener = document.activeElement;
   el.hidden = false;
   if (id === "servers") renderServers();
   if (id === "stats") loadStats();
@@ -1171,9 +1197,14 @@ function openSheet(id) {
   const focusTarget = el.querySelector("[data-close]");
   if (focusTarget) focusTarget.focus();
 }
+let sheetOpener = null;
 function closeSheets() {
+  const wasOpen = $$(".sheet").some((s) => !s.hidden && !s.classList.contains("docked"));
   $$(".sheet").forEach((s) => { if (!s.classList.contains("docked")) s.hidden = true; });
   stopConnections();
+  const back = sheetOpener;
+  sheetOpener = null;
+  if (wasOpen && back && back.isConnected && back.offsetParent) back.focus();
 }
 
 function openAdd() {
@@ -1674,7 +1705,7 @@ document.addEventListener("paste", (e) => {
   const img = [...(e.clipboardData || {}).items || []].find((i) => i.type.startsWith("image/"));
   if (img) { e.preventDefault(); openAdd(); decodeQRFile(img.getAsFile()); return; }
   const text = (e.clipboardData || window.clipboardData).getData("text");
-  if (/^(https?|vless|vmess|trojan|ss|hysteria2|hy2|tuic):\/\//i.test(text.trim()) || text.trim().startsWith("vela-backup:")) {
+  if (/^[a-z][a-z0-9+.-]{1,20}:\/\/\S/i.test(text.trim()) || text.trim().startsWith("vela-backup:")) {
     openAdd();
     $("#addText").value = text.trim();
   }
@@ -1818,7 +1849,14 @@ $("#logsRefresh").addEventListener("click", loadLogs);
 $("#ipCard").addEventListener("click", refreshIP);
 $("#speedCard").addEventListener("click", runSpeed);
 
-$("#search").addEventListener("input", (e) => { filters.q = e.target.value.trim().toLowerCase(); renderNodes(); });
+let searchTimer;
+$("#search").addEventListener("input", (e) => {
+  filters.q = e.target.value.trim().toLowerCase();
+  clearTimeout(searchTimer);
+  const p = snap && snap.profiles.find((x) => x.id === viewProfile);
+  // a long list is rebuilt when typing pauses
+  searchTimer = setTimeout(renderNodes, p && p.nodes.length > 300 ? 150 : 0);
+});
 $("#filters").addEventListener("click", (e) => {
   const b = e.target.closest("[data-filter]");
   if (!b) return;
@@ -1843,6 +1881,8 @@ $("#addDialog").addEventListener("paste", (e) => {
 function applyLayout() {
   const servers = $("#servers");
   if (window.innerWidth >= 900) {
+    // resizing sends many events: the list is built once, when it docks
+    if (servers.classList.contains("docked")) return;
     servers.classList.add("docked");
     servers.hidden = false;
     if (snap) renderServers();

@@ -20,7 +20,7 @@ func runtimePlatform() string {
 
 func isElevated() bool { return os.Geteuid() == 0 }
 
-func relaunchElevated() error {
+func relaunchElevated(args []string) error {
 	return errors.New(tr("запустите Vela через sudo, чтобы перехватывать весь трафик"))
 }
 
@@ -118,3 +118,5 @@ func registerURLSchemes() {}
 // Global hotkeys are a Windows feature; elsewhere (development builds) the
 // setting is kept but does nothing.
 func registerHotkey(spec *hotkeySpec, onPress func()) error { return nil }
+
+func recoverSystemProxy(port int) {}

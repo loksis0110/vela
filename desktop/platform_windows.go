@@ -23,16 +23,21 @@ func isElevated() bool {
 	return windows.GetCurrentProcessToken().IsElevated()
 }
 
-func relaunchElevated() error {
+// relaunchElevated starts Vela with admin rights (Windows asks the user).
+func relaunchElevated(args []string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = syscall.EscapeArg(a)
+	}
 	verb, _ := windows.UTF16PtrFromString("runas")
 	file, _ := windows.UTF16PtrFromString(exe)
-	args, _ := windows.UTF16PtrFromString("--connect")
+	params, _ := windows.UTF16PtrFromString(strings.Join(quoted, " "))
 	dir, _ := windows.UTF16PtrFromString(filepath.Dir(exe))
-	if err := windows.ShellExecute(0, verb, file, args, dir, windows.SW_NORMAL); err != nil {
+	if err := windows.ShellExecute(0, verb, file, params, dir, windows.SW_NORMAL); err != nil {
 		return errors.New(tr("запуск с правами администратора отменён"))
 	}
 	return nil
