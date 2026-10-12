@@ -5,6 +5,7 @@ import android.content.res.Configuration
 import android.os.Build
 import app.vela.client.notify.Reminders
 import app.vela.client.data.Store
+import app.vela.client.vpn.VelaVpnService
 import app.vela.client.vpn.VpnManager
 import app.vela.client.widget.VelaWidget
 import kotlinx.coroutines.CoroutineScope
@@ -61,5 +62,6 @@ class VelaApp : Application() {
         runCatching { Reminders.ensureChannel(this) }
         runCatching { Store.relabel() }
         runCatching { VelaWidget.updateAll(this) }
+        runCatching { VelaVpnService.onLanguageChanged() }
     }
 }

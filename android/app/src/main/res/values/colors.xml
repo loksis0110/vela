@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ink">#FF0C1424</color>
+    <!-- window and splash background: light here, dark in values-night (same as the app's palettes) -->
+    <color name="ink">#FFEEF2F8</color>
     <color name="ic_launcher_background">#FF0F1A30</color>
 </resources>
