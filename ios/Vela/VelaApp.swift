@@ -191,8 +191,9 @@ struct RootView: View {
         // subscriptions are refreshed while the app is open, as often as set
         while !Task.isCancelled {
             // the provider changed the servers of the one in use: the tunnel
-            // gets the new list (an old server may be gone)
-            if await store.refreshDue(), tunnel.state == .connected { await tunnel.reload() }
+            // gets the new list (an old server may be gone); while it's down
+            // the list is sent when iOS brings it back
+            if await store.refreshDue() { await tunnel.reload() }
             try? await Task.sleep(nanoseconds: 10 * 60 * 1_000_000_000)
         }
     }

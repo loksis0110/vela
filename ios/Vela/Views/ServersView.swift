@@ -47,7 +47,7 @@ struct ServersView: View {
                 if let probe = store.probe {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Text(LF("Проверяем серверы: %@ из %@", "\(probe.done)", "\(probe.total)")).font(.footnote).foregroundStyle(Palette.muted)
+                            Text(LF("Проверено %@ из %@ · работают %@", "\(probe.done)", "\(probe.total)", "\(probe.ok)")).font(.footnote).foregroundStyle(Palette.muted)
                             Spacer()
                             Button("Остановить") { tunnel.stopProbe() }.font(.footnote).buttonStyle(.borderless)
                         }
@@ -235,8 +235,16 @@ struct ServersView: View {
     }
 
     private func filters(_ p: Profile) -> some View {
-        let protocols = Array(Set(p.nodes.map(\.proto).filter { !$0.isEmpty })).sorted()
-        let flags = Array(Set(p.nodes.compactMap { Fmt.splitFlag($0.name).flag })).sorted { Fmt.country($0) < Fmt.country($1) }
+        // one pass: this runs on every redraw (results of a check, the
+        // traffic numbers), and per-country counting was slow with 500+ servers
+        var protoSet = Set<String>()
+        var perFlag: [String: Int] = [:]
+        for n in p.nodes {
+            if !n.proto.isEmpty { protoSet.insert(n.proto) }
+            if let f = Fmt.splitFlag(n.name).flag { perFlag[f, default: 0] += 1 }
+        }
+        let protocols = protoSet.sorted()
+        let flags = perFlag.keys.sorted { Fmt.country($0) < Fmt.country($1) }
         return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 Chip(text: L("★ Избранные"), on: onlyFav) { onlyFav.toggle() }
@@ -253,7 +261,7 @@ struct ServersView: View {
                     Menu {
                         Button("Все страны") { country = "" }
                         ForEach(flags, id: \.self) { f in
-                            Button("\(f) \(Fmt.country(f))  \(p.nodes.filter { Fmt.splitFlag($0.name).flag == f }.count)") { country = f }
+                            Button("\(f) \(Fmt.country(f))  \(perFlag[f] ?? 0)") { country = f }
                         }
                     } label: {
                         Chip(text: (country.isEmpty ? L("Все страны") : country + " " + Fmt.country(country)) + " ▾", on: !country.isEmpty) {}.allowsHitTesting(false)
@@ -310,7 +318,11 @@ struct ServersView: View {
                 onPing: { Task { await tunnel.pingOne(profile: p.id, node: n.id) } }) { choose(p, n.id) }
                 .swipeActions {
                     if p.kind == "manual" {
-                        Button("Удалить", role: .destructive) { store.deleteNode(profile: p.id, node: n.id) }
+                        Button("Удалить", role: .destructive) {
+                            store.deleteNode(profile: p.id, node: n.id)
+                            // the running core must not keep a deleted server
+                            if p.id == store.state.activeProfile { Task { await tunnel.reload() } }
+                        }
                     }
                     Button { share(Fmt.splitFlag(n.name).rest, n.link) } label: { Label("QR", systemImage: "qrcode") }.tint(Palette.hull)
                 }
@@ -331,7 +343,7 @@ struct ServersView: View {
     }
 
     private func check() async {
-        guard let p = profile else { return }
+        guard let p = profile, !p.nodes.isEmpty else { return }
         // the running core can't check another subscription (the error would
         // land on the home screen behind this sheet)
         if tunnel.state != .disconnected, p.id != store.state.activeProfile {
@@ -339,6 +351,8 @@ struct ServersView: View {
             return
         }
         await tunnel.pingAll(p.id)
+        // stopped: the list already shows what was checked
+        guard !store.stopRequested else { return }
         let ok = p.nodes.filter { (store.pings[$0.id] ?? 0) > 0 }.count
         message = LF("Работают %@ из %@", "\(ok)", "\(p.nodes.count)")
     }
@@ -414,12 +428,11 @@ struct ServersView: View {
     private func choose(_ p: Profile, _ node: String) {
         let sameProfile = p.id == store.state.activeProfile
         store.select(profile: p.id, node: node)
-        if tunnel.state == .connected {
-            Task {
-                var switched = false
-                if sameProfile { switched = await tunnel.switchTo(node) }
-                if !switched { await tunnel.reload() }
-            }
+        Task {
+            var switched = false
+            if sameProfile, tunnel.state == .connected { switched = await tunnel.switchTo(node) }
+            // while connecting (or reconnected by iOS later) it's sent once the tunnel is up
+            if !switched { await tunnel.reload() }
         }
         dismiss()
     }

@@ -34,6 +34,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func startTunnel(options: [String: NSObject]?) async throws {
         // the app's language, remembered for starts by iOS (On Demand)
         if let lang = options?["lang"] as? String { UserDefaults.standard.set(lang, forKey: "lang") }
+        // the core's own messages (errors on screen and in the report) too
+        VelaextSetLanguage(Self.language)
         var step = tr("подготовка")
         do {
             try await start(options: options, step: &step)
@@ -60,7 +62,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         step = tr("папки")
         let working = base.appendingPathComponent("core", isDirectory: true)
         try? FileManager.default.createDirectory(at: working, withIntermediateDirectories: true)
-        try? Data().write(to: base.appendingPathComponent("start.log"))
+        // the previous start (with its stop reason) stays readable for the report
+        let startLog = base.appendingPathComponent("start.log"), previous = base.appendingPathComponent("start-prev.log")
+        try? FileManager.default.removeItem(at: previous)
+        try? FileManager.default.moveItem(at: startLog, to: previous)
+        try? Data().write(to: startLog)
         note("start, data: \(base.path), app group: \(hasAppGroup)")
         step = tr("правила маршрутизации")
         try installRules(into: base.appendingPathComponent("rules", isDirectory: true))
@@ -78,7 +84,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let config = configContent else {
             throw TunnelError(tr("откройте Vela и подключитесь из приложения"))
         }
-        note("config: \(config.utf8.count) bytes, memory: \(memoryMB()) MB")
+        note("config: \(config.utf8.count) bytes, memory: \(memory().now) MB")
         // a fresh log for every connection
         try? Data().write(to: base.appendingPathComponent("core.log"))
 
@@ -104,7 +110,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         try commandServer!.start()
         step = tr("подключение к серверу")
         try startService()
-        note("service started, memory: \(memoryMB()) MB")
+        note("service started, memory: \(memory().now) MB")
     }
 
     private var hasAppGroup: Bool {
@@ -126,7 +132,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func memoryMB() -> Int {
+    /// Memory of the extension in MB (iOS stops it at about 50): now and the
+    /// highest so far.
+    private func memory() -> (now: Int, peak: Int) {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
         let kr = withUnsafeMutablePointer(to: &info) {
@@ -134,7 +142,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
             }
         }
-        return kr == KERN_SUCCESS ? Int(info.phys_footprint / 1_048_576) : -1
+        guard kr == KERN_SUCCESS else { return (-1, -1) }
+        let now = Int(info.phys_footprint / 1_048_576)
+        return (now, max(now, Int(info.ledger_phys_footprint_peak / 1_048_576)))
+    }
+
+    /// The app's language ("ru"/"en"), or the extension's own when the app
+    /// hasn't passed it yet.
+    private static var language: String {
+        if let saved = UserDefaults.standard.string(forKey: "lang"), !saved.isEmpty { return saved }
+        return (Bundle.main.preferredLocalizations.first ?? "en").hasPrefix("ru") ? "ru" : "en"
+    }
+
+    /// Same as in the app: tells whether the app's config is the running one.
+    static func fingerprint(_ text: String) -> String {
+        var h: UInt64 = 0xCBF2_9CE4_8422_2325
+        for b in text.utf8 {
+            h ^= UInt64(b)
+            h = h &* 0x0000_0100_0000_01B3
+        }
+        return String(h, radix: 16)
     }
 
     /// Rule sets of the routing modes ship inside the extension bundle
@@ -214,12 +241,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         log.info("stopping: \(reason.rawValue)")
         // why iOS stopped the tunnel (1 user, 3 no network, 9/10 profile
         // disabled/removed, 11 another VPN, 16 app update…), for the report
-        note("stop: reason \(reason.rawValue), memory: \(memoryMB()) MB")
-        locked { stopService() }
-        if let server = commandServer {
+        let mem = memory()
+        note("stop: reason \(reason.rawValue), memory: \(mem.now) MB, peak: \(mem.peak) MB")
+        // a reload arriving now finds no command server and does nothing
+        let server: LibboxCommandServer? = locked {
+            stopService()
+            defer { commandServer = nil }
+            return commandServer
+        }
+        if let server {
             try? await Task.sleep(nanoseconds: 100 * NSEC_PER_MSEC)
             server.close()
-            commandServer = nil
         }
     }
 
@@ -230,8 +262,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             trimLog()
             return tailLog()
         }
-        if config == "vela:memory" { return Data("\(memoryMB())".utf8) }
+        if config == "vela:memory" {
+            let mem = memory()
+            return Data("\(mem.now) \(mem.peak)".utf8)
+        }
         if config == "vela:stats" { return Data(VelaextTrafficSummary(trafficURL.path).utf8) }
+        if config == "vela:startlog" { return startLog() }
+        if config.hasPrefix("vela:hello:") {
+            // the app (re)attached: its language, and what this tunnel runs
+            let lang = String(config.dropFirst("vela:hello:".count))
+            if lang == "ru" || lang == "en" {
+                UserDefaults.standard.set(lang, forKey: "lang")
+                VelaextSetLanguage(lang)
+            }
+            return locked { hello() }
+        }
         guard config.first(where: { !$0.isWhitespace }) == "{" else { return nil } // unknown command
         trimLog()
         reasserting = true
@@ -264,6 +309,31 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             try? startService()
             return error.localizedDescription.data(using: .utf8)
         }
+    }
+
+    /// Controller and config of the running core: after a start by iOS (On
+    /// Demand, the widget) the app's copy of the port may be stale.
+    private func hello() -> Data? {
+        var o: [String: Any] = [:]
+        if let config = configContent {
+            if let api = Self.controller(in: config) {
+                o["port"] = api.port
+                o["secret"] = api.secret
+            }
+            o["config"] = Self.fingerprint(config)
+        }
+        return try? JSONSerialization.data(withJSONObject: o)
+    }
+
+    /// The start log of this and the previous connection (the app can't read
+    /// the extension's files without an App Group).
+    private func startLog() -> Data {
+        func read(_ name: String) -> String {
+            (try? String(contentsOf: dataURL.appendingPathComponent(name), encoding: .utf8)) ?? ""
+        }
+        let previous = read("start-prev.log").split(separator: "\n").suffix(30).joined(separator: "\n")
+        let current = read("start.log").split(separator: "\n").suffix(60).joined(separator: "\n")
+        return Data((previous.isEmpty ? current : previous + "\n…\n" + current).utf8)
     }
 
     /// Keeps the log of a long session from growing without limit.
