@@ -132,8 +132,7 @@ final class TunnelManager: ObservableObject {
                 startWatchdog(fresh: startedHere)
                 startedHere = false
                 Task {
-                    // settings changed while the tunnel was (re)connecting
-                    if self.reloadPending { await self.reload() }
+                    await self.attach()
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
                     await self.refreshIP()
                 }
@@ -151,8 +150,14 @@ final class TunnelManager: ObservableObject {
                 // the tunnel stopped by itself: tell the user why
                 Task { await self.explainDisconnect(wasConnected: was == .connected) }
             }
+            if was != .disconnected, userStopped {
+                // stopped from Vela: now the flag for the widget can be
+                // brought up to date (left alone while the tunnel ran)
+                Task { await self.applyAlwaysOn() }
+            }
             userStopped = false
-            reloadPending = false
+            // reloadPending stays: iOS may start the tunnel again with the
+            // last config (On Demand), the changes are sent then
             appliedConfig = nil
             up = 0; down = 0; total = 0; activeNode = nil
             history = []
@@ -196,7 +201,7 @@ final class TunnelManager: ObservableObject {
         lines.append("Vela \(info["CFBundleShortVersionString"] ?? "?") (\(info["CFBundleVersion"] ?? "?")), iOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         let group = Bundle.main.object(forInfoDictionaryKey: "AppGroupIdentifier") as? String ?? ""
         let hasGroup = !group.isEmpty && FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil
-        lines.append("App Group: " + (hasGroup ? L("есть") : L("нет (подпись без группы, журнал запуска недоступен)")))
+        lines.append("App Group: " + (hasGroup ? L("есть") : L("нет (подпись без группы)")))
         lines.append(LF("Расширение VPN: %@", Self.tunnelBundleID))
         let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
         lines.append(LF("Профилей VPN в iOS: %@", "\(managers.count)"))
@@ -223,11 +228,15 @@ final class TunnelManager: ObservableObject {
             lines.append(LF("Конфигурация не собирается: %@", error.localizedDescription))
         }
         lines.append(LF("Маршрутизация: %@", store.state.settings.routing))
-        if state == .connected {
-            let mem = await sendMessage("vela:memory") ?? "?"
-            lines.append(LF("Память расширения: %@ МБ из ~50", mem))
+        if state == .connected, let mem = await recordMemory() {
+            lines.append(LF("Память расширения: %@ МБ из ~50, пик %@ МБ", "\(mem.now)", "\(mem.peak)"))
+        } else if let saved = UserDefaults.standard.string(forKey: "extMemory")?.split(separator: " "), saved.count == 2 {
+            lines.append(LF("Память расширения в прошлый раз: пик %@ МБ из ~50 (%@)", String(saved[0]), String(saved[1])))
         }
-        if let log = try? String(contentsOf: store.dataURL.appendingPathComponent("start.log"), encoding: .utf8), !log.isEmpty {
+        // the extension's own log: read directly with the App Group, or asked for
+        var log = (try? String(contentsOf: store.dataURL.appendingPathComponent("start.log"), encoding: .utf8)) ?? ""
+        if !hasGroup, state == .connected { log = await sendMessage("vela:startlog") ?? "" }
+        if !log.isEmpty {
             lines.append("")
             lines.append(L("Журнал запуска:"))
             lines.append(log)
@@ -262,11 +271,13 @@ final class TunnelManager: ObservableObject {
         m.protocolConfiguration = proto
         m.localizedDescription = "Vela"
         m.isEnabled = true
-        // «Постоянный VPN»: iOS brings the tunnel back after network changes and restarts
+        // «Постоянный VPN»: iOS brings the tunnel back after network changes and
+        // restarts. Switched on once the tunnel is up (attach): on in this save,
+        // iOS could start the tunnel itself first, with the previous config and port.
         let connect = NEOnDemandRuleConnect()
         connect.interfaceTypeMatch = .any
         m.onDemandRules = [connect]
-        m.isOnDemandEnabled = Store.shared.state.alwaysOn
+        m.isOnDemandEnabled = false
         // iOS asks the user to allow adding the VPN configuration here the first time.
         try await m.saveToPreferences()
         try await m.loadFromPreferences()
@@ -279,8 +290,62 @@ final class TunnelManager: ObservableObject {
     private var starting = false
     /// Settings changed while the tunnel was connecting: applied once it's up.
     private var reloadPending = false
-    /// Hash of the config the running core has, so the same one isn't sent again.
-    private var appliedConfig: Int?
+    /// Fingerprint of the config the running core has, so the same one isn't sent again.
+    private var appliedConfig: String?
+
+    /// Stable across launches and the same in the extension (FNV-1a).
+    nonisolated static func fingerprint(_ text: String) -> String {
+        var h: UInt64 = 0xCBF2_9CE4_8422_2325
+        for b in text.utf8 {
+            h ^= UInt64(b)
+            h = h &* 0x0000_0100_0000_01B3
+        }
+        return String(h, radix: 16)
+    }
+
+    /// The tunnel is up (started here, by iOS or the widget, or found running
+    /// at launch): learn its controller (the stored port may be another one
+    /// after a start by iOS), pass the language, switch On Demand on and send
+    /// settings changed while it wasn't connected.
+    private func attach() async {
+        if let reply = await sendMessage("vela:hello:" + Lang.code) {
+            let o = Store.json(reply)
+            if let p = (o["port"] as? NSNumber)?.intValue, p > 0 {
+                port = p
+                secret = o["secret"] as? String ?? ""
+            }
+            appliedConfig = o["config"] as? String
+        }
+        await enableOnDemand()
+        if reloadPending { await reload() }
+    }
+
+    /// «Постоянный VPN»: On Demand goes on once the tunnel is up.
+    private func enableOnDemand() async {
+        guard Store.shared.state.alwaysOn, let m = manager else { return }
+        await serially {
+            try? await m.loadFromPreferences()
+            // not after a quick «Отключить» or when the tunnel is already gone:
+            // iOS would bring it back
+            guard self.state == .connected, !self.userStopped, Store.shared.state.alwaysOn, !m.isOnDemandEnabled else { return }
+            m.isOnDemandEnabled = true
+            await Self.save(m)
+        }
+    }
+
+    /// Changes of the saved VPN profile, one at a time (each one loads it,
+    /// changes it and saves it with awaits in between).
+    private var profileWork: Task<Void, Never>?
+
+    private func serially(_ op: @escaping @MainActor () async -> Void) async {
+        let previous = profileWork
+        let task = Task { @MainActor in
+            await previous?.value
+            await op()
+        }
+        profileWork = task
+        await task.value
+    }
 
     func connect() async {
         guard !starting else { return }
@@ -304,7 +369,7 @@ final class TunnelManager: ObservableObject {
             secret = newSecret
             do {
                 try m.connection.startVPNTunnel(options: ["configContent": config as NSString, "lang": Lang.code as NSString])
-                appliedConfig = config.hashValue
+                appliedConfig = Self.fingerprint(config)
             } catch {
                 port = oldPort
                 secret = oldSecret
@@ -323,14 +388,16 @@ final class TunnelManager: ObservableObject {
         userStopped = true
         guard let m = manager else { return }
         Task {
-            // On Demand (set here, by the widget or in Settings) would connect
-            // again right away; the copy in memory may be stale, so refresh it
-            try? await m.loadFromPreferences()
-            if m.isOnDemandEnabled {
-                m.isOnDemandEnabled = false
-                await Self.save(m)
+            await self.serially {
+                // On Demand (set here, by the widget or in Settings) would connect
+                // again right away; the copy in memory may be stale, so refresh it
+                try? await m.loadFromPreferences()
+                if m.isOnDemandEnabled {
+                    m.isOnDemandEnabled = false
+                    await Self.save(m)
+                }
+                m.connection.stopVPNTunnel()
             }
-            m.connection.stopVPNTunnel()
         }
     }
 
@@ -349,31 +416,38 @@ final class TunnelManager: ObservableObject {
     /// Applies «Постоянный VPN» to the saved VPN configuration.
     func applyAlwaysOn() async {
         guard let m = manager else { return }
-        try? await m.loadFromPreferences()
-        let always = Store.shared.state.alwaysOn
-        let want = always && state != .disconnected
-        var changed = m.isOnDemandEnabled != want
-        m.isOnDemandEnabled = want
-        // the flag for the widget; the protocol is left alone while the tunnel
-        // runs (iOS may restart it), connect() writes it then
-        if state == .disconnected, let proto = m.protocolConfiguration as? NETunnelProviderProtocol,
-           proto.providerConfiguration?["alwaysOn"] as? Bool != always {
-            proto.providerConfiguration = ["alwaysOn": always]
-            m.protocolConfiguration = proto
-            changed = true
+        await serially {
+            try? await m.loadFromPreferences()
+            let always = Store.shared.state.alwaysOn
+            let want = always && self.state != .disconnected
+            var changed = m.isOnDemandEnabled != want
+            m.isOnDemandEnabled = want
+            // the flag for the widget; the protocol is left alone while the tunnel
+            // runs (iOS may restart it), connect() writes it then
+            if self.state == .disconnected, let proto = m.protocolConfiguration as? NETunnelProviderProtocol,
+               proto.providerConfiguration?["alwaysOn"] as? Bool != always {
+                proto.providerConfiguration = ["alwaysOn": always]
+                m.protocolConfiguration = proto
+                changed = true
+            }
+            if changed { await Self.save(m) }
         }
-        if changed { await Self.save(m) }
     }
 
     /// Applies new settings or another profile without dropping the tunnel.
     func reload() async {
-        if state == .connecting { reloadPending = true }
-        guard state == .connected, let session = manager?.connection as? NETunnelProviderSession else { return }
+        guard state == .connected, let session = manager?.connection as? NETunnelProviderSession else {
+            // sent once the tunnel is up (connecting now, or started again by
+            // iOS with the last config); connect() builds a fresh one anyway
+            reloadPending = true
+            return
+        }
         reloadPending = false
         do {
             let config = try Store.shared.buildConfig(port: port, secret: secret)
             // the same config again would only restart the core for nothing
-            guard config.hashValue != appliedConfig else { return }
+            let fingerprint = Self.fingerprint(config)
+            guard fingerprint != appliedConfig else { return }
             try session.sendProviderMessage(Data(config.utf8)) { [weak self] reply in
                 guard let reply, let text = String(data: reply, encoding: .utf8), !text.isEmpty else { return }
                 // the extension went back to the previous config
@@ -382,7 +456,7 @@ final class TunnelManager: ObservableObject {
                     self?.error = text
                 }
             }
-            appliedConfig = config.hashValue
+            appliedConfig = fingerprint
         } catch {
             self.error = error.localizedDescription
         }
@@ -444,6 +518,8 @@ final class TunnelManager: ObservableObject {
                 self.total = u + d
                 self.connectionCount = (c["connections"] as? [Any])?.count ?? 0
                 if tick % 3 == 0 { self.activeNode = await self.resolveActive() }
+                // the extension's memory, for the report (iOS stops it at ~50 MB)
+                if tick % 30 == 10 { _ = await self.recordMemory() }
                 // the extension saves the statistics every 30 seconds
                 if tick % 60 == 5 { await self.loadSummary() }
                 tick += 1
@@ -560,6 +636,17 @@ final class TunnelManager: ObservableObject {
         return text.isEmpty ? L("Журнал пуст.") : text
     }
 
+    /// The extension's memory in MB, now and the peak; the peak is kept with
+    /// the routing mode for the report after the tunnel is gone.
+    private func recordMemory() async -> (now: Int, peak: Int)? {
+        guard let reply = await sendMessage("vela:memory") else { return nil }
+        let parts = reply.split(separator: " ").compactMap { Int($0) }
+        guard let now = parts.first, now >= 0 else { return nil }
+        let peak = max(now, parts.count > 1 ? parts[1] : now)
+        UserDefaults.standard.set("\(peak) \(Store.shared.state.settings.routing)", forKey: "extMemory")
+        return (now, peak)
+    }
+
     /// Sends a command to the Network Extension and returns its reply.
     private func sendMessage(_ command: String) async -> String? {
         guard state == .connected, let session = manager?.connection as? NETunnelProviderSession else { return nil }
@@ -632,14 +719,17 @@ final class TunnelManager: ObservableObject {
         return now.hasPrefix("node-") ? String(now.dropFirst(5)) : now
     }
 
-    /// Real check of every server of a profile. While disconnected the app
-    /// runs a temporary core and shows why each failing server fails; while
-    /// connected the running core is asked through its controller.
     /// Stops the server check in progress.
     func stopProbe() {
         Store.shared.stopRequested = true
         VelacoreStopProbe()
+        // requests to the running core already on their way end now, not
+        // after their timeout
+        inCoreChecks?.cancel()
     }
+
+    /// Checks through the running core in progress (pingAll).
+    private var inCoreChecks: Task<Void, Never>?
 
     /// Checks one server: through the running core when it's in use, otherwise
     /// with a temporary core.
@@ -647,14 +737,15 @@ final class TunnelManager: ObservableObject {
         let store = Store.shared
         guard let p = store.state.profiles.first(where: { $0.id == profileID }),
               let n = p.nodes.first(where: { $0.id == nodeID }) else { return }
+        // "measuring" right away
+        store.pings[n.id] = 0
+        store.reasons[n.id] = nil
         var inCore = false
         if state == .connected, p.id == store.state.activeProfile {
-            inCore = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))") != nil
+            inCore = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))", timeout: 3) != nil
         }
         if inCore {
-            store.pings[n.id] = 0
-            store.reasons[n.id] = nil
-            let r = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=8000", timeout: 11)
+            let r = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=6000", timeout: 9)
             let ms = (r?["delay"] as? NSNumber)?.intValue ?? -1
             store.pings[n.id] = ms > 0 ? ms : -1
             if ms <= 0 { store.reasons[n.id] = L("сервер не ответил") }
@@ -664,6 +755,10 @@ final class TunnelManager: ObservableObject {
         }
     }
 
+    /// Real check of every server of a profile. While disconnected the app
+    /// runs a temporary core and shows why each failing server fails; while
+    /// connected the running core is asked through its controller. Results
+    /// appear as they arrive.
     func pingAll(_ profileID: String? = nil) async {
         let store = Store.shared
         guard let profile = store.state.profiles.first(where: { $0.id == (profileID ?? store.state.activeProfile) }) ?? store.state.active,
@@ -677,39 +772,40 @@ final class TunnelManager: ObservableObject {
             error = L("Чтобы проверить другую подписку, отключитесь")
             return
         }
-        for n in profile.nodes { store.pings[n.id] = 0; store.reasons[n.id] = nil }
-        store.probe = (0, profile.nodes.count)
-        store.stopRequested = false
+        store.beginProbe(profile.nodes)
         // the running core holds only some of the servers (memory limit of
-        // the extension); the rest are checked with a temporary core
-        let all = await request("GET", "/proxies")
+        // the extension); the rest are checked at the same time with a
+        // temporary core in the app
+        let all = await request("GET", "/proxies", timeout: 4)
         let present = Set((all?["proxies"] as? [String: Any] ?? [:]).keys)
         let inCore = profile.nodes.filter { present.contains(VelacoreNodeTag($0.id)) }
         let outside = profile.nodes.filter { !present.contains(VelacoreNodeTag($0.id)) }
-        await withTaskGroup(of: (String, Int).self) { group in
-            var started = 0
-            var iterator = inCore.makeIterator()
-            func addNext() {
-                guard !store.stopRequested, let n = iterator.next() else { return }
-                started += 1
-                group.addTask {
-                    let path = "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=8000"
-                    let r = await self.request("GET", path, timeout: 11)
-                    return (n.id, (r?["delay"] as? NSNumber)?.intValue ?? -1)
+        let noAnswer = L("сервер не ответил")
+        await store.streaming { feed in
+            async let rest: Void = store.probeWithTempCore(outside, feed: feed)
+            let checks = Task { @MainActor in
+                await withTaskGroup(of: (String, Int).self) { group in
+                    var iterator = inCore.makeIterator()
+                    func addNext() {
+                        guard !store.stopRequested, let n = iterator.next() else { return }
+                        group.addTask {
+                            let path = "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=6000"
+                            let r = await self.request("GET", path, timeout: 9)
+                            return (n.id, (r?["delay"] as? NSNumber)?.intValue ?? -1)
+                        }
+                    }
+                    for _ in 0 ..< 12 { addNext() }
+                    for await (id, ms) in group {
+                        feed.add(id, ms > 0 ? ms : -1, ms > 0 ? "" : noAnswer)
+                        addNext()
+                    }
                 }
             }
-            for _ in 0 ..< 12 { addNext() }
-            for await (id, ms) in group {
-                if ms <= 0, store.stopRequested { store.pings[id] = nil; continue }
-                store.pings[id] = ms > 0 ? ms : -1
-                if ms <= 0 { store.reasons[id] = L("сервер не ответил") }
-                if let p = store.probe { store.probe = (p.done + 1, p.total) }
-                addNext()
-            }
+            self.inCoreChecks = checks
+            await checks.value
+            self.inCoreChecks = nil
+            await rest
         }
-        if !store.stopRequested { await store.probeWithTempCore(outside) }
-        for n in profile.nodes where store.pings[n.id] == 0 { store.pings[n.id] = nil }
-        store.probe = nil
-        store.savePings()
+        store.endProbe(profile.nodes)
     }
 }

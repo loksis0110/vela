@@ -162,7 +162,8 @@
 "Отсканируйте QR-код в Vela на другом устройстве или отправьте текст и вставьте его в окно «Добавить»." = "Scan the QR code with Vela on another device, or send the text and paste it into the “Add” window.";
 "Отчёт" = "Report";
 "Оформление" = "Appearance";
-"Память расширения: %@ МБ из ~50" = "Extension memory: %@ MB of ~50";
+"Память расширения в прошлый раз: пик %@ МБ из ~50 (%@)" = "Extension memory last time: peak %@ MB of ~50 (%@)";
+"Память расширения: %@ МБ из ~50, пик %@ МБ" = "Extension memory: %@ MB of ~50, peak %@ MB";
 "Пинг…" = "Ping…";
 "По дням и месяцам" = "By day and month";
 "По месяцам" = "By month";
@@ -192,7 +193,7 @@
 "Приложения откроют их заново, если они ещё нужны." = "Apps will open them again if they still need them.";
 "Проверить все серверы" = "Check all servers";
 "Проверить сервер" = "Check server";
-"Проверяем серверы: %@ из %@" = "Checking servers: %@ of %@";
+"Проверено %@ из %@ · работают %@" = "Checked %@ of %@ · %@ working";
 "Профилей VPN в iOS: %@" = "VPN profiles in iOS: %@";
 "Профиль VPN ещё не создан" = "The VPN profile isn't created yet";
 "Профиль включён: %@, On Demand: %@, статус: %@" = "Profile enabled: %@, On Demand: %@, status: %@";
@@ -285,7 +286,7 @@
 "мс" = "ms";
 "не нашли поддерживаемых ссылок" = "no supported links found";
 "не работает" = "not working";
-"нет (подпись без группы, журнал запуска недоступен)" = "no (signed without the group, start log unavailable)";
+"нет (подпись без группы)" = "no (signed without the group)";
 "осталось дней: %@" = "days left: %@";
 "отдача" = "upload";
 "открыто сейчас" = "open now";

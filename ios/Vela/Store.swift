@@ -204,6 +204,44 @@ private final class ResultBox: @unchecked Sendable {
     func get() -> (Int, String)? { lock.lock(); defer { lock.unlock() }; return value }
 }
 
+/// Results of a server check from the core's threads. The UI takes them a
+/// few times a second: hundreds arrive at once (dead hosts fail within
+/// seconds), and redrawing the list for each one made it freeze.
+final class ProbeFeed: @unchecked Sendable {
+    struct Item {
+        let id: String
+        let ms: Int
+        let reason: String
+    }
+
+    private let lock = NSLock()
+    private var items: [Item] = []
+
+    func add(_ id: String, _ ms: Int, _ reason: String) {
+        lock.lock()
+        items.append(Item(id: id, ms: ms, reason: reason))
+        lock.unlock()
+    }
+
+    func take() -> [Item] {
+        lock.lock()
+        defer { lock.unlock() }
+        let out = items
+        items = []
+        return out
+    }
+}
+
+/// A flag read from the check's threads (set by «Остановить»).
+final class StopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var on = false
+    var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return on }
+        set { lock.lock(); on = newValue; lock.unlock() }
+    }
+}
+
 /// Bridges Go probe callbacks to Swift.
 private final class ProbeCallback: NSObject, VelacoreProbeHandlerProtocol {
     let handler: (String, Int, String) -> Void
@@ -223,8 +261,8 @@ final class Store: ObservableObject {
     @Published var pings: [String: Int] = [:]
     /// why a node failed the last check
     @Published var reasons: [String: String] = [:]
-    /// progress of the server check
-    @Published var probe: (done: Int, total: Int)?
+    /// progress of the server check; ok: working so far
+    @Published var probe: (done: Int, total: Int, ok: Int)?
     /// Provider announcements the user closed: profile id → text.
     @Published private(set) var dismissedAnnounce: [String: String] =
         UserDefaults.standard.dictionary(forKey: "dismissedAnnounce") as? [String: String] ?? [:]
@@ -619,49 +657,111 @@ final class Store: ObservableObject {
 
     // MARK: - Server check
 
+    /// Set by «Остановить»: failures that arrive after it are not real.
+    private let stopFlag = StopFlag()
+    var stopRequested: Bool {
+        get { stopFlag.value }
+        set { stopFlag.value = newValue }
+    }
+
     /// Real request through every server using a temporary core in the app.
     /// Call while the VPN is off; reasons for failures are reported.
-    /// Set by «Остановить»: failures that arrive after it are not real.
-    nonisolated(unsafe) var stopRequested = false
-
     func probeOffline(_ profile: Profile) async {
         guard probe == nil else { return }
+        beginProbe(profile.nodes)
+        await streaming { feed in await self.probeWithTempCore(profile.nodes, feed: feed) }
+        endProbe(profile.nodes)
+    }
+
+    /// Marks the servers as being checked (one update for the whole list).
+    func beginProbe(_ nodes: [Node]) {
         stopRequested = false
-        for n in profile.nodes { pings[n.id] = 0; reasons[n.id] = nil }
-        probe = (0, profile.nodes.count)
-        await probeWithTempCore(profile.nodes)
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        // stopped: servers that weren't checked must not stay "measuring"
-        for n in profile.nodes where pings[n.id] == 0 { pings[n.id] = nil }
+        var p = pings, r = reasons
+        for n in nodes {
+            p[n.id] = 0
+            r[n.id] = nil
+        }
+        pings = p
+        reasons = r
+        probe = (0, nodes.count, 0)
+    }
+
+    /// Ends a check: servers it didn't reach (stopped) don't stay "measuring".
+    func endProbe(_ nodes: [Node]) {
+        var p = pings
+        for n in nodes where p[n.id] == 0 { p[n.id] = nil }
+        pings = p
         probe = nil
         savePings()
     }
 
-    /// Real request through each server with a temporary core in the app.
-    /// Updates pings, reasons and the progress counter.
-    func probeWithTempCore(_ nodes: [Node]) async {
-        guard !nodes.isEmpty else { return }
-        let nodesJSON = "[" + nodes.map(\.raw).joined(separator: ",") + "]"
-        let callback = ProbeCallback { id, ms, reason in
-            Task { @MainActor in
-                let s = Store.shared
-                if ms <= 0, s.stopRequested { return }
-                s.pings[id] = ms > 0 ? ms : -1
-                if ms <= 0, !reason.isEmpty { s.reasons[id] = reason }
-                if let p = s.probe { s.probe = (p.done + 1, p.total) }
+    /// Runs a check whose results go through a feed and reach the screen in
+    /// batches, four times a second, as soon as they are known.
+    func streaming(_ work: (ProbeFeed) async -> Void) async {
+        let feed = ProbeFeed()
+        let flusher = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                Store.shared.show(feed.take())
             }
         }
+        await work(feed)
+        flusher.cancel()
+        show(feed.take())
+    }
+
+    /// Puts a batch of check results on screen with one update.
+    private func show(_ batch: [ProbeFeed.Item]) {
+        guard !batch.isEmpty else { return }
+        var p = pings, r = reasons
+        var done = 0, ok = 0
+        for x in batch {
+            if x.ms <= 0, stopRequested {
+                // the stop itself, not the server
+                if p[x.id] == 0 { p[x.id] = nil }
+                continue
+            }
+            p[x.id] = x.ms > 0 ? x.ms : -1
+            if x.ms <= 0, !x.reason.isEmpty { r[x.id] = x.reason }
+            done += 1
+            if x.ms > 0 { ok += 1 }
+        }
+        pings = p
+        reasons = r
+        if let pr = probe, done > 0 { probe = (min(pr.total, pr.done + done), pr.total, pr.ok + ok) }
+    }
+
+    /// Real request through each server with a temporary core in the app;
+    /// results go to the feed.
+    func probeWithTempCore(_ nodes: [Node], feed: ProbeFeed) async {
+        guard !nodes.isEmpty else { return }
+        let nodesJSON = "[" + nodes.map(\.raw).joined(separator: ",") + "]"
+        let callback = ProbeCallback { id, ms, reason in feed.add(id, ms, reason) }
         let failed: Bool = await Task.detached(priority: .userInitiated) {
             var err: NSError?
             let ok = VelacoreProbeNodes(nodesJSON, 9000, 12, callback, &err)
             return !ok || err != nil
         }.value
-        if failed, !stopRequested {
-            // temporary core unavailable: fall back to TCP reachability
-            for n in nodes where (pings[n.id] ?? 0) == 0 {
-                let ms = await Task.detached { Int(VelacoreTCPPing(n.server, Int32(n.port))) }.value
-                pings[n.id] = ms > 0 ? ms : -1
-                if ms <= 0 { reasons[n.id] = L("сервер недоступен") }
+        guard failed, !stopRequested else { return }
+        // temporary core unavailable: TCP reachability of the servers it
+        // didn't report, many at once
+        show(feed.take())
+        let left = nodes.filter { (pings[$0.id] ?? 0) == 0 }
+        let stop = stopFlag
+        let reason = L("сервер недоступен")
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            let queue = OperationQueue()
+            queue.maxConcurrentOperationCount = 16
+            for n in left {
+                queue.addOperation {
+                    guard !stop.value else { return }
+                    let ms = Int(VelacoreTCPPing(n.server, Int32(n.port)))
+                    feed.add(n.id, ms > 0 ? ms : -1, ms > 0 ? "" : reason)
+                }
+            }
+            queue.addBarrierBlock {
+                _ = queue
+                done.resume()
             }
         }
     }
@@ -673,16 +773,23 @@ final class Store: ObservableObject {
         let box = ResultBox()
         let callback = ProbeCallback { _, ms, reason in box.set((ms, reason)) }
         let json = "[" + node.raw + "]"
-        _ = await Task.detached(priority: .userInitiated) {
+        let failure: String? = await Task.detached(priority: .userInitiated) {
             var err: NSError?
-            return VelacoreProbeNodes(json, 9000, 1, callback, &err)
+            let ok = VelacoreProbeNodes(json, 9000, 1, callback, &err)
+            return ok && err == nil ? nil : (err?.localizedDescription ?? "")
         }.value
-        guard let (ms, reason) = box.get() else {
+        if let (ms, reason) = box.get() {
+            pings[node.id] = ms > 0 ? ms : -1
+            if ms <= 0, !reason.isEmpty { reasons[node.id] = reason }
+        } else if let failure, !stopRequested {
+            // the temporary core didn't start: at least whether it's reachable
+            let ms = await Task.detached { Int(VelacoreTCPPing(node.server, Int32(node.port))) }.value
+            pings[node.id] = ms > 0 ? ms : -1
+            if ms <= 0 { reasons[node.id] = failure.isEmpty ? L("сервер недоступен") : failure }
+        } else {
             pings[node.id] = nil // stopped
             return
         }
-        pings[node.id] = ms > 0 ? ms : -1
-        if ms <= 0, !reason.isEmpty { reasons[node.id] = reason }
         savePings()
     }
 
@@ -695,14 +802,19 @@ final class Store: ObservableObject {
         guard let profile = state.active, !profile.nodes.isEmpty else {
             throw CoreError(message: L("Сначала добавьте сервер или подписку"))
         }
-        let nodes = profile.nodes.compactMap { Self.json($0.raw) as Any? }
         let ids = Set(profile.nodes.map(\.id))
         // automatic selection: favorites first, then the fastest, never the dead ones
         let ranked = pings.filter { ids.contains($0.key) && $0.value > 0 }.sorted { $0.value < $1.value }.map(\.key)
         let failed = pings.filter { ids.contains($0.key) && $0.value < 0 }.map(\.key)
+        let selected = profile.id == state.activeProfile ? state.selectedNode : "auto"
+        var list = profile.nodes
+        if state.settings.routing == "blocked", list.count > Self.blockedModeServers {
+            list = Self.shortList(list, selected: selected, favorites: state.favorites, ranked: ranked, failed: Set(failed))
+        }
+        let nodes = list.compactMap { Self.json($0.raw) as Any? }
         let req: [String: Any] = [
             "platform": "ios", "nodes": nodes,
-            "selected": profile.id == state.activeProfile ? state.selectedNode : "auto",
+            "selected": selected,
             "settings": state.settings.json, "dataDir": "__VELA_DATA__", "skipRuleInstall": true,
             "controllerPort": port, "controllerSecret": secret,
             "favorites": state.favorites.filter { ids.contains($0) }, "ranked": ranked, "failed": failed,
@@ -713,6 +825,29 @@ final class Store: ObservableObject {
         let config = VelacoreBuildConfig(String(data: data, encoding: .utf8), &error)
         if let error { throw CoreError(message: error.localizedDescription) }
         return config
+    }
+
+    /// «Только заблокированное» loads big lists of sites and addresses into
+    /// the ~50 MB of the Network Extension, so the core gets fewer servers
+    /// then (it keeps up to 30 for automatic selection plus the favorites).
+    static let blockedModeServers = 20
+
+    /// The chosen server, working favorites, the fastest, then unchecked ones.
+    static func shortList(_ nodes: [Node], selected: String, favorites: [String], ranked: [String], failed: Set<String>) -> [Node] {
+        let byID = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var out: [Node] = []
+        var taken = Set<String>()
+        func take(_ id: String) {
+            guard out.count < blockedModeServers, !taken.contains(id), let n = byID[id] else { return }
+            taken.insert(id)
+            out.append(n)
+        }
+        take(selected)
+        for id in favorites where !failed.contains(id) { take(id) }
+        for id in ranked { take(id) }
+        for n in nodes where !failed.contains(n.id) { take(n.id) }
+        for n in nodes { take(n.id) }
+        return out
     }
 
     // MARK: - Helpers
