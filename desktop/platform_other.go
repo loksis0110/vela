@@ -93,6 +93,8 @@ func embeddedWindowOpen() bool { return false }
 
 func closeWindow() {}
 
+func replaceBrowserWindow(url, dataDir string) {}
+
 func windowThemeChanged() {}
 
 func allowForeground() {}

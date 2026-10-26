@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -155,7 +156,7 @@ func openWindow(url, dataDir string) {
 		os.Remove(marker)
 		logWindowError(dataDir, errors.New("the previous start of the built-in window did not finish, using the browser window"))
 	}
-	if !crashed && os.Getenv("VELA_WINDOW") != "browser" && webViewInstalled() {
+	if !crashed && os.Getenv("VELA_WINDOW") != "browser" && webViewInstalled(dataDir) {
 		_ = os.WriteFile(marker, nil, 0o644)
 		ready := make(chan error, 1)
 		go runEmbeddedWindow(url, dataDir, ready)
@@ -178,12 +179,53 @@ func openWindow(url, dataDir string) {
 	openBrowserWindow(url, dataDir)
 }
 
-func webViewInstalled() bool {
+// webViewInstalled asks the WebView2 loader, and the registry when the
+// loader can't tell, whether the WebView2 runtime is installed.
+func webViewInstalled(dataDir string) bool {
 	webviewCheckOnce.Do(func() {
 		v, err := webviewloader.GetInstalledVersion()
-		webviewAvailable = err == nil && v != ""
+		if err == nil && v != "" {
+			webviewAvailable = true
+			return
+		}
+		if rv := webViewRegistryVersion(); rv != "" {
+			webviewAvailable = true // try it: a failure falls back and is logged
+			if err != nil {
+				logWindowError(dataDir, fmt.Errorf("WebView2 loader: %v (runtime %s found in the registry)", err, rv))
+			}
+			return
+		}
+		if err != nil {
+			logWindowError(dataDir, fmt.Errorf("WebView2 loader: %v", err))
+		} else {
+			logWindowError(dataDir, errWebViewNotInstalled)
+		}
 	})
 	return webviewAvailable
+}
+
+// webViewRegistryVersion reads the installed WebView2 runtime version.
+func webViewRegistryVersion() string {
+	const client = `Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}`
+	for _, loc := range []struct {
+		root registry.Key
+		path string
+	}{
+		{registry.LOCAL_MACHINE, `SOFTWARE\WOW6432Node\` + client},
+		{registry.LOCAL_MACHINE, `SOFTWARE\` + client},
+		{registry.CURRENT_USER, `Software\` + client},
+	} {
+		k, err := registry.OpenKey(loc.root, loc.path, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		v, _, err := k.GetStringValue("pv")
+		k.Close()
+		if err == nil && v != "" && v != "0.0.0.0" {
+			return v
+		}
+	}
+	return ""
 }
 
 // embeddedWindowOpen reports whether the native window is open (it closes
@@ -590,4 +632,21 @@ func saveWindowPlacement(hwnd uintptr, dataDir string) {
 // lparamPointer reads a pointer Windows passes in a message parameter.
 func lparamPointer(l uintptr) unsafe.Pointer {
 	return *(*unsafe.Pointer)(unsafe.Pointer(&l))
+}
+
+// replaceBrowserWindow swaps an Edge/Chrome Vela window left from an older
+// version (it reconnects to the new Vela after an update) for the built-in
+// window.
+func replaceBrowserWindow(url, dataDir string) {
+	if os.Getenv("VELA_WINDOW") == "browser" || embeddedWindowOpen() || !webViewInstalled(dataDir) {
+		return
+	}
+	focusMu.Lock()
+	focusFound = 0
+	windows.EnumWindows(focusEnum, nil)
+	found := focusFound
+	focusMu.Unlock()
+	if found != 0 {
+		openWindow(url, dataDir)
+	}
 }
