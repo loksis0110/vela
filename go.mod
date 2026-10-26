@@ -3,6 +3,7 @@ module github.com/velaapp/vela
 go 1.26
 
 require (
+	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1
 	github.com/makiuchi-d/gozxing v0.1.1
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	fyne.io/systray v1.12.2

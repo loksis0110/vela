@@ -283,7 +283,10 @@ func (a *App) installUpdate(info *UpdateInfo) error {
 	a.mu.Lock()
 	connect := a.intent || a.status.State == "connected"
 	a.mu.Unlock()
-	args := []string{"-restarted", "-from=" + Version, "-hidden"}
+	args := []string{"-restarted", "-from=" + Version}
+	if !embeddedWindowOpen() {
+		args = append(args, "-hidden") // a browser window reconnects by itself
+	}
 	if connect {
 		args = append(args, "-connect")
 	}

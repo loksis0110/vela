@@ -48,6 +48,7 @@ func (a *App) SetTheme(theme string) {
 	a.saveLocked()
 	a.mu.Unlock()
 	a.pushState()
+	windowThemeChanged()
 }
 
 // ---------------------------------------------------------------- pings on disk

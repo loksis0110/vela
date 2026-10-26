@@ -63,9 +63,10 @@ func findBrowser() string {
 	return ""
 }
 
-// openWindow shows the UI as a standalone app window (Edge/Chrome app mode,
-// no tabs or address bar). Falls back to the default browser.
-func openWindow(url, dataDir string) {
+// openBrowserWindow shows the UI as an Edge/Chrome window in app mode (no
+// tabs or address bar), used when the WebView2 runtime is missing. Falls
+// back to the default browser.
+func openBrowserWindow(url, dataDir string) {
 	if browser := findBrowser(); browser != "" {
 		cmd := exec.Command(browser,
 			"--app="+url,
@@ -168,6 +169,9 @@ var (
 // focusWindow brings an open Vela window (Edge/Chrome in app mode titled
 // "Vela") to the front. Reports false when there is none.
 func focusWindow() bool {
+	if focusEmbeddedWindow() {
+		return true
+	}
 	focusMu.Lock()
 	focusFound = 0
 	windows.EnumWindows(focusEnum, nil)

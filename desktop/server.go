@@ -228,8 +228,10 @@ func (s *Server) Serve(l net.Listener) error {
 		// the new Vela waits for this one to exit, keeps the token (the open
 		// window reconnects to it instead of a second window opening) and
 		// connects only when the user was connecting
+		// a browser window reconnects by itself; the built-in window closes
+		// with this process, so the new Vela opens it again
 		args := []string{"-restarted", "-token=" + s.token}
-		if s.app.subscribers() > 0 {
+		if s.app.subscribers() > 0 && !embeddedWindowOpen() {
 			args = append(args, "-hidden")
 		}
 		if s.app.wantsConnection() {

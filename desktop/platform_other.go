@@ -89,6 +89,12 @@ func systemLanguage() string {
 
 func focusWindow() bool { return false }
 
+func embeddedWindowOpen() bool { return false }
+
+func closeWindow() {}
+
+func windowThemeChanged() {}
+
 func allowForeground() {}
 
 func tunnelLUID() (uint64, error) { return 0, errors.New("not supported") }
