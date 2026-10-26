@@ -1,5 +1,5 @@
 TAGS := with_gvisor,with_quic,with_utls,with_clash_api
-VERSION := 1.4.3
+VERSION := 1.4.4
 
 .PHONY: core rules test windows android-lib ios-lib android icons
 
