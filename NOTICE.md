@@ -9,6 +9,8 @@
 | [runetfreedom/russia-v2ray-rules-dat](https://github.com/runetfreedom/russia-v2ray-rules-dat) | GPL-3.0; данные: re:filter (MIT), antifilter community, [v2fly domain-list-community](https://github.com/v2fly/domain-list-community) (MIT) | `core/rules/geosite-ru-blocked.srs`, `geoip-ru-blocked.srs` и `ru-inside.srs` (собран из категорий v2fly: сервисы ИИ, Spotify, Netflix, YouTube, Discord, Telegram, X, Meta и др.) для режима «Только заблокированное» (подробнее ниже) |
 | [WireGuard for Windows](https://git.zx2c4.com/wireguard-windows) (`tunnel/firewall`) | MIT | код фильтров WFP для kill switch адаптирован в `desktop/wfp_windows.go` (уведомление о лицензии сохранено в файле) |
 | [fyne.io/systray](https://github.com/fyne-io/systray) | Apache-2.0 | значок в трее Windows |
+| [go-webview2](https://github.com/jchv/go-webview2), [go-winloader](https://github.com/jchv/go-winloader) | MIT | окно Vela на Windows (WebView2): код в `desktop/webview2` адаптирован, лицензия в `desktop/webview2/LICENSE` |
+| WebView2Loader.dll ([Microsoft WebView2 SDK](https://www.nuget.org/packages/Microsoft.Web.WebView2)) | лицензия SDK Microsoft (распространение разрешено), `desktop/webview2/webviewloader/sdk/LICENSE.txt` | загрузка WebView2 из Vela.exe |
 | [gomobile (SagerNet)](https://github.com/sagernet/gomobile) | BSD-3-Clause | сборка ядра для Android и iOS |
 | Jetpack Compose, AndroidX | Apache-2.0 | интерфейс Android |
 

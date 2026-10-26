@@ -17,7 +17,7 @@ import (
 	"fyne.io/systray"
 )
 
-var Version = "1.4.2"
+var Version = "1.4.3"
 
 //go:embed assets/tray-off.ico
 var trayOff []byte
@@ -152,6 +152,7 @@ func quit(app *App) {
 	quitOnce.Do(func() {
 		app.Disconnect()
 		app.fw.Disable()
+		closeWindow()
 		systray.Quit()
 		time.Sleep(200 * time.Millisecond)
 		os.Exit(0)
