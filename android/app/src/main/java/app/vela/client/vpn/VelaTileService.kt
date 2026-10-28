@@ -13,6 +13,8 @@ import app.vela.client.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 /** Quick Settings tile: connect / disconnect from the notification shade. */
@@ -26,7 +28,8 @@ class VelaTileService : TileService() {
     override fun onStartListening() {
         job?.cancel()
         job = CoroutineScope(Dispatchers.Main).launch {
-            VpnManager.status.collect { render(it.state) }
+            // the status changes every second (traffic): redraw only on a new state
+            VpnManager.status.map { it.state }.distinctUntilChanged().collect { render(it) }
         }
     }
 

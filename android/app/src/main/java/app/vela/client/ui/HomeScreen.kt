@@ -62,6 +62,10 @@ import androidx.compose.ui.unit.sp
 import app.vela.client.R
 import app.vela.client.data.AppState
 import app.vela.client.vpn.ConnState
+import app.vela.client.vpn.Health
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import app.vela.client.vpn.IpInfo
 import app.vela.client.vpn.SpeedState
 import app.vela.client.vpn.VpnStatus
@@ -91,10 +95,16 @@ fun HomeScreen(
     onConnections: () -> Unit,
 ) {
     var now by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
+    // the session clock ticks only while the screen is visible: a stopped
+    // activity stays alive for hours behind the VPN service
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(status.state) {
-        while (status.state == ConnState.Connected) {
-            now = System.currentTimeMillis() / 1000
-            delay(1000)
+        if (status.state != ConnState.Connected) return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                now = System.currentTimeMillis() / 1000
+                delay(1000)
+            }
         }
     }
 
@@ -151,7 +161,9 @@ fun HomeScreen(
                 .semantics { contentDescription = label },
             contentAlignment = Alignment.BottomCenter,
         ) {
-            Constellation(status.state, Modifier.fillMaxSize())
+            // the constellation lights up once traffic really flows
+            val look = if (status.state == ConnState.Connected && status.health == Health.Checking) ConnState.Connecting else status.state
+            Constellation(look, Modifier.fillMaxSize())
             val connected = status.state == ConnState.Connected
             Text(
                 label,
@@ -167,7 +179,13 @@ fun HomeScreen(
         }
 
         val (statusRes, statusColor) = when (status.state) {
-            ConnState.Connected -> R.string.status_protected to Vela.Sea
+            // «protected» only once a request really went through the server
+            ConnState.Connected -> when (status.health) {
+                Health.Ok -> R.string.status_protected to Vela.Sea
+                Health.Checking -> R.string.status_checking to Vela.Flare
+                Health.Offline -> R.string.status_offline to Vela.Flare
+                Health.Failing -> R.string.status_failing to Vela.Danger
+            }
             ConnState.Connecting -> R.string.status_connecting to Vela.Flare
             ConnState.Disconnecting -> R.string.status_disconnecting to Vela.Text
             ConnState.Disconnected -> R.string.status_off to Vela.Text

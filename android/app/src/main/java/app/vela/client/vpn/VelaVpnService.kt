@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.NetworkCapabilities
 import android.net.VpnService
@@ -16,6 +18,7 @@ import android.system.OsConstants
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import app.vela.client.Lang
 import app.vela.client.R
 import app.vela.client.data.Store
@@ -49,7 +52,9 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.net.Inet6Address
@@ -75,7 +80,10 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             val s = running ?: return
             s.post {
                 when (VpnManager.status.value.state) {
-                    ConnState.Connected -> s.showNotification(Lang.str(R.string.notif_connected), update = true)
+                    ConnState.Connected -> {
+                        s.shownText = ""
+                        s.showNotification(s.notificationText(VpnManager.status.value.health), update = true)
+                    }
                     ConnState.Connecting -> s.showNotification(Lang.str(R.string.notif_connecting), update = true)
                     else -> {}
                 }
@@ -89,6 +97,28 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     private var tunFd: ParcelFileDescriptor? = null
     private var statsJob: Job? = null
     private var watchJob: Job? = null
+    private var receiverOn = false
+
+    /** Text of the notification now shown, so it is redrawn only on a change. */
+    @Volatile private var shownText = ""
+
+    /**
+     * Screen on: the connection is checked at once (it was left alone while the
+     * screen was off). Doze: the core pauses its timers (automatic selection
+     * re-tests), as sing-box's own app does.
+     */
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_ON -> VpnManager.recheckSoon(1000)
+                PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
+                    val idle = getSystemService(PowerManager::class.java)?.isDeviceIdleMode == true
+                    runCatching { if (idle) commandServer?.pause() else commandServer?.wake() }
+                    if (!idle) VpnManager.recheckSoon(1000)
+                }
+            }
+        }
+    }
 
     /** Id of the newest start command: stopping must not cancel a newer «connect». */
     @Volatile private var lastStartId = 0
@@ -168,11 +198,12 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         val current = VpnManager.status.value.state
         if (current == ConnState.Connected) {
             // e.g. Always-on asked again: keep the right notification text
-            showNotification(Lang.str(R.string.notif_connected))
+            showNotification(notificationText(VpnManager.status.value.health))
             return@withLock
         }
         VpnManager.status.value = VpnStatus(state = ConnState.Connecting)
         try {
+            // nothing slow before the core: no network requests, no waiting
             val port = freePort()
             val secret = Store.randomId(16)
             val config = Store.buildConfig(port, secret)
@@ -185,11 +216,14 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 it.start()
                 commandServer = it
             }
-            server.startOrReloadService(config, OverrideOptions())
+            server.startOrReloadService(config.json, OverrideOptions())
+            VpnManager.runningNodes = config.nodeIds
             startRecorder(port, secret)
             Store.setWasConnected(true)
-            VpnManager.status.value = VpnStatus(state = ConnState.Connected, since = System.currentTimeMillis() / 1000)
-            showNotification(Lang.str(R.string.notif_connected))
+            // the tunnel is up; «protected» only once a request really went through
+            VpnManager.status.value = VpnStatus(state = ConnState.Connected, since = System.currentTimeMillis() / 1000, health = Health.Checking)
+            showNotification(notificationText(Health.Checking))
+            registerReceiverOnce()
             startStats()
             startWatchdog()
         } catch (e: Exception) {
@@ -216,10 +250,11 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             val config = Store.buildConfig(port, secret)
             // the reloaded core starts counting from zero: save what the old one carried
             runCatching { Velacore.stopTrafficRecorder() }
-            server.startOrReloadService(config, OverrideOptions())
+            server.startOrReloadService(config.json, OverrideOptions())
+            VpnManager.runningNodes = config.nodeIds
             startRecorder(port, secret)
-            VpnManager.status.value = VpnManager.status.value.copy(error = null, notice = null, activeNode = null)
-            showNotification(Lang.str(R.string.notif_connected))
+            VpnManager.status.update { it.copy(error = null, notice = null, activeNode = null, health = Health.Checking) }
+            showNotification(notificationText(Health.Checking), update = true)
             startWatchdog()
         } catch (e: Exception) {
             Log.e(TAG, "restart failed", e)
@@ -262,6 +297,22 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         tunFd = null
         DefaultNetworkMonitor.stop()
         VpnManager.controllerPort = 0
+        VpnManager.runningNodes = emptySet()
+        if (receiverOn) {
+            runCatching { unregisterReceiver(receiver) }
+            receiverOn = false
+        }
+    }
+
+    private fun registerReceiverOnce() {
+        if (receiverOn) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+        }
+        receiverOn = runCatching {
+            ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        }.isSuccess
     }
 
     /** Traffic statistics (Statistics screen) of the running core. */
@@ -277,9 +328,17 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             var tick = 0
             val power = getSystemService(PowerManager::class.java)
             while (isActive) {
+                // the speed, the graph and the session counter are shown only on
+                // Vela's screen: while it is closed (or the screen is off) nothing
+                // is asked every second. Forget the last sample so the next one
+                // isn't a fake spike; the watchdog keeps «now using» fresh.
+                if (!VpnManager.uiVisible.value) {
+                    last = null
+                    tick = 0
+                    withTimeoutOrNull(60_000) { VpnManager.uiVisible.first { it } }
+                    continue
+                }
                 delay(1000)
-                // don't wake the radio just for statistics while the screen is off;
-                // forget the last sample so the next one isn't a fake spike
                 if (!power.isInteractive) {
                     last = null
                     continue
@@ -288,91 +347,165 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 val active = if (tick++ % 3 == 0) VpnManager.activeNode() else null
                 val prev = last
                 last = now
-                val s = VpnManager.status.value
-                if (s.state != ConnState.Connected) continue
+                if (VpnManager.status.value.state != ConnState.Connected) continue
                 val up = if (prev != null) (now.first - prev.first).coerceAtLeast(0) else 0
                 val down = if (prev != null) (now.second - prev.second).coerceAtLeast(0) else 0
                 VpnManager.pushTraffic(up, down)
-                VpnManager.status.value = s.copy(
-                    up = up,
-                    down = down,
-                    upTotal = now.first,
-                    downTotal = now.second,
-                    activeNode = active ?: s.activeNode,
-                )
+                // atomic: the watchdog changes the health at the same time
+                whileConnected {
+                    it.copy(up = up, down = down, upTotal = now.first, downTotal = now.second, activeNode = active ?: it.activeNode)
+                }
             }
         }
     }
 
     /**
-     * Checks the server in use right after connecting and then every 30
-     * seconds. When the chosen server stops answering Vela switches to
-     * automatic selection (unless the user turned that off).
+     * Checks that traffic really goes through: right after connecting (the
+     * status says «checking» until then), every 30 seconds while the screen is
+     * on, and at once after a network change, screen on or a server switch.
+     * A failed check is confirmed within seconds; then a chosen server is
+     * replaced by automatic selection (unless turned off) and automatic
+     * selection re-tests its servers. When the network itself doesn't work no
+     * server is blamed or replaced.
      */
     private fun startWatchdog() {
         watchJob?.cancel()
+        // a poke left from before this start must not skip the first wait
+        VpnManager.recheck.tryReceive()
         watchJob = scope.launch {
-            delay(2500)
             val power = getSystemService(PowerManager::class.java)
             var fails = 0
-            var first = true
+            var offline = 0
+            var verified = false
+            var wait = 0L
             while (isActive) {
-                if (!first && !power.isInteractive) {
-                    delay(60_000)
-                    continue
+                if (wait > 0) {
+                    val poke = withTimeoutOrNull(wait) { VpnManager.recheck.receive() }
+                    if (poke != null && poke > 0) delay(poke)
                 }
                 if (VpnManager.status.value.state != ConnState.Connected) return@launch
-                if (DefaultNetworkMonitor.defaultNetwork == null) {
-                    // no internet at all (lift, airplane mode): not the server's fault
-                    fails = 0
-                    first = false
-                    delay(30_000)
+                if (verified && !power.isInteractive) {
+                    // the screen is off: nobody waits for an answer, the radio may sleep
+                    wait = 120_000
                     continue
                 }
-                val ok = VpnManager.probeCurrent() != null
-                if (ok) {
+                if (DefaultNetworkMonitor.defaultNetwork == null) {
+                    // no network at all (lift, airplane mode): not the server's fault;
+                    // a new network wakes this up
                     fails = 0
-                } else {
-                    fails++
-                    if (first || fails >= 2) {
-                        fails = 0
-                        failover(first)
-                    }
+                    setHealth(Health.Offline)
+                    wait = 60_000
+                    continue
                 }
-                first = false
-                delay(30_000)
+                val ms = VpnManager.probeCurrent(if (verified) 6000 else 5000)
+                if (VpnManager.status.value.state != ConnState.Connected) return@launch
+                if (ms != null) {
+                    fails = 0
+                    offline = 0
+                    verified = true
+                    setHealth(Health.Ok)
+                    noteWorking(ms)
+                    wait = 30_000
+                    continue
+                }
+                // just after a network change connections are being re-made: try again shortly
+                if (DefaultNetworkMonitor.sinceChangeMs() < 8000) {
+                    wait = 3000
+                    continue
+                }
+                if (!VpnManager.directWorks()) {
+                    // e.g. no internet behind this Wi-Fi yet: asked again soon at
+                    // first, then calmly
+                    fails = 0
+                    setHealth(Health.Offline)
+                    wait = if (offline++ < 5) 3000 else 15_000
+                    continue
+                }
+                offline = 0
+                fails++
+                wait = when {
+                    fails == 1 -> 2000
+                    fails < 4 -> 5000
+                    fails < 8 -> 15_000
+                    else -> 30_000
+                }
+                // switched to automatic selection: its own failures count from zero
+                if (failover(justConnected = !verified, fails = fails)) fails = 0
+                // after a confirmed failure the screen-off rule applies as well:
+                // no checks while nobody looks
+                verified = verified || fails >= 2
             }
         }
     }
 
-    private suspend fun failover(justConnected: Boolean) {
+    private fun setHealth(health: Health) {
+        val s = VpnManager.status.value
+        if (s.state != ConnState.Connected || s.health == health) return
+        whileConnected { it.copy(health = health) }
+        showNotification(notificationText(health), update = true)
+    }
+
+    /**
+     * The check went through the server in use: its result is the freshest one,
+     * so the next start of automatic selection begins with it. The «now using»
+     * line of the widget is kept current here while Vela's screen is closed.
+     */
+    private suspend fun noteWorking(ms: Int) {
+        val id = VpnManager.activeNode() ?: return
+        val s = VpnManager.status.value
+        if (s.state == ConnState.Connected && s.activeNode != id) whileConnected { it.copy(activeNode = id) }
+        val old = Store.pings.value[id] ?: 0
+        // small changes aren't worth a write every 30 seconds
+        if (old <= 0 || ms * 4 < old * 3 || ms * 3 > old * 4) {
+            Store.setPings(mapOf(id to ms))
+            Store.reasons.update { it - id }
+            Store.savePings()
+        }
+    }
+
+    /** Reacts to a failed check; true when it switched to automatic selection. */
+    private suspend fun failover(justConnected: Boolean, fails: Int): Boolean {
         val st = Store.state.value
-        val profile = st.active ?: return
+        val profile = st.active ?: return false
         val selected = st.selectedNode
         val manual = selected != "auto" && profile.nodes.any { it.id == selected }
-        val s = VpnManager.status.value
-        if (st.settings.disableFailover || !manual) {
-            if (manual && justConnected) {
-                VpnManager.status.value = s.copy(error = Lang.str(R.string.error_server_silent_auto))
-            } else if (!manual) {
-                VpnManager.retestAuto()
-            }
-            return
+        if (!manual) {
+            // automatic selection: the one in use stopped answering, re-test now
+            // (a server is only switched for a better one, so no flapping)
+            if (fails == 2) markFailed(VpnManager.activeNode())
+            if (fails == 1 || fails == 2 || fails % 4 == 0) VpnManager.retestAuto()
+            if (fails >= 2) setHealth(Health.Failing)
+            return false
+        }
+        if (!justConnected && fails < 2) return false
+        if (st.settings.disableFailover) {
+            setHealth(Health.Failing)
+            if (justConnected && fails == 1) whileConnected { it.copy(error = Lang.str(R.string.error_server_silent_auto)) }
+            return false
         }
         val name = profile.nodes.first { it.id == selected }.name
         // remembered as failed, so automatic selection skips it next time
-        Store.pings.update { it + (selected to -1) }
-        Store.reasons.update { it + (selected to Lang.str(R.string.reason_stopped_answering)) }
-        Store.savePings()
+        markFailed(selected)
         if (VpnManager.switchTo("auto")) {
             Store.select(profile.id, "auto")
-            VpnManager.status.value = VpnManager.status.value.copy(
-                error = null,
-                notice = Lang.str(R.string.notice_switched_auto, name),
-            )
-        } else if (justConnected) {
-            VpnManager.status.value = s.copy(error = Lang.str(R.string.error_server_silent))
+            whileConnected { it.copy(error = null, notice = Lang.str(R.string.notice_switched_auto, name)) }
+            return true
         }
+        setHealth(Health.Failing)
+        if (justConnected) whileConnected { it.copy(error = Lang.str(R.string.error_server_silent)) }
+        return false
+    }
+
+    /** Changes the status only while connected: a «disconnect» meanwhile wins. */
+    private inline fun whileConnected(crossinline change: (VpnStatus) -> VpnStatus) {
+        VpnManager.status.update { if (it.state == ConnState.Connected) change(it) else it }
+    }
+
+    private fun markFailed(id: String?) {
+        if (id.isNullOrEmpty()) return
+        Store.setPings(mapOf(id to -1))
+        Store.reasons.update { it + (id to Lang.str(R.string.reason_stopped_answering)) }
+        Store.savePings()
     }
 
     private fun humanize(e: Exception): String {
@@ -388,11 +521,23 @@ class VelaVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     // ------------------------------------------------------------- notification
 
+    private fun notificationText(health: Health): String = Lang.str(
+        when (health) {
+            Health.Ok -> R.string.notif_connected
+            Health.Checking -> R.string.notif_checking
+            Health.Offline -> R.string.status_offline
+            Health.Failing -> R.string.status_failing
+        },
+    )
+
     /**
      * Shows the status in the foreground notification; false when Android refused it.
      * [update] only redraws the notification of the running service.
      */
     private fun showNotification(text: String, update: Boolean = false): Boolean {
+        // redrawn only when the text changes (the watchdog reports every check)
+        if (update && text == shownText) return true
+        shownText = text
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
             // also renames the channel after a language change

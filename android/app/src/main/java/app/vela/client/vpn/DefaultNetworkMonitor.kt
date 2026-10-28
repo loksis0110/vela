@@ -9,6 +9,7 @@ import android.net.NetworkRequest
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import app.vela.libbox.InterfaceUpdateListener
 import java.net.NetworkInterface
 
@@ -25,6 +26,15 @@ object DefaultNetworkMonitor {
     @Volatile private var listener: InterfaceUpdateListener? = null
     private var registered = false
 
+    /** What the core was told last: capability updates that change nothing aren't passed on. */
+    private var lastSent: Triple<String, Int, Boolean>? = null
+
+    /** When the underlying network last changed (elapsedRealtime). */
+    @Volatile private var changedAt = 0L
+
+    /** Milliseconds since the underlying network last changed. */
+    fun sinceChangeMs(): Long = SystemClock.elapsedRealtime() - changedAt
+
     private val handler by lazy { Handler(HandlerThread("vela-network").apply { start() }.looper) }
 
     private val request = NetworkRequest.Builder()
@@ -34,10 +44,15 @@ object DefaultNetworkMonitor {
 
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
+            val isNew = network != defaultNetwork
             defaultNetwork = network
-            notifyListener()
+            if (isNew) changed()
+            notifyListener(force = isNew)
         }
 
+        // fires on every bandwidth or signal estimate: only a real change
+        // (another interface, metered or not) is passed to the core, which
+        // otherwise re-reads every interface each time
         override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
             if (network == defaultNetwork) notifyListener()
         }
@@ -45,6 +60,7 @@ object DefaultNetworkMonitor {
         override fun onLost(network: Network) {
             if (network == defaultNetwork) {
                 defaultNetwork = null
+                changed()
                 notifyListener()
             }
         }
@@ -75,18 +91,37 @@ object DefaultNetworkMonitor {
         runCatching { connectivity.unregisterNetworkCallback(callback) }
         registered = false
         defaultNetwork = null
+        synchronized(sentLock) { lastSent = null }
     }
 
     fun setListener(l: InterfaceUpdateListener?) {
         listener = l
-        notifyListener()
+        notifyListener(force = true)
     }
 
-    private fun notifyListener() {
+    /** A new network (or none): the connection check runs once the core has re-made its connections. */
+    private fun changed() {
+        changedAt = SystemClock.elapsedRealtime()
+        VpnManager.recheckSoon(2000)
+    }
+
+    private val sentLock = Any()
+
+    private fun send(l: InterfaceUpdateListener, name: String, index: Int, metered: Boolean, force: Boolean) {
+        val key = Triple(name, index, metered)
+        synchronized(sentLock) {
+            if (!force && key == lastSent) return
+            lastSent = key
+        }
+        // outside the lock: the core may call back into the app from here
+        l.updateDefaultInterface(name, index, metered, false)
+    }
+
+    private fun notifyListener(force: Boolean = false) {
         val l = listener ?: return
         val network = defaultNetwork
         if (network == null) {
-            l.updateDefaultInterface("", -1, false, false)
+            send(l, "", -1, false, force)
             return
         }
         repeat(10) {
@@ -96,7 +131,7 @@ object DefaultNetworkMonitor {
             if (name != null && index != null) {
                 val caps = connectivity.getNetworkCapabilities(network)
                 val metered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
-                l.updateDefaultInterface(name, index, metered, false)
+                send(l, name, index, metered, force)
                 return
             }
             Thread.sleep(100)

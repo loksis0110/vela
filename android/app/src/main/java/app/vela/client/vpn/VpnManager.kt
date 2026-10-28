@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -32,6 +33,18 @@ import java.util.concurrent.atomic.AtomicInteger
 
 enum class ConnState { Disconnected, Connecting, Connected, Disconnecting }
 
+/** Whether traffic really goes through while [ConnState.Connected]. */
+enum class Health {
+    /** The tunnel is up, the first request through the server hasn't come back yet. */
+    Checking,
+    /** A real request went through the server. */
+    Ok,
+    /** The phone has no working network: not the server's fault. */
+    Offline,
+    /** The network works, the server doesn't answer (Vela keeps trying). */
+    Failing,
+}
+
 data class VpnStatus(
     val state: ConnState = ConnState.Disconnected,
     val error: String? = null,
@@ -44,6 +57,7 @@ data class VpnStatus(
     val activeNode: String? = null,
     /** Calm message, e.g. that Vela switched to another server. */
     val notice: String? = null,
+    val health: Health = Health.Checking,
 )
 
 /** What websites see: from MyIP in the Go core. */
@@ -77,6 +91,28 @@ object VpnManager {
     @Volatile var controllerPort = 0
     @Volatile var controllerSecret = ""
 
+    /** Ids of the servers in the running configuration (a refresh may add others later). */
+    @Volatile var runningNodes: Set<String> = emptySet()
+
+    /** True while Vela's screen is visible: per-second statistics are needed only then. */
+    val uiVisible = MutableStateFlow(false)
+    private val uiCount = AtomicInteger(0)
+
+    fun onUiStarted() {
+        uiVisible.value = uiCount.incrementAndGet() > 0
+    }
+
+    fun onUiStopped() {
+        uiVisible.value = uiCount.updateAndGet { (it - 1).coerceAtLeast(0) } > 0
+    }
+
+    /** Wakes the connection check early (new network, screen on, another server); the value is a delay in ms. */
+    val recheck = Channel<Long>(Channel.CONFLATED)
+
+    fun recheckSoon(delayMs: Long = 0) {
+        recheck.trySend(delayMs)
+    }
+
     /** Returns an Intent to ask for VPN permission, or null when already granted. */
     fun prepare(context: Context): Intent? = VpnService.prepare(context)
 
@@ -91,7 +127,10 @@ object VpnManager {
 
     /** Rebuilds the config in the running service (settings, server list). */
     fun restart(context: Context) {
-        if (status.value.state != ConnState.Connected) return
+        // while connecting the command waits for the start to finish: a refresh that
+        // ended meanwhile must not leave the old server list running
+        val state = status.value.state
+        if (state != ConnState.Connected && state != ConnState.Connecting) return
         runCatching { context.startService(Intent(context, VelaVpnService::class.java).setAction(VelaVpnService.ACTION_RESTART)) }
     }
 
@@ -131,8 +170,16 @@ object VpnManager {
 
     /** Switches the server instantly without reconnecting. */
     suspend fun switchTo(nodeId: String): Boolean = withContext(Dispatchers.IO) {
+        // added by a refresh after the start: only a rebuilt config has it
+        if (nodeId != "auto" && nodeId !in runningNodes) return@withContext false
         val target = if (nodeId == "auto") "auto" else Velacore.nodeTag(nodeId)
-        request("PUT", "/proxies/proxy", JSONObject().put("name", target).toString()) != null
+        val ok = request("PUT", "/proxies/proxy", JSONObject().put("name", target).toString()) != null
+        if (ok) {
+            // the new server is checked right away, not in up to 30 seconds
+            status.update { if (it.state == ConnState.Connected) it.copy(health = Health.Checking, activeNode = null) else it }
+            recheckSoon(300)
+        }
+        ok
     }
 
     suspend fun traffic(): Pair<Long, Long>? = withContext(Dispatchers.IO) {
@@ -146,19 +193,38 @@ object VpnManager {
         if (now == "auto") {
             now = request("GET", "/proxies/auto")?.let { JSONObject(it).optString("now") } ?: return@withContext null
         }
-        now.removePrefix("node-")
+        // empty until automatic selection finished its first test
+        now.removePrefix("node-").takeIf { it.isNotEmpty() }
     }
 
     /** Real request through the server in use; delay in ms or null. */
-    suspend fun probeCurrent(): Int? = withContext(Dispatchers.IO) {
-        val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=8000"
-        request("GET", "/proxies/proxy/delay?$q", timeoutMs = 11000)?.let { JSONObject(it).optInt("delay", 0) }?.takeIf { it > 0 }
+    suspend fun probeCurrent(timeoutMs: Int = 6000): Int? = withContext(Dispatchers.IO) {
+        probeOutbound("proxy", TEST_URL, timeoutMs)
     }
+
+    /**
+     * True when the network itself works: a request without the VPN server (the
+     * core's direct outbound) gets an answer. Tells «the server is dead» from «no
+     * internet behind this Wi-Fi», so servers aren't blamed for the network.
+     */
+    suspend fun directWorks(): Boolean = coroutineScope {
+        val checks = DIRECT_URLS.map { url -> async(Dispatchers.IO) { probeOutbound("direct", url, 3500) != null } }
+        checks.awaitAll().any { it }
+    }
+
+    private fun probeOutbound(tag: String, url: String, timeoutMs: Int): Int? {
+        val q = "url=" + URLEncoder.encode(url, "UTF-8") + "&timeout=$timeoutMs"
+        return request("GET", "/proxies/$tag/delay?$q", timeoutMs = timeoutMs + 2000)
+            ?.let { runCatching { JSONObject(it).optInt("delay", 0) }.getOrDefault(0) }?.takeIf { it > 0 }
+    }
+
+    /** Reachable directly from Russia and elsewhere; one answer is enough. */
+    private val DIRECT_URLS = listOf(TEST_URL, "https://ya.ru/")
 
     /** Makes automatic selection re-test its servers right now. */
     suspend fun retestAuto() = withContext(Dispatchers.IO) {
-        val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=20000"
-        request("GET", "/group/auto/delay?$q", timeoutMs = 25000)
+        val q = "url=" + URLEncoder.encode(TEST_URL, "UTF-8") + "&timeout=15000"
+        request("GET", "/group/auto/delay?$q", timeoutMs = 18000)
     }
 
     fun pushTraffic(up: Long, down: Long) {
@@ -267,7 +333,7 @@ object VpnManager {
         var ms = -1
         var reason = ""
         var got = true
-        if (status.value.state == ConnState.Connected && profile.id == st.activeProfile) {
+        if (status.value.state == ConnState.Connected && profile.id == st.activeProfile && node.id in runningNodes) {
             ms = probeThroughCore(node.id, 8000)
             if (ms <= 0) reason = Lang.str(R.string.reason_no_answer)
         } else {
@@ -282,7 +348,7 @@ object VpnManager {
             Store.pings.update { it - node.id }
             return@withContext
         }
-        Store.pings.update { it + (node.id to (if (ms > 0) ms else -1)) }
+        Store.setPings(mapOf(node.id to (if (ms > 0) ms else -1)))
         if (ms <= 0 && reason.isNotEmpty()) Store.reasons.update { it + (node.id to reason) }
         Store.savePings()
     }
@@ -316,7 +382,7 @@ object VpnManager {
                 if (pending.isEmpty()) return
                 ArrayList(pending).also { pending.clear() }
             }
-            Store.pings.update { m -> HashMap(m).apply { batch.forEach { (id, ms, _) -> put(id, ms) } } }
+            Store.setPings(batch.associate { (id, ms, _) -> id to ms })
             val failed = batch.filter { it.second <= 0 && it.third.isNotEmpty() }
             if (failed.isNotEmpty()) Store.reasons.update { m -> HashMap(m).apply { failed.forEach { (id, _, r) -> put(id, r) } } }
             probe.value = done.addAndGet(batch.size).coerceAtMost(total) to total
@@ -329,7 +395,17 @@ object VpnManager {
         }
         try {
             withContext(Dispatchers.IO) {
-                if (connected) probeConnected(nodes, ::report) else probeOffline(nodes, ::report)
+                if (!connected) {
+                    probeOffline(nodes, ::report)
+                } else {
+                    // servers a refresh added after the start aren't in the running core
+                    val running = runningNodes
+                    val (inCore, rest) = nodes.partition { it.id in running }
+                    coroutineScope {
+                        launch { probeConnected(inCore, ::report) }
+                        if (rest.isNotEmpty()) launch { probeOffline(rest, ::report) }
+                    }
+                }
             }
         } finally {
             ticker.cancel()

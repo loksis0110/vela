@@ -4,6 +4,7 @@
     <string name="notif_channel">Состояние VPN</string>
     <string name="notif_connected">Подключено</string>
     <string name="notif_connecting">Подключение…</string>
+    <string name="notif_checking">Подключено, проверяем…</string>
     <string name="notif_disconnect">Отключить</string>
     <string name="tile_off">Выключено</string>
     <string name="widget_description">Подключение одним нажатием</string>
@@ -81,6 +82,9 @@
     <string name="status_connecting">Подключение…</string>
     <string name="status_disconnecting">Отключение…</string>
     <string name="status_off">Не подключено</string>
+    <string name="status_checking">Проверяем соединение…</string>
+    <string name="status_offline">Нет сети, ждём…</string>
+    <string name="status_failing">Сервер не отвечает</string>
     <string name="home_session">%1$s, передано %2$s</string>
     <string name="home_add_server_hint">Добавьте сервер, чтобы начать</string>
     <string name="home_add_server">Добавить сервер</string>
