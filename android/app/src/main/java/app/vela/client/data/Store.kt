@@ -16,6 +16,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -237,11 +238,37 @@ object Store {
     lateinit var prefs: SharedPreferences
         private set
 
-    private val _state = MutableStateFlow(AppState())
-    val state: StateFlow<AppState> = _state.asStateFlow()
+    /**
+     * state.json (every server of every subscription) is parsed on a thread of
+     * its own while the app loads the Go library; whoever needs the state first
+     * waits here for it, so nothing ever sees an empty state.
+     */
+    private val loaded = java.util.concurrent.FutureTask<AppState>(java.util.concurrent.Callable { loadAll() })
+    private val ready = java.util.concurrent.CountDownLatch(1)
+    @Volatile private var hwidCreated = false
+
+    @Volatile private var loading = false
+
+    private val _state: MutableStateFlow<AppState> by lazy {
+        // used before init(): never wait for a load that nobody started
+        if (!loading) loaded.run()
+        MutableStateFlow(loaded.get())
+    }
+    val state: StateFlow<AppState> by lazy { _state.asStateFlow() }
 
     /** Latency in ms per node id: -1 unreachable, -2 measured only when connected, 0 measuring. */
     val pings = MutableStateFlow<Map<String, Int>>(emptyMap())
+
+    /** When each result in [pings] was measured (unix seconds; 0 unknown, from before 1.4.4). */
+    private val pingTimes = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Stores check results (ms, or -1 failed) measured just now. */
+    fun setPings(results: Map<String, Int>) {
+        if (results.isEmpty()) return
+        val now = System.currentTimeMillis() / 1000
+        results.forEach { (id, ms) -> if (ms != 0) pingTimes[id] = now }
+        pings.update { m -> HashMap(m).apply { putAll(results) } }
+    }
 
     /** Why a server failed the last check (human readable). */
     val reasons = MutableStateFlow<Map<String, String>>(emptyMap())
@@ -256,15 +283,42 @@ object Store {
         dataDir = context.filesDir
         file = File(dataDir, "state.json")
         prefs = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
-        _state.value = load()
-        loadPings()
-        runCatching {
-            val o = JSONObject(prefs.getString("dismissedAnnounce", "{}") ?: "{}")
-            dismissedAnnounce.value = o.keys().asSequence().associateWith { o.getString(it) }
+        loading = true
+        Thread({
+            loaded.run()
+            try {
+                if (hwidCreated) persistSoon()
+                runCatching {
+                    val o = JSONObject(prefs.getString("dismissedAnnounce", "{}") ?: "{}")
+                    dismissedAnnounce.value = o.keys().asSequence().associateWith { o.getString(it) }
+                }
+                runCatching { relabel() }
+                applyFetchOptions()
+            } finally {
+                ready.countDown()
+            }
+        }, "vela-load").start()
+    }
+
+    /** Parses the saved state and check results (off the main thread). */
+    private fun loadAll(): AppState {
+        var st = try {
+            load()
+        } catch (e: Throwable) {
+            Log.e("VelaStore", "can't load the state", e)
+            AppState()
         }
-        if (_state.value.hwid.isEmpty()) update { it.copy(hwid = randomId(16)) }
-        relabel()
-        applyFetchOptions()
+        if (st.hwid.isEmpty()) {
+            st = st.copy(hwid = randomId(16))
+            hwidCreated = true
+        }
+        loadPings()
+        return st
+    }
+
+    /** Subscription requests wait until the HWID and user agent are passed to the core. */
+    private fun awaitReady() {
+        runCatching { ready.await(5, TimeUnit.SECONDS) }
     }
 
     /**
@@ -376,7 +430,16 @@ object Store {
             val o = JSONObject(File(dataDir, "pings.json").readText())
             pings.value = o.keys().asSequence().associateWith { o.getInt(it) }.filterValues { it != 0 }
         }
+        runCatching {
+            val o = JSONObject(File(dataDir, PING_TIMES).readText())
+            o.keys().forEach { pingTimes[it] = o.optLong(it) }
+        }
     }
+
+    private const val PING_TIMES = "pings-time.json"
+
+    /** A failed check older than this no longer keeps a server out of automatic selection. */
+    private const val FAILED_FRESH_SECONDS = 24 * 3600L
 
     /** Remembers check results so automatic selection can skip dead servers after a restart. */
     fun savePings() {
@@ -386,8 +449,13 @@ object Store {
                 pingsQueued.set(false)
                 runCatching {
                     val o = JSONObject()
-                    pings.value.filterValues { it != 0 }.forEach { (k, v) -> o.put(k, v) }
+                    val t = JSONObject()
+                    pings.value.filterValues { it != 0 }.forEach { (k, v) ->
+                        o.put(k, v)
+                        pingTimes[k]?.let { t.put(k, it) }
+                    }
                     writeAtomically(File(dataDir, "pings.json"), o.toString())
+                    writeAtomically(File(dataDir, PING_TIMES), t.toString())
                 }.onFailure { Log.w("VelaStore", "can't save the check results", it) }
             }
         }
@@ -422,8 +490,14 @@ object Store {
         val next = block(_state.value)
         if (next == _state.value) return
         _state.value = next
-        // written off the calling thread (often the UI); bursts of changes are
-        // coalesced and the newest state always ends up on disk
+        persistSoon()
+    }
+
+    /**
+     * Written off the calling thread (often the UI); bursts of changes are
+     * coalesced and the newest state always ends up on disk.
+     */
+    private fun persistSoon() {
         if (writeQueued.compareAndSet(false, true)) {
             writer.execute {
                 writeQueued.set(false)
@@ -471,6 +545,7 @@ object Store {
 
     /** Downloads a subscription without adding it (for the confirmation of an app link). */
     suspend fun preview(url: String): JSONObject = withContext(Dispatchers.IO) {
+        awaitReady()
         JSONObject(Velacore.fetchSubscription(url))
     }
 
@@ -523,7 +598,13 @@ object Store {
         val fresh = after.profiles.firstOrNull { it.id == profileId }?.nodes.orEmpty().map { it.id }.toSet()
         if (old == fresh) return after to false
         val selected = if (after.selectedNode == "auto" || after.selectedNode in fresh) after.selectedNode else "auto"
-        return after.copy(selectedNode = selected) to true
+        // the server carrying the traffic is still there: the running VPN goes on
+        // (reloading drops every connection, and providers rename info entries on
+        // each refresh). The new list is used from the next connection, or as soon
+        // as a server that isn't running yet is picked.
+        val inUse = if (selected == "auto") VpnManager.status.value.activeNode else selected
+        val keep = selected == after.selectedNode && inUse != null && inUse in fresh && inUse in VpnManager.runningNodes
+        return after.copy(selectedNode = selected) to !keep
     }
 
     private fun makeActiveIfNone(target: String) = update { st ->
@@ -542,6 +623,7 @@ object Store {
     suspend fun import(text: String): String = withContext(Dispatchers.IO) {
         val input = text.trim()
         if (input.isEmpty()) fail(R.string.import_empty)
+        awaitReady()
         val backup = runCatching { Velacore.decodeBackup(input) }.getOrElse { throw VelaError(it.message ?: Lang.str(R.string.backup_broken)) }
         if (backup.isNotEmpty()) return@withContext restore(JSONObject(backup))
         val split = JSONObject(Velacore.splitImport(input))
@@ -642,6 +724,7 @@ object Store {
     suspend fun refresh(profileId: String) = withContext(Dispatchers.IO) {
         val p = _state.value.profiles.firstOrNull { it.id == profileId && it.kind == "subscription" }
             ?: fail(R.string.refresh_not_found)
+        awaitReady()
         val sub = JSONObject(Velacore.fetchSubscription(p.url))
         val nodes = sub.optJSONArray("nodes").toNodes()
         var reload = false
@@ -778,10 +861,22 @@ object Store {
         return if (msg.isEmpty()) Lang.str(R.string.backup_restored_settings) else Lang.str(R.string.backup_restored, msg)
     }
 
-    fun setWasConnected(value: Boolean) = update { it.copy(wasConnected = value) }
+    /**
+     * Kept in the small preferences file: writing state.json (every server of
+     * every subscription) on each connect and disconnect cost a full serialization
+     * and an fsync right while the core was starting.
+     */
+    fun setWasConnected(value: Boolean) {
+        if (prefs.getBoolean(WAS_CONNECTED, false) != value) prefs.edit().putBoolean(WAS_CONNECTED, value).apply()
+    }
+
+    private const val WAS_CONNECTED = "wasConnected"
+
+    /** A sing-box configuration and the servers it contains. */
+    class BuiltConfig(val json: String, val nodeIds: Set<String>)
 
     /** Builds the sing-box configuration for the active profile. */
-    fun buildConfig(controllerPort: Int, controllerSecret: String): String {
+    fun buildConfig(controllerPort: Int, controllerSecret: String): BuiltConfig {
         val st = _state.value
         val profile = st.active ?: fail(R.string.error_add_server_first)
         if (profile.nodes.isEmpty()) fail(R.string.error_no_servers)
@@ -794,13 +889,20 @@ object Store {
             .put("controllerPort", controllerPort)
             .put("controllerSecret", controllerSecret)
             .put("logPath", logFile.absolutePath)
-        // automatic selection: favorites first, then the fastest, never the dead ones
+        // automatic selection starts on the first candidate before its own test
+        // finishes: favorites first, then the fastest of the last checks, never
+        // the ones that failed recently. A failure older than a day only moves
+        // the server behind the measured ones (it may work again).
         val ids = profile.nodes.map { it.id }.toSet()
         val p = pings.value
+        val now = System.currentTimeMillis() / 1000
         req.put("favorites", JSONArray(st.favorites.filter { it in ids }))
         req.put("ranked", JSONArray(p.filter { it.key in ids && it.value > 0 }.entries.sortedBy { it.value }.map { it.key }))
-        req.put("failed", JSONArray(p.filter { it.key in ids && it.value < 0 }.keys.toList()))
-        return Velacore.buildConfig(req.toString())
+        req.put(
+            "failed",
+            JSONArray(p.filter { it.key in ids && it.value < 0 && now - (pingTimes[it.key] ?: 0L) < FAILED_FRESH_SECONDS }.keys.toList()),
+        )
+        return BuiltConfig(Velacore.buildConfig(req.toString()), ids)
     }
 
     fun randomId(bytes: Int = 8): String {

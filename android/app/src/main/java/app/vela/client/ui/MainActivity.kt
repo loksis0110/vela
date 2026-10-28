@@ -61,6 +61,7 @@ import app.vela.client.R
 import app.vela.client.data.Store
 import app.vela.client.notify.Reminders
 import app.vela.client.vpn.ConnState
+import app.vela.client.vpn.Health
 import app.vela.client.vpn.SpeedState
 import app.vela.client.vpn.VpnManager
 import app.vela.velacore.Velacore
@@ -70,6 +71,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -109,6 +111,9 @@ class MainModel : ViewModel() {
     /** Connection state whose side effects (IP check, speed reset) are done. */
     var handledState: ConnState? = null
 
+    /** Server for which the IP was checked after connecting (once traffic really went through). */
+    var ipCheckedFor: String? = null
+
     fun launch(block: suspend CoroutineScope.() -> Unit): Job = viewModelScope.launch(block = block)
 }
 
@@ -144,8 +149,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // per-second statistics of the running VPN are asked only while visible
+        VpnManager.onUiStarted()
+    }
+
     override fun onStop() {
         super.onStop()
+        VpnManager.onUiStopped()
         // Android may end the process any time now: nothing changed may be lost
         Store.flush()
     }
@@ -357,18 +369,27 @@ private fun App(model: MainModel) {
         val state = status.state
         if (model.handledState == state) return@LaunchedEffect
         when (state) {
-            ConnState.Connected -> {
-                delay(1200)
-                model.launch { VpnManager.refreshIp() }
-            }
-            ConnState.Disconnected -> {
+            // the address before connecting is no longer what websites see
+            ConnState.Connecting, ConnState.Disconnected -> {
                 VpnManager.ip.value = null
                 VpnManager.ipError.value = null
+                model.ipCheckedFor = null
             }
             else -> {}
         }
         if (!VpnManager.speed.value.running) VpnManager.speed.value = SpeedState()
         model.handledState = state
+    }
+    // asked once traffic really goes through the server, not after a fixed pause
+    // (a dead server used to end in an «IP check failed» error instead), and
+    // again when another server took over (switch, failover)
+    // (automatic selection names its server only after its first round of tests)
+    val ipKey = if (status.state == ConnState.Connected && status.health == Health.Ok) status.activeNode.orEmpty() else null
+    LaunchedEffect(ipKey) {
+        if (ipKey != null && ipKey != model.ipCheckedFor) {
+            model.ipCheckedFor = ipKey
+            model.launch { VpnManager.refreshIp() }
+        }
     }
 
     // a tapped app link or shared text: confirm what it adds
@@ -441,8 +462,8 @@ private fun App(model: MainModel) {
                             reconnectIfNeeded()
                         }
                     },
-                    onDismissError = { VpnManager.status.value = VpnManager.status.value.copy(error = null) },
-                    onDismissNotice = { VpnManager.status.value = VpnManager.status.value.copy(notice = null) },
+                    onDismissError = { VpnManager.status.update { it.copy(error = null) } },
+                    onDismissNotice = { VpnManager.status.update { it.copy(notice = null) } },
                     history = history, ip = ip, ipBusy = ipBusy, ipError = ipError, speed = speed,
                     onIp = { model.launch { VpnManager.refreshIp() } },
                     onSpeed = { model.launch { VpnManager.runSpeedTest() } },
