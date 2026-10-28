@@ -87,13 +87,17 @@ final class PlatformInterface: NSObject, LibboxPlatformInterfaceProtocol, Libbox
         pathMonitor = monitor
         let ready = DispatchSemaphore(value: 0)
         var first = true
+        // one update at a time, in order (lastPath is shared between them)
         monitor.pathUpdateHandler = { [weak self] path in
             self?.report(path, to: listener)
             if first { first = false; ready.signal() }
         }
-        monitor.start(queue: DispatchQueue.global())
-        ready.wait()
+        monitor.start(queue: pathQueue)
+        // the first path comes within milliseconds; the start never hangs on it
+        _ = ready.wait(timeout: .now() + 2)
     }
+
+    private let pathQueue = DispatchQueue(label: "app.vela.tunnel.path")
 
     private func report(_ path: Network.NWPath, to listener: LibboxInterfaceUpdateListenerProtocol) {
         let desc = "\(path.status) " + path.availableInterfaces.map { "\($0.name)#\($0.index)" }.joined(separator: ",")

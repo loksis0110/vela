@@ -1,13 +1,39 @@
 import Foundation
+import Network
 import NetworkExtension
 import Velacore
 import WidgetKit
 
 enum ConnState { case disconnected, connecting, connected, disconnecting }
 
+/// Whether traffic really flows through the connected tunnel (the core's
+/// own request through the server in use).
+enum LinkState { case checking, ok, down, offline }
+
 struct TrafficPoint: Equatable {
     let up: Int64
     let down: Int64
+}
+
+/// Numbers that change every second while connected. Only the views that
+/// show them observe this, so the rest of the app (the server list with
+/// hundreds of rows) isn't redrawn every second. Changed on the main thread.
+final class LiveStats: ObservableObject {
+    @Published fileprivate(set) var up: Int64 = 0
+    @Published fileprivate(set) var down: Int64 = 0
+    @Published fileprivate(set) var total: Int64 = 0
+    /// Last two minutes of traffic per second.
+    @Published fileprivate(set) var history: [TrafficPoint] = []
+    /// Open connections of the running core.
+    @Published fileprivate(set) var connectionCount = 0
+
+    fileprivate func reset() {
+        if up != 0 { up = 0 }
+        if down != 0 { down = 0 }
+        if total != 0 { total = 0 }
+        if !history.isEmpty { history = [] }
+        if connectionCount != 0 { connectionCount = 0 }
+    }
 }
 
 /// What websites see (from MyIP in the Go core).
@@ -40,21 +66,20 @@ final class TunnelManager: ObservableObject {
     @Published private(set) var state: ConnState = .disconnected
     @Published var error: String?
     @Published private(set) var since: Date?
-    @Published private(set) var up: Int64 = 0
-    @Published private(set) var down: Int64 = 0
-    @Published private(set) var total: Int64 = 0
+    /// Checked right after connecting: «Защищено» only once a request
+    /// through the server went through.
+    @Published private(set) var link: LinkState = .checking
+    /// Traffic numbers of the running core (polled every second while the
+    /// app is on screen).
+    let live = LiveStats()
     /// Node id that currently carries traffic (resolves "auto").
     @Published private(set) var activeNode: String?
     /// Calm message, e.g. that Vela switched to another server.
     @Published var notice: String?
-    /// Last two minutes of traffic per second.
-    @Published private(set) var history: [TrafficPoint] = []
     @Published private(set) var ip: IPInfo?
     @Published private(set) var ipBusy = false
     @Published private(set) var ipError: String?
     @Published var speed = SpeedState()
-    /// Open connections of the running core (from the stats poll).
-    @Published private(set) var connectionCount = 0
     /// Traffic statistics: live from the extension while connected, the
     /// last saved copy otherwise.
     @Published private(set) var summary: TrafficSummary?
@@ -104,13 +129,77 @@ final class TunnelManager: ObservableObject {
         return (Bundle.main.bundleIdentifier ?? "app.vela.client") + ".tunnel"
     }()
 
+    /// A load from iOS in progress: launch and becoming active ask at the same
+    /// moment, one trip to the VPN settings serves both.
+    private var loading: Task<Void, Never>?
+
     func load() async {
-        let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
-        manager = managers.first {
-            ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == Self.tunnelBundleID
-        } ?? managers.first
-        if let manager { observe(manager) }
-        apply(manager?.connection.status ?? .disconnected)
+        if let loading { return await loading.value }
+        let task = Task { @MainActor in
+            let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
+            let m = managers.first {
+                ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == Self.tunnelBundleID
+            } ?? managers.first
+            self.manager = m
+            if let m { self.observe(m) }
+            self.apply(m?.connection.status ?? .disconnected)
+        }
+        loading = task
+        await task.value
+        loading = nil
+    }
+
+    /// The app is on screen: the per-second numbers are polled only then.
+    private var foreground = true
+    private var lastCheck = Date.distantPast
+
+    private init() {
+        watchNetwork()
+    }
+
+    /// Wi-Fi ↔ mobile data and similar: the core moves its connections by
+    /// itself; the app checks the server again a moment later (not every
+    /// 30 s), once for a burst of changes.
+    private let pathMonitor = NWPathMonitor()
+    private var pathKey = ""
+    private var recheck: Task<Void, Never>?
+
+    private func watchNetwork() {
+        pathMonitor.pathUpdateHandler = { @Sendable path in
+            let key = "\(path.status) " + path.availableInterfaces.map { $0.name }.joined(separator: ",")
+            Task { @MainActor in TunnelManager.shared.networkChanged(key) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "app.vela.path"))
+    }
+
+    private func networkChanged(_ key: String) {
+        let previous = pathKey
+        pathKey = key
+        guard !previous.isEmpty, key != previous, state == .connected, foreground else { return }
+        recheck?.cancel()
+        recheck = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let self, !Task.isCancelled, self.state == .connected, self.link != .checking else { return }
+            self.startWatchdog(fresh: false, verify: false)
+        }
+    }
+
+    /// Called on scene phase changes: nothing is polled in the background,
+    /// and coming back after a while checks the connection right away
+    /// (the network may have changed meanwhile).
+    func setForeground(_ on: Bool) {
+        guard on != foreground else { return }
+        foreground = on
+        if !on {
+            statsTask?.cancel()
+            statsTask = nil
+            return
+        }
+        guard state == .connected else { return }
+        startStats()
+        if Date().timeIntervalSince(lastCheck) > 20, link != .checking {
+            startWatchdog(fresh: false, verify: false)
+        }
     }
 
     private func observe(_ m: NETunnelProviderManager) {
@@ -127,14 +216,24 @@ final class TunnelManager: ObservableObject {
             let wasConnected = state == .connected
             state = .connected
             since = manager?.connection.connectedDate ?? Date()
-            startStats()
             if !wasConnected {
-                startWatchdog(fresh: startedHere)
+                startStats()
+                let fresh = startedHere
                 startedHere = false
+                // «Проверяем соединение…» until a request went through
+                link = .checking
+                watchTask?.cancel()
                 Task {
-                    await self.attach()
-                    try? await Task.sleep(nanoseconds: 1_200_000_000)
-                    await self.refreshIP()
+                    if fresh {
+                        // started here: port and secret are known, check at once
+                        self.startWatchdog(fresh: true, verify: true)
+                        await self.attach()
+                    } else {
+                        // started by iOS (On Demand, widget) or found running:
+                        // the stored controller port may be an older one
+                        await self.attach()
+                        if self.state == .connected { self.startWatchdog(fresh: false, verify: true) }
+                    }
                 }
             }
         case .connecting, .reasserting:
@@ -159,9 +258,8 @@ final class TunnelManager: ObservableObject {
             // reloadPending stays: iOS may start the tunnel again with the
             // last config (On Demand), the changes are sent then
             appliedConfig = nil
-            up = 0; down = 0; total = 0; activeNode = nil
-            history = []
-            connectionCount = 0
+            live.reset()
+            if activeNode != nil { activeNode = nil }
             if was == .connected { summaryLive = false }
             statsTask?.cancel()
             watchTask?.cancel()
@@ -222,7 +320,7 @@ final class TunnelManager: ObservableObject {
             }
         }
         do {
-            let cfg = try store.buildConfig(port: 1, secret: "x")
+            let cfg = try await store.buildConfig(port: 1, secret: "x")
             lines.append(LF("Конфигурация: %@, серверов в ней: %@", Fmt.bytes(Int64(cfg.utf8.count)), "\(cfg.components(separatedBy: "\"tag\": \"node-").count - 1)"))
         } catch {
             lines.append(LF("Конфигурация не собирается: %@", error.localizedDescription))
@@ -254,7 +352,8 @@ final class TunnelManager: ObservableObject {
         if #available(iOS 18.0, *) { ControlCenter.shared.reloadAllControls() }
     }
 
-    private func ensureManager() async throws -> NETunnelProviderManager {
+    /// The VPN profile to start: (profile, whether it was saved just now).
+    private func ensureManager(force: Bool = false) async throws -> (NETunnelProviderManager, Bool) {
         // a fresh copy from iOS: the one in memory may be stale (changed in
         // Settings, by the widget) or removed, and saving it would fail
         let all = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
@@ -262,12 +361,25 @@ final class TunnelManager: ObservableObject {
         let m = ours.first ?? all.first ?? NETunnelProviderManager()
         // duplicates left by quick double taps in 1.4.0
         for extra in ours.dropFirst() { try? await extra.removeFromPreferences() }
+        // Saving the profile is the slowest step of connecting (and makes iOS
+        // reload its VPN settings): only when something in it has to change.
+        let alwaysOn = Store.shared.state.alwaysOn
+        if !force, let current = m.protocolConfiguration as? NETunnelProviderProtocol,
+           current.providerBundleIdentifier == Self.tunnelBundleID, current.serverAddress == "Vela",
+           !current.disconnectOnSleep, current.providerConfiguration?["alwaysOn"] as? Bool == alwaysOn,
+           m.localizedDescription == "Vela", m.isEnabled, !m.isOnDemandEnabled,
+           let rules = m.onDemandRules, rules.count == 1,
+           (rules[0] as? NEOnDemandRuleConnect)?.interfaceTypeMatch == .any {
+            manager = m
+            observe(m)
+            return (m, false)
+        }
         let proto = (m.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
         proto.providerBundleIdentifier = Self.tunnelBundleID
         proto.serverAddress = "Vela"
         proto.disconnectOnSleep = false
         // the widget and the Control Center control read it (no shared App Group)
-        proto.providerConfiguration = ["alwaysOn": Store.shared.state.alwaysOn]
+        proto.providerConfiguration = ["alwaysOn": alwaysOn]
         m.protocolConfiguration = proto
         m.localizedDescription = "Vela"
         m.isEnabled = true
@@ -283,7 +395,7 @@ final class TunnelManager: ObservableObject {
         try await m.loadFromPreferences()
         manager = m
         observe(m)
-        return m
+        return (m, true)
     }
 
     /// A start in progress: a second tap must not create a second VPN profile.
@@ -360,18 +472,30 @@ final class TunnelManager: ObservableObject {
             // checked first: without servers nothing is saved or changed
             let newPort = Int.random(in: 20000 ... 60000)
             let newSecret = Store.randomID(16)
-            let config = try Store.shared.buildConfig(port: newPort, secret: newSecret)
+            let request = try Store.shared.configRequest(port: newPort, secret: newSecret)
+            // the core builds the config while iOS loads the VPN profile
+            async let built = Store.build(request)
             // a change of the VPN profile still running (a quick Disconnect
             // and Connect) would make this save fail as stale
             _ = await profileWork?.value
-            let m = try await ensureManager()
+            let (m, saved) = try await ensureManager()
+            let config = try await built
             // the extension keeps the config of the last start for On Demand,
             // so the stored port changes only together with it
             let oldPort = port, oldSecret = secret
             port = newPort
             secret = newSecret
+            let options: [String: NSObject] = ["configContent": config as NSString, "lang": Lang.code as NSString]
             do {
-                try m.connection.startVPNTunnel(options: ["configContent": config as NSString, "lang": Lang.code as NSString])
+                do {
+                    try m.connection.startVPNTunnel(options: options)
+                } catch {
+                    guard !saved else { throw error }
+                    // the profile wasn't saved (nothing to change): an iOS
+                    // copy gone stale meanwhile is saved again, then started
+                    let (fresh, _) = try await ensureManager(force: true)
+                    try fresh.connection.startVPNTunnel(options: options)
+                }
                 appliedConfig = Self.fingerprint(config)
             } catch {
                 port = oldPort
@@ -438,6 +562,10 @@ final class TunnelManager: ObservableObject {
     }
 
     /// Applies new settings or another profile without dropping the tunnel.
+    /// Only the newest of reloads started one after another is sent (the
+    /// config is built off the main thread, an older one may finish later).
+    private var reloadSeq = 0
+
     func reload() async {
         guard state == .connected, let session = manager?.connection as? NETunnelProviderSession else {
             // sent once the tunnel is up (connecting now, or started again by
@@ -446,8 +574,15 @@ final class TunnelManager: ObservableObject {
             return
         }
         reloadPending = false
+        reloadSeq += 1
+        let seq = reloadSeq
         do {
-            let config = try Store.shared.buildConfig(port: port, secret: secret)
+            let config = try await Store.build(Store.shared.configRequest(port: port, secret: secret))
+            guard seq == reloadSeq else { return }
+            guard state == .connected else {
+                reloadPending = true
+                return
+            }
             // the same config again would only restart the core for nothing
             let fingerprint = Self.fingerprint(config)
             guard fingerprint != appliedConfig else { return }
@@ -496,31 +631,48 @@ final class TunnelManager: ObservableObject {
     }
 
     /// Switches server instantly; returns false when a reload is needed.
-    func switchTo(_ nodeID: String) async -> Bool {
+    /// The new server is checked right away (verify), like a new connection.
+    func switchTo(_ nodeID: String, verify: Bool = true) async -> Bool {
         let target = nodeID == "auto" ? "auto" : VelacoreNodeTag(nodeID)
-        return await request("PUT", "/proxies/proxy", body: ["name": target]) != nil
+        let ok = await request("PUT", "/proxies/proxy", body: ["name": target]) != nil
+        if ok, verify, state == .connected { startWatchdog(fresh: true, verify: true) }
+        return ok
     }
 
     private func startStats() {
         statsTask?.cancel()
+        statsTask = nil
+        // nothing is polled while the app isn't on screen
+        guard foreground else { return }
         statsTask = Task { [weak self] in
             var last: (Int64, Int64)?
             var tick = 0
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self, self.state == .connected else { continue }
-                guard let c = await self.request("GET", "/connections") else { continue }
+                guard let self, !Task.isCancelled else { return }
+                guard self.state == .connected else { continue }
+                guard let c = await self.request("GET", "/connections"), !Task.isCancelled else { continue }
                 let u = (c["uploadTotal"] as? NSNumber)?.int64Value ?? 0
                 let d = (c["downloadTotal"] as? NSNumber)?.int64Value ?? 0
+                let live = self.live
                 if let last {
-                    self.up = max(0, u - last.0); self.down = max(0, d - last.1)
-                    self.history.append(TrafficPoint(up: self.up, down: self.down))
-                    if self.history.count > 120 { self.history.removeFirst(self.history.count - 120) }
+                    let up = max(0, u - last.0), down = max(0, d - last.1)
+                    if live.up != up { live.up = up }
+                    if live.down != down { live.down = down }
+                    var h = live.history
+                    h.append(TrafficPoint(up: up, down: down))
+                    if h.count > 120 { h.removeFirst(h.count - 120) }
+                    // an idle line stays an idle line: no redraw for it
+                    if h != live.history { live.history = h }
                 }
                 last = (u, d)
-                self.total = u + d
-                self.connectionCount = (c["connections"] as? [Any])?.count ?? 0
-                if tick % 3 == 0 { self.activeNode = await self.resolveActive() }
+                if live.total != u + d { live.total = u + d }
+                let count = (c["connections"] as? [Any])?.count ?? 0
+                if live.connectionCount != count { live.connectionCount = count }
+                if tick % 3 == 0 {
+                    let now = await self.resolveActive()
+                    if now != self.activeNode { self.activeNode = now }
+                }
                 // the extension's memory, for the report (iOS stops it at ~50 MB)
                 if tick % 30 == 10 { _ = await self.recordMemory() }
                 // the extension saves the statistics every 30 seconds
@@ -530,58 +682,175 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// Checks the server in use right after connecting and then every 30
-    /// seconds; when the chosen server stops answering, switches to
-    /// automatic selection (unless turned off in Settings).
-    private func startWatchdog(fresh: Bool) {
+    /// Automatic selection is in use (no server chosen, or it's gone).
+    private var autoSelected: Bool {
+        let st = Store.shared.state
+        guard let p = st.active else { return true }
+        return st.selectedNode == "auto" || !p.nodes.contains { $0.id == st.selectedNode }
+    }
+
+    private func setLink(_ new: LinkState) {
+        guard link != new else { return }
+        let was = link
+        link = new
+        // a new connection or another server: the address websites see now
+        if new == .ok, was == .checking || ip == nil { Task { await self.refreshIP() } }
+    }
+
+    /// Checks the server in use right away (verify: «Проверяем соединение…»
+    /// until it answers) and then every 30 seconds. A server that stops
+    /// answering is replaced within seconds: automatic selection moves on to
+    /// a candidate that answers, a chosen server is switched to automatic
+    /// selection (unless turned off in Settings). When the network itself is
+    /// down nothing is blamed on the server.
+    private func startWatchdog(fresh: Bool, verify: Bool) {
         watchTask?.cancel()
+        if verify { link = .checking }
         watchTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
             var fails = 0
-            var first = fresh
+            var first = true
             while !Task.isCancelled {
                 guard let self, self.state == .connected else { return }
-                let ok = await self.request("GET", "/proxies/proxy/delay?url=\(Self.testURL)&timeout=8000", timeout: 11) != nil
-                if ok {
+                let auto = self.autoSelected
+                // the first check decides what the screen says: a working
+                // server answers in well under a second, a dead one is left quickly
+                let limit = first ? (auto ? 3000 : 6000) : 8000
+                let ms = await self.delay("proxy", timeoutMs: limit)
+                guard !Task.isCancelled, self.state == .connected else { return }
+                self.lastCheck = Date()
+                var pause = 30.0
+                if let ms, ms > 0 {
                     fails = 0
+                    self.setLink(.ok)
+                } else if ms == nil {
+                    // the core's controller didn't answer (restarting): not the server
+                    pause = 3
                 } else {
-                    fails += 1
-                    if first || fails >= 2 {
+                    let network = await self.networkUp()
+                    guard !Task.isCancelled, self.state == .connected else { return }
+                    if network == false {
+                        // Wi-Fi gone, no signal: the server isn't to blame
                         fails = 0
-                        await self.failover(justConnected: first)
+                        self.setLink(.offline)
+                        pause = 5
+                    } else if network == nil {
+                        pause = 3
+                    } else if auto {
+                        fails += 1
+                        self.setLink(.checking)
+                        if await self.pickWorking() {
+                            pause = 0.3
+                        } else {
+                            self.setLink(.down)
+                            pause = 15
+                        }
+                    } else {
+                        fails += 1
+                        if (first && fresh) || fails >= 2 {
+                            fails = 0
+                            if await self.failover(justConnected: first && fresh) {
+                                self.setLink(.checking)
+                                pause = 0.3
+                            } else {
+                                self.setLink(.down)
+                                pause = 15
+                            }
+                        } else {
+                            // once may be a hiccup: asked again soon, not in 30 s
+                            self.setLink(.checking)
+                            pause = 3
+                        }
                     }
                 }
                 first = false
-                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000))
             }
         }
     }
 
-    private func failover(justConnected: Bool) async {
+    /// Delay through an outbound of the running core: ms, -1 when it didn't
+    /// get through, nil when the core's controller itself didn't answer.
+    private func delay(_ tag: String, url: String = TunnelManager.testURL, timeoutMs: Int) async -> Int? {
+        guard port != 0, let u = URL(string: "http://127.0.0.1:\(port)/proxies/\(tag)/delay?url=\(url)&timeout=\(timeoutMs)") else { return nil }
+        var req = URLRequest(url: u, timeoutInterval: Double(timeoutMs) / 1000 + 3)
+        req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+        return await Self.delayResult(req)
+    }
+
+    private nonisolated static func delayResult(_ req: URLRequest) async -> Int? {
+        guard let (data, resp) = try? await controllerSession.data(for: req),
+              let http = resp as? HTTPURLResponse else { return nil }
+        // wrong secret or no such outbound: the controller, not the server
+        if http.statusCode == 401 || http.statusCode == 404 { return nil }
+        guard http.statusCode < 300 else { return -1 }
+        let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let ms = (o?["delay"] as? NSNumber)?.intValue ?? 0
+        return ms > 0 ? ms : -1
+    }
+
+    /// Whether the network works without the VPN (the core's direct way out,
+    /// a Russian and a foreign site): nil when the core didn't answer.
+    private func networkUp() async -> Bool? {
+        async let a = delay("direct", timeoutMs: 3000)
+        async let b = delay("direct", url: "https%3A%2F%2Fya.ru", timeoutMs: 3000)
+        let (x, y) = await (a, b)
+        if x == nil, y == nil { return nil }
+        return (x ?? -1) > 0 || (y ?? -1) > 0
+    }
+
+    /// Automatic selection: the server in use stopped answering. The group's
+    /// next candidates (best by the last check first) are asked at once;
+    /// every answer goes into the group's history and the group switches to
+    /// the fastest one that answered, without waiting for its 10-minute test.
+    private func pickWorking() async -> Bool {
+        guard let info = await request("GET", "/proxies/auto", timeout: 3),
+              let all = info["all"] as? [String], !all.isEmpty else { return false }
+        let now = info["now"] as? String ?? ""
+        // the one that failed starts the next connection further down the list
+        if now.hasPrefix("node-") {
+            let id = String(now.dropFirst(5))
+            if (Store.shared.pings[id] ?? 0) > 0 { Store.shared.pings[id] = nil }
+        }
+        let candidates = all.filter { $0 != now }.prefix(Store.shared.state.settings.routing == "blocked" ? 4 : 6)
+        return await withTaskGroup(of: Bool.self) { group in
+            for tag in candidates {
+                group.addTask { (await self.delay(tag, timeoutMs: 4000) ?? -1) > 0 }
+            }
+            for await ok in group where ok {
+                group.cancelAll()
+                return true
+            }
+            return false
+        }
+    }
+
+    /// A chosen server stopped answering: automatic selection takes over
+    /// (unless turned off). true when another server is in use now.
+    private func failover(justConnected: Bool) async -> Bool {
         let store = Store.shared
         let st = store.state
-        guard let profile = st.active else { return }
-        let manual = st.selectedNode != "auto" && profile.nodes.contains { $0.id == st.selectedNode }
-        if st.settings.disableFailover || !manual {
-            if manual, justConnected {
+        guard let profile = st.active else { return false }
+        guard !st.settings.disableFailover else {
+            if justConnected {
                 error = L("Выбранный сервер не отвечает. Выберите другой сервер или «Автовыбор»")
-            } else if !manual {
-                _ = await request("GET", "/group/auto/delay?url=\(Self.testURL)&timeout=20000", timeout: 25)
             }
-            return
+            return false
         }
         let name = profile.nodes.first { $0.id == st.selectedNode }?.name ?? L("Сервер")
         // remembered as failed, so automatic selection skips it next time
         store.pings[st.selectedNode] = -1
         store.reasons[st.selectedNode] = L("перестал отвечать во время работы")
         store.savePings()
-        if await switchTo("auto") {
+        if await switchTo("auto", verify: false) {
             store.select(profile: profile.id, node: "auto")
             error = nil
             notice = LF("«%@» не отвечает. Vela переключилась на автовыбор", name)
-        } else if justConnected {
+            return true
+        }
+        if justConnected {
             error = L("Выбранный сервер не отвечает. Выберите другой сервер")
         }
+        return false
     }
 
     // MARK: - Tools
@@ -743,13 +1012,10 @@ final class TunnelManager: ObservableObject {
         // "measuring" right away
         store.pings[n.id] = 0
         store.reasons[n.id] = nil
-        var inCore = false
-        if state == .connected, p.id == store.state.activeProfile {
-            inCore = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))", timeout: 3) != nil
-        }
-        if inCore {
-            let r = await request("GET", "/proxies/\(VelacoreNodeTag(n.id))/delay?url=\(Self.testURL)&timeout=6000", timeout: 9)
-            let ms = (r?["delay"] as? NSNumber)?.intValue ?? -1
+        // through the running core when it holds this server (one request;
+        // not there, it answers 404 and a temporary core checks it)
+        if state == .connected, p.id == store.state.activeProfile,
+           let ms = await delay(VelacoreNodeTag(n.id), timeoutMs: 6000) {
             store.pings[n.id] = ms > 0 ? ms : -1
             if ms <= 0 { store.reasons[n.id] = L("сервер не ответил") }
             store.savePings()
@@ -784,6 +1050,9 @@ final class TunnelManager: ObservableObject {
         let inCore = profile.nodes.filter { present.contains(VelacoreNodeTag($0.id)) }
         let outside = profile.nodes.filter { !present.contains(VelacoreNodeTag($0.id)) }
         let noAnswer = L("сервер не ответил")
+        // every check is a connection inside the extension (~50 MB limit):
+        // fewer at once next to the big site lists of «Только заблокированное»
+        let parallel = store.state.settings.routing == "blocked" ? 6 : 12
         await store.streaming { feed in
             async let rest: Void = store.probeWithTempCore(outside, feed: feed)
             let checks = Task { @MainActor in
@@ -797,7 +1066,7 @@ final class TunnelManager: ObservableObject {
                             return (n.id, (r?["delay"] as? NSNumber)?.intValue ?? -1)
                         }
                     }
-                    for _ in 0 ..< 12 { addNext() }
+                    for _ in 0 ..< parallel { addNext() }
                     for await (id, ms) in group {
                         feed.add(id, ms > 0 ? ms : -1, ms > 0 ? "" : noAnswer)
                         addNext()
