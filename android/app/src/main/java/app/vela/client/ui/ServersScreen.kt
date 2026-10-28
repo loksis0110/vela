@@ -271,6 +271,8 @@ fun ServersScreen(
         val isActive = profile.id == app.activeProfile
         val autoSelected = isActive && (app.selectedNode == "auto" || profile.nodes.none { it.id == app.selectedNode })
         val connected = status.state == ConnState.Connected && isActive
+        // rows depend on the server in use, not on the whole status (it changes every second)
+        val inUseId = if (connected) status.activeNode else null
 
         val dismissed by Store.dismissedAnnounce.collectAsState()
         val announce = Store.visibleAnnounce(profile, dismissed)
@@ -358,7 +360,7 @@ fun ServersScreen(
                     badge = badgeFor(n.name), title = splitFlag(n.name).second, meta = tags,
                     ping = pingLabel(pings[n.id]), selected = isActive && app.selectedNode == n.id,
                     reason = if ((pings[n.id] ?: 0) < 0) reasons[n.id] else null,
-                    inUse = connected && status.activeNode == n.id,
+                    inUse = inUseId == n.id,
                     onClick = { onSelect(profile.id, n.id) },
                     onDelete = if (profile.kind == "manual") ({ onDeleteNode(profile, n) }) else null,
                     favorite = n.id in app.favorites,
