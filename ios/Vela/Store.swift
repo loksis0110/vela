@@ -232,6 +232,27 @@ final class ProbeFeed: @unchecked Sendable {
     }
 }
 
+/// Numbers of queued writes per file: an older copy isn't written when a
+/// newer one is already queued.
+final class WriteSeq: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: [String: Int] = [:]
+
+    func next(_ key: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let n = (last[key] ?? 0) + 1
+        last[key] = n
+        return n
+    }
+
+    func isLatest(_ key: String, _ n: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return last[key] == n
+    }
+}
+
 /// A flag read from the check's threads (set by «Остановить»).
 final class StopFlag: @unchecked Sendable {
     private let lock = NSLock()
@@ -304,9 +325,25 @@ final class Store: ObservableObject {
 
     /// Remembers check results so automatic selection skips dead servers after a restart.
     func savePings() {
-        if let data = try? JSONEncoder().encode(pings.filter { $0.value != 0 }) {
-            try? data.write(to: dataURL.appendingPathComponent("pings.json"), options: .atomic)
+        let snapshot = pings.filter { $0.value != 0 }
+        let url = dataURL.appendingPathComponent("pings.json")
+        let seq = writes.next("pings")
+        Self.io.async { [writes] in
+            // a newer copy is already on its way
+            guard writes.isLatest("pings", seq), let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: url, options: .atomic)
         }
+    }
+
+    /// Files are written off the main thread, one after another: encoding
+    /// hundreds of servers took a noticeable moment on every tap.
+    private nonisolated static let io = DispatchQueue(label: "app.vela.store.io", qos: .utility)
+    private nonisolated let writes = WriteSeq()
+
+    /// Waits until everything changed so far is on disk (the app goes to the
+    /// background and may be closed).
+    func flush() {
+        Self.io.sync {}
     }
 
     private func update(_ change: (inout AppState) -> Void) {
@@ -317,10 +354,14 @@ final class Store: ObservableObject {
     }
 
     private func persist(_ next: AppState) {
-        if let data = try? JSONEncoder().encode(next) {
+        let target = fileURL
+        let seq = writes.next("state")
+        Self.io.async { [writes] in
+            // several changes in a row: only the newest state is written
+            guard writes.isLatest("state", seq), let data = try? JSONEncoder().encode(next) else { return }
             // keys stay out of iCloud/iTunes backups
-            try? data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-            var url = fileURL
+            try? data.write(to: target, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            var url = target
             var values = URLResourceValues()
             values.isExcludedFromBackup = true
             try? url.setResourceValues(values)
@@ -798,33 +839,59 @@ final class Store: ObservableObject {
     /// Builds the sing-box config. Paths point to a placeholder that the
     /// Network Extension replaces with its own data directory, so the app and
     /// the extension don't need a shared container.
-    func buildConfig(port: Int, secret: String) throws -> String {
+    func buildConfig(port: Int, secret: String) async throws -> String {
+        try await Self.build(configRequest(port: port, secret: secret))
+    }
+
+    /// The request for the core's config builder, from the current state.
+    /// Quick (runs on the main thread): the servers' JSON is passed as it is
+    /// stored, not parsed and written again.
+    func configRequest(port: Int, secret: String) throws -> String {
         guard let profile = state.active, !profile.nodes.isEmpty else {
             throw CoreError(message: L("Сначала добавьте сервер или подписку"))
         }
         let ids = Set(profile.nodes.map(\.id))
-        // automatic selection: favorites first, then the fastest, never the dead ones
+        // automatic selection starts with the first of these (until its own
+        // test answers): favorites and the fastest by the last check first,
+        // never the dead ones
         let ranked = pings.filter { ids.contains($0.key) && $0.value > 0 }.sorted { $0.value < $1.value }.map(\.key)
         let failed = pings.filter { ids.contains($0.key) && $0.value < 0 }.map(\.key)
+        let order = Dictionary(ranked.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+        // working favorites by the last check (unchecked ones after them),
+        // not in the order they were starred
+        let favorites = state.favorites.filter { ids.contains($0) }.enumerated()
+            .sorted { (order[$0.element] ?? Int.max, $0.offset) < (order[$1.element] ?? Int.max, $1.offset) }
+            .map(\.element)
         let selected = profile.id == state.activeProfile ? state.selectedNode : "auto"
         var list = profile.nodes
         if state.settings.routing == "blocked", list.count > Self.blockedModeServers {
-            list = Self.shortList(list, selected: selected, favorites: state.favorites, ranked: ranked, failed: Set(failed))
+            list = Self.shortList(list, selected: selected, favorites: favorites, ranked: ranked, failed: Set(failed))
         }
-        let nodes = list.compactMap { Self.json($0.raw) as Any? }
         let req: [String: Any] = [
-            "platform": "ios", "nodes": nodes,
+            "platform": "ios",
             "selected": selected,
             "settings": state.settings.json, "dataDir": "__VELA_DATA__", "skipRuleInstall": true,
             "controllerPort": port, "controllerSecret": secret,
-            "favorites": state.favorites.filter { ids.contains($0) }, "ranked": ranked, "failed": failed,
+            "favorites": favorites, "ranked": ranked, "failed": failed,
             "logPath": "__VELA_DATA__/core.log",
         ]
         let data = try JSONSerialization.data(withJSONObject: req)
-        var error: NSError?
-        let config = VelacoreBuildConfig(String(data: data, encoding: .utf8), &error)
-        if let error { throw CoreError(message: error.localizedDescription) }
-        return config
+        guard let text = String(data: data, encoding: .utf8), text.hasPrefix("{"), text.count > 2 else {
+            throw CoreError(message: LF("Конфигурация не собирается: %@", "JSON"))
+        }
+        // each node's raw JSON is an object written by JSONSerialization
+        let raws = list.map(\.raw).filter { $0.hasPrefix("{") && $0.hasSuffix("}") }
+        return "{\"nodes\":[" + raws.joined(separator: ",") + "]," + String(text.dropFirst())
+    }
+
+    /// Runs the core's config builder off the main thread.
+    nonisolated static func build(_ request: String) async throws -> String {
+        try await Task.detached(priority: .userInitiated) {
+            var error: NSError?
+            let config = VelacoreBuildConfig(request, &error)
+            if let error { throw CoreError(message: error.localizedDescription) }
+            return config
+        }.value
     }
 
     /// «Только заблокированное» loads big lists of sites and addresses into

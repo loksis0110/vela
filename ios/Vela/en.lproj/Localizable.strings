@@ -302,3 +302,6 @@
 "эти серверы уже есть в списке" = "these servers are already in the list";
 "● используется" = "● in use";
 "★ Избранные" = "★ Favorites";
+"Проверяем соединение…" = "Checking connection…";
+"Нет сети" = "No network";
+"Сервер не отвечает" = "Server not responding";

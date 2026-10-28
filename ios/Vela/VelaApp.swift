@@ -87,8 +87,14 @@ struct RootView: View {
             .task { await launchWork() }
             .onChange(of: phase) { p in
                 if p == .active {
+                    tunnel.setForeground(true)
                     Task { await tunnel.load() }
                     pickup.check()
+                } else if p == .background {
+                    // no polling while nobody looks; changes are on disk before
+                    // iOS may close the app
+                    tunnel.setForeground(false)
+                    store.flush()
                 }
             }
             .onOpenURL { url in openLink(url.absoluteString) }
@@ -178,16 +184,16 @@ struct RootView: View {
     @MainActor
     private func launchWork() async {
         await tunnel.load()
-        pickup.check()
-        Reminders.shared.sync()
-        await tunnel.loadSummary()
-        // «Подключаться при запуске»: once per app start
+        // «Подключаться при запуске»: once per app start, before anything else
         if !LaunchState.handled {
             LaunchState.handled = true
             if store.state.connectOnLaunch, tunnel.state == .disconnected, !store.state.profiles.isEmpty {
                 await tunnel.connect()
             }
         }
+        pickup.check()
+        Reminders.shared.sync()
+        await tunnel.loadSummary()
         // subscriptions are refreshed while the app is open, as often as set
         while !Task.isCancelled {
             // the provider changed the servers of the one in use: the tunnel
