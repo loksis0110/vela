@@ -75,9 +75,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // (Connect On Demand, Settings) the last config saved here is used.
         step = tr("конфигурация")
         let snapshot = base.appendingPathComponent("tunnel-config.json")
-        if let config = options?["configContent"] as? String {
-            configContent = config
-            try? config.write(to: snapshot, atomically: true, encoding: .utf8)
+        let fromApp = options?["configContent"] as? String
+        if let fromApp {
+            configContent = fromApp
         } else {
             configContent = try? String(contentsOf: snapshot, encoding: .utf8)
         }
@@ -111,6 +111,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         step = tr("подключение к серверу")
         try startService()
         note("service started, memory: \(memory().now) MB")
+        // kept for starts by iOS (On Demand, the widget) once it has started:
+        // a config that can't start isn't brought back
+        if let fromApp { try? fromApp.write(to: snapshot, atomically: true, encoding: .utf8) }
     }
 
     private var hasAppGroup: Bool {
@@ -121,7 +124,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Appends a line to start.log (shown in the app when the App Group works).
     private func note(_ line: String) {
         let url = dataURL.appendingPathComponent("start.log")
-        let stamp = ISO8601DateFormatter().string(from: Date())
+        let stamp = Self.stampFormat.string(from: Date())
         let data = Data("\(stamp) \(line)\n".utf8)
         if let h = try? FileHandle(forWritingTo: url) {
             h.seekToEndOfFile()
@@ -131,6 +134,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             try? data.write(to: url)
         }
     }
+
+    private static let stampFormat = ISO8601DateFormatter()
 
     /// Memory of the extension in MB (iOS stops it at about 50): now and the
     /// highest so far.
@@ -359,6 +364,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func sleep() async {
         commandServer?.pause()
+        // a long session's log is kept small without a timer of its own
+        trimLog()
     }
 
     override func wake() {

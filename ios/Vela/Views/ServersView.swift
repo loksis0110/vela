@@ -20,12 +20,16 @@ struct ServersView: View {
     @State private var country = ""
     @State private var sharing: ShareItem?
 
-    private func matches(_ n: Node) -> Bool {
-        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
-        if !q.isEmpty {
+    /// The search words, prepared once per redraw (not once per server).
+    private var words: [Substring] {
+        query.trimmingCharacters(in: .whitespaces).lowercased().split(separator: " ")
+    }
+
+    private func matches(_ n: Node, _ words: [Substring]) -> Bool {
+        if !words.isEmpty {
             let flag = Fmt.splitFlag(n.name).flag
             let hay = [n.name, n.proto, n.security, n.network, n.server, flag.map(Fmt.country) ?? ""].joined(separator: " ").lowercased()
-            if q.split(separator: " ").contains(where: { !hay.contains($0) }) { return false }
+            if words.contains(where: { !hay.contains($0) }) { return false }
         }
         if onlyFav, !store.state.favorites.contains(n.id) { return false }
         if onlyOK, (store.pings[n.id] ?? 0) <= 0 { return false }
@@ -287,7 +291,8 @@ struct ServersView: View {
                 ?? (hasFavs ? L("Среди избранных, переключается при сбое") : L("Самый быстрый сервер, переключается при сбое")),
             ping: nil, selected: autoSelected, inUse: false, reason: nil) { choose(p, "auto") }
 
-        let visible = p.nodes.filter(matches)
+        let w = words
+        let visible = p.nodes.filter { matches($0, w) }
         let ordered = fastestFirst
             ? visible.sorted { rank(store.pings[$0.id]) < rank(store.pings[$1.id]) }
             : visible.filter { favs.contains($0.id) } + visible.filter { !favs.contains($0.id) }
@@ -295,13 +300,13 @@ struct ServersView: View {
             Text(LF("Показано %@ из %@", "\(visible.count)", "\(p.nodes.count)")).font(.caption).foregroundStyle(Palette.muted).listRowBackground(Color.clear)
         }
         if visible.isEmpty {
-            let elsewhere = query.isEmpty ? [] : store.state.profiles.filter { $0.id != p.id && $0.nodes.contains(where: matches) }
+            let elsewhere = query.isEmpty ? [] : store.state.profiles.filter { $0.id != p.id && $0.nodes.contains(where: { matches($0, w) }) }
             VStack(spacing: 6) {
                 Text("Ничего не найдено").font(.headline)
                 Text(elsewhere.isEmpty ? L("Измените поиск или фильтры.") : L("Есть совпадения в других подписках:"))
                     .foregroundStyle(Palette.muted)
                 ForEach(elsewhere) { o in
-                    Button(o.displayName + " · \(o.nodes.filter(matches).count)") { viewID = o.id }
+                    Button(o.displayName + " · \(o.nodes.filter({ matches($0, w) }).count)") { viewID = o.id }
                 }
             }
             .frame(maxWidth: .infinity).padding(20)

@@ -56,11 +56,7 @@ struct HomeView: View {
                         let today = tunnel.summary?.today.total
                         ToolCard(label: L("Статистика"), value: today.map { Fmt.bytes($0) } ?? L("Трафик"),
                                  meta: today == nil ? L("По дням и месяцам") : L("за сегодня"), busy: false) { showStats = true }
-                        let on = tunnel.state == .connected
-                        ToolCard(label: L("Соединения"), value: on ? "\(tunnel.connectionCount)" : "—",
-                                 meta: on ? L("открыто сейчас") : L("когда VPN включён"), busy: false) { showConnections = true }
-                            .disabled(!on)
-                            .opacity(on ? 1 : 0.6)
+                        ConnectionsCard(live: tunnel.live, on: tunnel.state == .connected) { showConnections = true }
                     }
                     currentServer
                     routingSwitch
@@ -155,47 +151,34 @@ struct HomeView: View {
             Text(statusText.0).font(.system(size: 22, weight: .semibold)).foregroundStyle(statusText.1).padding(.top, 10)
             Group {
                 // the clock ticks only while connected
-                if tunnel.state == .connected {
-                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                        Text(subtitle(ctx.date)).font(.subheadline).foregroundStyle(Palette.muted).monospacedDigit()
-                    }
+                if tunnel.state == .connected, let since = tunnel.since {
+                    LiveSubtitle(live: tunnel.live, since: since)
                 } else {
-                    Text(subtitle(Date())).font(.subheadline).foregroundStyle(Palette.muted)
+                    Text(store.state.profiles.isEmpty ? L("Добавьте сервер, чтобы начать") : "")
+                        .font(.subheadline).foregroundStyle(Palette.muted)
                 }
             }
             .lineLimit(1).minimumScaleFactor(0.8)
             .frame(height: 20).padding(.top, 4)
             if tunnel.state == .connected {
-                HStack(spacing: 28) {
-                    speed("↓", tunnel.down)
-                    speed("↑", tunnel.up)
-                }
-                .padding(.top, 10)
-                TrafficGraph(points: tunnel.history).padding(.top, 12)
+                LiveTraffic(live: tunnel.live)
             }
         }
     }
 
     private var statusText: (String, Color) {
         switch tunnel.state {
-        case .connected: (L("Защищено"), Palette.sea)
-        case .connecting: (L("Подключение…"), Palette.flare)
-        case .disconnecting: (L("Отключение…"), Palette.text)
-        case .disconnected: (L("Не подключено"), Palette.text)
-        }
-    }
-
-    private func subtitle(_ now: Date) -> String {
-        if tunnel.state == .connected, let since = tunnel.since {
-            return LF("%@, передано %@", Fmt.duration(Int(now.timeIntervalSince(since))), Fmt.bytes(tunnel.total))
-        }
-        return store.state.profiles.isEmpty ? L("Добавьте сервер, чтобы начать") : ""
-    }
-
-    private func speed(_ arrow: String, _ value: Int64) -> some View {
-        HStack(spacing: 6) {
-            Text(arrow).foregroundStyle(Palette.muted)
-            Text(Fmt.speed(value)).fontWeight(.semibold).monospacedDigit()
+        case .connected:
+            switch tunnel.link {
+            case .ok: return (L("Защищено"), Palette.sea)
+            // shown until a request through the server went through
+            case .checking: return (L("Проверяем соединение…"), Palette.flare)
+            case .offline: return (L("Нет сети"), Palette.flare)
+            case .down: return (L("Сервер не отвечает"), Palette.danger)
+            }
+        case .connecting: return (L("Подключение…"), Palette.flare)
+        case .disconnecting: return (L("Отключение…"), Palette.text)
+        case .disconnected: return (L("Не подключено"), Palette.text)
         }
     }
 
@@ -340,6 +323,54 @@ struct HomeView: View {
         case .disconnecting:
             break
         }
+    }
+}
+
+/// Time connected and bytes passed; the only part of the home screen that
+/// changes every second.
+private struct LiveSubtitle: View {
+    @ObservedObject var live: LiveStats
+    let since: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            Text(LF("%@, передано %@", Fmt.duration(Int(ctx.date.timeIntervalSince(since))), Fmt.bytes(live.total)))
+                .font(.subheadline).foregroundStyle(Palette.muted).monospacedDigit()
+        }
+    }
+}
+
+/// Current speed and the two-minute graph.
+private struct LiveTraffic: View {
+    @ObservedObject var live: LiveStats
+
+    var body: some View {
+        HStack(spacing: 28) {
+            speed("↓", live.down)
+            speed("↑", live.up)
+        }
+        .padding(.top, 10)
+        TrafficGraph(points: live.history).padding(.top, 12)
+    }
+
+    private func speed(_ arrow: String, _ value: Int64) -> some View {
+        HStack(spacing: 6) {
+            Text(arrow).foregroundStyle(Palette.muted)
+            Text(Fmt.speed(value)).fontWeight(.semibold).monospacedDigit()
+        }
+    }
+}
+
+private struct ConnectionsCard: View {
+    @ObservedObject var live: LiveStats
+    let on: Bool
+    let action: () -> Void
+
+    var body: some View {
+        ToolCard(label: L("Соединения"), value: on ? "\(live.connectionCount)" : "—",
+                 meta: on ? L("открыто сейчас") : L("когда VPN включён"), busy: false, action: action)
+            .disabled(!on)
+            .opacity(on ? 1 : 0.6)
     }
 }
 
