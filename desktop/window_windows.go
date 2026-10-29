@@ -28,6 +28,7 @@ const (
 	wmDestroy       = 0x0002
 	wmMove          = 0x0003
 	wmSize          = 0x0005
+	sizeMinimized   = 1
 	wmActivate      = 0x0006
 	wmClose         = 0x0010
 	wmEraseBkgnd    = 0x0014
@@ -96,6 +97,9 @@ type embeddedWindow struct {
 	dark     bool
 	dataDir  string
 	threadUp chan struct{} // closed when the window thread ends
+	// minimized: the page is told it is hidden, so it stops drawing (the
+	// traffic graph, timers) until the window is restored
+	minimized bool
 }
 
 type winRect struct{ Left, Top, Right, Bottom int32 }
@@ -417,7 +421,20 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	switch msg {
 	case wmSize:
 		if browser != nil {
-			browser.Resize()
+			embedded.mu.Lock()
+			was := embedded.minimized
+			now := wparam == sizeMinimized
+			embedded.minimized = now
+			embedded.mu.Unlock()
+			switch {
+			case now && !was:
+				_ = browser.Hide()
+			case !now && was:
+				_ = browser.Show()
+			}
+			if !now {
+				browser.Resize()
+			}
 		}
 		return 0
 	case wmMove:

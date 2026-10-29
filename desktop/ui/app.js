@@ -76,8 +76,7 @@ function connectEvents() {
         toast(t("upd.updated", { v: snap.version }));
       }
     } else if (msg.type === "status") {
-      const was = status.state;
-      const wasActive = status.activeNode;
+      const prev = status;
       status = msg.data;
       if (status.state === "connected") {
         traffic.push({ t: Date.now() / 1000, up: status.up || 0, down: status.down || 0 });
@@ -85,17 +84,14 @@ function connectEvents() {
       } else if (status.state === "connecting") {
         traffic = [];
       }
-      if (was !== status.state && (status.state === "connected" || status.state === "disconnected")) {
-        setTimeout(refreshIP, status.state === "connected" ? 1500 : 300);
-        if (!$("#connections").hidden) loadConnections();
-      }
-      renderGraph();
-      renderStatus();
-      renderCurrent();
-      if (!$("#settings").hidden && was !== status.state) renderPrefs();
-      // the list is rebuilt only when something in it changes, not every second:
-      // rebuilding under the cursor swallows clicks and is slow with 500+ servers
-      if (!$("#servers").hidden && (was !== status.state || wasActive !== status.activeNode)) renderNodes();
+      // the IP is looked up once traffic really flows (the check after
+      // connecting passed) and after disconnecting
+      const ready = (st) => st.state === "connected" && !st.checking;
+      if ((ready(status) && !ready(prev)) || (status.state === "disconnected" && prev.state !== "disconnected")) pending.ip = true;
+      if (prev.state !== status.state) pending.state = true;
+      if (prev.activeNode !== status.activeNode) pending.list = true;
+      // a minimized or hidden window draws nothing: it catches up when shown
+      if (!document.hidden) flushStatus();
     } else if (msg.type === "ping") {
       const d = msg.data;
       pings[d.id] = d.ms;
@@ -142,6 +138,24 @@ function connectEvents() {
   };
 }
 let updatedShown = false, clipChecked = false;
+
+// what changed while the window was hidden
+const pending = { ip: false, state: false, list: false };
+function flushStatus() {
+  if (pending.ip) {
+    setTimeout(refreshIP, 300);
+    if (!$("#connections").hidden) loadConnections();
+  }
+  renderGraph();
+  renderStatus();
+  renderCurrent();
+  if (!$("#settings").hidden && pending.state) renderPrefs();
+  // the list is rebuilt only when something in it changes, not every second:
+  // rebuilding under the cursor swallows clicks and is slow with 500+ servers
+  if (!$("#servers").hidden && (pending.state || pending.list)) renderNodes();
+  pending.ip = pending.state = pending.list = false;
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden && snap) flushStatus(); });
 
 // ------------------------------------------------------------------ helpers
 function esc(s) {
@@ -258,8 +272,10 @@ const stateKey = { disconnected: "state.disconnected", connecting: "state.connec
 let ksTimer;
 function renderStatus() {
   const hero = $("#hero");
-  hero.dataset.state = status.state;
-  $("#statusText").textContent = t(stateKey[status.state] || "state.disconnected");
+  // connected, the first request is still on its way: not green yet
+  const checking = status.state === "connected" && status.checking;
+  hero.dataset.state = checking ? "connecting" : status.state;
+  $("#statusText").textContent = checking ? t("state.checking") : t(stateKey[status.state] || "state.disconnected");
   const ksBlocked = status.blocked && status.state === "disconnected";
   $("#toggleLabel").textContent =
     status.state === "connected" || ksBlocked ? t("toggle.disconnect") :
@@ -324,7 +340,7 @@ function tickTimer() {
     el.textContent = "";
   }
 }
-setInterval(tickTimer, 1000);
+setInterval(() => { if (!document.hidden) tickTimer(); }, 1000);
 
 function renderCurrent() {
   if (!snap) return;

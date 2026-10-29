@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
 	N "github.com/sagernet/sing/common/network"
 
 	"github.com/velaapp/vela/core"
@@ -86,74 +85,126 @@ func (a *App) savePings() {
 
 // ---------------------------------------------------------------- failover
 
-// watchdog checks the connection every 45 seconds. When the chosen server
-// stops answering twice in a row it switches to automatic selection; when
-// automatic selection is in use it asks it to re-test its servers.
+// Watchdog timing: a check every watchdogEvery. Before leaving a server
+// chosen by hand a failed check is repeated after watchdogConfirm (one lost
+// request is no reason to override the user); automatic selection moves on
+// at once, at worst to another working server.
+var (
+	watchdogEvery   = 15 * time.Second
+	watchdogConfirm = 2 * time.Second
+	watchdogProbe   = 5 * time.Second
+)
+
+// watchdog checks the connection regularly. When the chosen server stops
+// answering it switches to automatic selection; when automatic selection is
+// in use it moves it to another working server at once (the core also does
+// that by itself when the server refuses connections; a server that
+// accepts them and stays silent is found only by this check).
 func (a *App) watchdog(stop chan struct{}) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	fails := 0
+	timer := time.NewTimer(watchdogEvery)
+	defer timer.Stop()
 	for {
 		select {
 		case <-stop:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
-		a.mu.Lock()
-		instance := a.instance
-		disabled := a.state.Settings.DisableFailover
-		selected := a.state.SelectedNode
-		// the chosen server already failed the check right after connecting
-		alreadyDown := a.status.ErrorCode == "server_unreachable"
-		a.mu.Unlock()
-		if instance == nil || disabled {
-			continue
+		timer.Reset(a.watchdogCheck(stop))
+	}
+}
+
+// watchdogCheck runs one check and returns when to run the next one.
+func (a *App) watchdogCheck(stop chan struct{}) time.Duration {
+	a.mu.Lock()
+	instance := a.instance
+	disabled := a.state.Settings.DisableFailover
+	selected := a.state.SelectedNode
+	checking := a.status.Checking
+	// the server already failed the check right after connecting
+	alreadyDown := a.status.ErrorCode == "server_unreachable"
+	a.mu.Unlock()
+	if instance == nil || disabled || checking {
+		return watchdogEvery
+	}
+	probe := func() bool {
+		_, err := core.ProbeTag(context.Background(), instance, core.TagSelector, watchdogProbe)
+		return err == nil
+	}
+	if probe() {
+		a.clearServerError()
+		return watchdogEvery
+	}
+	// the whole network is down (Wi-Fi lost, cable out): not the
+	// server's fault, switching servers would not help
+	if !core.NetworkReachable(context.Background(), instance) {
+		a.setServerError(tr("Нет подключения к интернету"), "no_internet")
+		return watchdogConfirm * 5
+	}
+	manual := selected != "auto" && selected != ""
+	if manual && !alreadyDown {
+		select {
+		case <-stop:
+			return watchdogEvery
+		case <-time.After(watchdogConfirm):
 		}
-		if _, err := core.ProbeTag(context.Background(), instance, core.TagSelector, 8*time.Second); err == nil {
-			fails = 0
+		if probe() {
 			a.clearServerError()
-			continue
-		}
-		// the whole network is down (Wi-Fi lost, cable out): not the
-		// server's fault, switching servers would not help
-		if !core.NetworkReachable(context.Background(), instance) {
-			fails = 0
-			a.setServerError(tr("Нет подключения к интернету"), "no_internet")
-			continue
-		}
-		fails++
-		if fails < 2 && !alreadyDown {
-			continue
-		}
-		fails = 0
-		if selected != "auto" && selected != "" {
-			name := a.nodeName(selected)
-			// remembered as failed, so automatic selection skips it next time
-			a.pingsMu.Lock()
-			a.pings[selected] = -1
-			a.reasons[selected] = tr("перестал отвечать во время работы")
-			a.pingsMu.Unlock()
-			a.savePings()
-			if err := a.controller("PUT", "/proxies/"+core.TagSelector, map[string]string{"name": core.TagAuto}, nil); err == nil {
-				a.mu.Lock()
-				a.state.SelectedNode = "auto"
-				a.saveLocked()
-				a.status.Error, a.status.ErrorCode = "", ""
-				a.status.Notice = fmt.Sprintf(tr("«%s» перестал отвечать. Vela переключилась на автовыбор"), name)
-				a.mu.Unlock()
-				a.pushState()
-				a.pushStatus()
-			}
-			continue
-		}
-		if out, ok := instance.Outbound().Outbound(core.TagAuto); ok {
-			if group, ok := out.(adapter.URLTestGroup); ok {
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				group.URLTest(ctx)
-				cancel()
-			}
+			return watchdogEvery
 		}
 	}
+	a.mu.Lock()
+	still := a.instance == instance
+	a.mu.Unlock()
+	if !still {
+		return watchdogEvery
+	}
+	if manual {
+		name := a.nodeName(selected)
+		// remembered as failed, so automatic selection skips it next time
+		a.pingsMu.Lock()
+		a.pings[selected] = -1
+		a.reasons[selected] = tr("перестал отвечать во время работы")
+		a.pingsMu.Unlock()
+		a.savePings()
+		if err := a.controller("PUT", "/proxies/"+core.TagSelector, map[string]string{"name": core.TagAuto}, nil); err != nil {
+			return watchdogEvery
+		}
+		a.mu.Lock()
+		a.state.SelectedNode = "auto"
+		a.saveLocked()
+		a.mu.Unlock()
+		a.pushState()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_, err := core.RepickAuto(ctx, instance)
+		cancel()
+		a.mu.Lock()
+		if a.instance == instance {
+			a.status.ActiveNode = activeNodeOf(instance)
+			a.status.Error, a.status.ErrorCode = "", ""
+			a.status.Notice = fmt.Sprintf(tr("«%s» перестал отвечать. Vela переключилась на автовыбор"), name)
+		}
+		a.mu.Unlock()
+		if err != nil {
+			a.setServerError(tr("Ни один сервер пока не ответил. Проверьте подписку или интернет-соединение"), "server_unreachable")
+		}
+		a.pushStatus()
+		return watchdogEvery
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	_, err := core.RepickAuto(ctx, instance)
+	cancel()
+	if err != nil {
+		a.setServerError(tr("Ни один сервер пока не ответил. Проверьте подписку или интернет-соединение"), "server_unreachable")
+		return watchdogEvery
+	}
+	a.mu.Lock()
+	if a.instance == instance {
+		a.status.ActiveNode = activeNodeOf(instance)
+	}
+	a.mu.Unlock()
+	a.clearServerError()
+	a.pushStatus()
+	return watchdogEvery
 }
 
 // setServerError shows a problem of the working connection (the VPN stays on).

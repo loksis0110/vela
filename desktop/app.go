@@ -22,6 +22,7 @@ import (
 	"unicode"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 
 	"github.com/velaapp/vela/core"
 )
@@ -96,6 +97,9 @@ type Status struct {
 	Elevated   bool   `json:"elevated"`
 	// Notice is an informational message (e.g. automatic switch).
 	Notice string `json:"notice,omitempty"`
+	// Checking: connected, the first request through the server is still
+	// on its way (the window says «проверяем…», not «подключено»).
+	Checking bool `json:"checking,omitempty"`
 	// KillSwitch: the kill switch filters are on. Blocked: they are on and
 	// the VPN is not up, so the internet is blocked.
 	KillSwitch      bool   `json:"killSwitch,omitempty"`
@@ -319,7 +323,11 @@ func (a *App) Snapshot() Snapshot {
 	profiles := make([]*Profile, len(a.state.Profiles))
 	for i, p := range a.state.Profiles {
 		cp := *p
-		cp.Nodes = append([]core.Node(nil), p.Nodes...)
+		cp.Nodes = make([]core.Node, len(p.Nodes))
+		for k, n := range p.Nodes {
+			n.Outbound = nil // not used by the window, most of the size
+			cp.Nodes[k] = n
+		}
 		if cp.Kind == "manual" && cp.CustomName == "" {
 			cp.Name = tr("Мои серверы") // follows the language
 		}
@@ -391,7 +399,7 @@ func (a *App) pushStatus() {
 	a.mu.Lock()
 	st := a.status
 	// the tray menu changes with the connection state, not with traffic
-	key := fmt.Sprint(st.State, st.ActiveNode, st.Blocked)
+	key := fmt.Sprint(st.State, st.ActiveNode, st.Blocked, st.Checking)
 	trayChanged := key != a.trayKey
 	a.trayKey = key
 	a.mu.Unlock()
@@ -671,13 +679,21 @@ func (a *App) UpdateProfile(ctx context.Context, id string) error {
 	}
 	a.mu.Lock()
 	changed := false
+	inUseGone := false
 	if p = a.findProfile(id); p != nil {
 		changed = linksOf(p.Nodes) != linksOf(sub.Nodes)
+		if changed {
+			inUseGone = a.inUseGoneLocked(p.Nodes, sub.Nodes)
+		}
 		applySubscription(p, sub)
 		a.dedupeNameLocked(p)
 		a.saveLocked()
 	}
-	connectedHere := changed && a.status.State == "connected" && a.state.ActiveProfile == id
+	// the running core keeps working with the old list: it is restarted
+	// (dropping every open connection) only when the server in use or the
+	// chosen one is gone or changed; a newly added server chosen later
+	// makes Select reconnect by itself
+	connectedHere := inUseGone && a.status.State == "connected" && a.state.ActiveProfile == id
 	a.mu.Unlock()
 	a.pushState()
 	go a.checkAlerts()
@@ -685,6 +701,29 @@ func (a *App) UpdateProfile(ctx context.Context, id string) error {
 		go a.Reconnect()
 	}
 	return nil
+}
+
+// inUseGoneLocked reports whether the server carrying traffic or the one
+// chosen by the user is missing from the new list or has another link.
+func (a *App) inUseGoneLocked(old, fresh []core.Node) bool {
+	links := make(map[string]string, len(fresh))
+	for _, n := range fresh {
+		links[n.ID] = n.Link
+	}
+	oldLinks := make(map[string]string, len(old))
+	for _, n := range old {
+		oldLinks[n.ID] = n.Link
+	}
+	for _, id := range []string{a.status.ActiveNode, a.state.SelectedNode} {
+		if id == "" || id == "auto" {
+			continue
+		}
+		if l, ok := links[id]; !ok || l != oldLinks[id] {
+			return true
+		}
+	}
+	// automatic selection without a known server in use: restart to be safe
+	return a.status.ActiveNode == ""
 }
 
 // AutoUpdate refreshes subscriptions in the background.
@@ -810,12 +849,14 @@ func (a *App) Select(profileID, nodeID string) error {
 				active := a.resolveActive()
 				a.mu.Lock()
 				a.status.Error, a.status.ErrorCode, a.status.Notice = "", "", ""
+				a.status.Checking = true
 				if active != "" {
 					a.status.ActiveNode = active
 				}
+				instance := a.instance
 				a.mu.Unlock()
 				a.pushStatus()
-				go a.selfCheck(nodeID)
+				go a.selfCheck(nodeID, instance, false)
 				return nil
 			}
 		}
@@ -893,6 +934,7 @@ func (a *App) setStatus(state, errMsg, code string) {
 	}
 	if state != "connected" {
 		a.status.Notice = ""
+		a.status.Checking = false
 	}
 	if state == "disconnected" {
 		a.status.Since = 0
@@ -1009,10 +1051,14 @@ func (a *App) connect() error {
 			a.mu.Unlock()
 		}
 	}
+	a.mu.Lock()
+	a.status.Checking = true
+	a.status.ActiveNode = activeNodeOf(instance)
+	a.mu.Unlock()
 	a.setStatus("connected", "", "")
-	go a.statsLoop(stop)
+	go a.statsLoop(stop, instance)
 	go a.watchdog(stop)
-	go a.selfCheck(selected)
+	go a.selfCheck(selected, instance, true)
 	return nil
 }
 
@@ -1175,35 +1221,40 @@ func (a *App) controller(method, path string, body any, out any) error {
 	return nil
 }
 
-func (a *App) statsLoop(stop chan struct{}) {
+func (a *App) statsLoop(stop chan struct{}, instance *box.Box) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var lastUp, lastDown int64 = -1, -1
-	tick := 0
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
 		}
-		var conns struct {
-			UploadTotal   int64 `json:"uploadTotal"`
-			DownloadTotal int64 `json:"downloadTotal"`
+		// read in-process: the controller's /connections encodes every open
+		// connection as JSON, and this runs every second
+		upTotal, downTotal, ok := core.TrafficTotals(instance)
+		if !ok {
+			var conns struct {
+				UploadTotal   int64 `json:"uploadTotal"`
+				DownloadTotal int64 `json:"downloadTotal"`
+			}
+			if err := a.controller("GET", "/connections", nil, &conns); err != nil {
+				continue
+			}
+			upTotal, downTotal = conns.UploadTotal, conns.DownloadTotal
 		}
-		if err := a.controller("GET", "/connections", nil, &conns); err != nil {
-			continue
-		}
-		active := ""
-		if tick%3 == 0 {
-			active = a.resolveActive()
-		}
-		tick++
+		active := activeNodeOf(instance)
 		a.mu.Lock()
-		if lastUp >= 0 {
-			a.status.Up = max(0, conns.UploadTotal-lastUp)
-			a.status.Down = max(0, conns.DownloadTotal-lastDown)
+		if a.instance != instance {
+			a.mu.Unlock()
+			return
 		}
-		a.status.UpTotal, a.status.DownTotal = conns.UploadTotal, conns.DownloadTotal
+		if lastUp >= 0 {
+			a.status.Up = max(0, upTotal-lastUp)
+			a.status.Down = max(0, downTotal-lastDown)
+		}
+		a.status.UpTotal, a.status.DownTotal = upTotal, downTotal
 		if lastUp >= 0 {
 			a.history = append(a.history, TrafficPoint{T: time.Now().Unix(), Up: a.status.Up, Down: a.status.Down})
 			if len(a.history) > 300 {
@@ -1214,62 +1265,121 @@ func (a *App) statsLoop(stop chan struct{}) {
 			a.status.ActiveNode = active
 		}
 		a.mu.Unlock()
-		lastUp, lastDown = conns.UploadTotal, conns.DownloadTotal
+		lastUp, lastDown = upTotal, downTotal
 		if a.subscribers() > 0 {
 			a.pushStatus()
 		}
 	}
 }
 
-// selfCheck makes a real request through the chosen server right after
-// connecting and warns the user if nothing gets through.
-func (a *App) selfCheck(selected string) {
-	time.Sleep(500 * time.Millisecond)
-	var lastErr error
-	var instance *box.Box
-	for attempt := 0; attempt < 2; attempt++ {
+// selfCheck makes sure traffic really gets through right after connecting
+// (or switching servers); until then the window says «проверяем…». With
+// automatic selection right after the start the core is trying the servers
+// already and its first answer is the check; otherwise one real request
+// goes through the server in use.
+func (a *App) selfCheck(selected string, instance *box.Box, afterStart bool) {
+	if instance == nil {
+		return
+	}
+	current := func() bool {
 		a.mu.Lock()
-		instance = a.instance
-		still := a.status.State == "connected"
-		a.mu.Unlock()
-		if !still || instance == nil {
-			return
-		}
-		if _, err := core.ProbeTag(context.Background(), instance, core.TagSelector, 8*time.Second); err == nil {
-			return
-		} else {
-			lastErr = err
+		defer a.mu.Unlock()
+		return a.instance == instance && a.status.State == "connected"
+	}
+	ok, decided := false, false
+	var lastErr error
+	if afterStart && (selected == "auto" || selected == "") {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		tag, err := core.WaitAutoPick(ctx, instance)
+		cancel()
+		switch {
+		case err != nil:
+			lastErr, decided = err, true
+		case tag != "":
+			ok, decided = true, true
 		}
 	}
+	for attempt := 0; !decided && attempt < 2; attempt++ {
+		if !current() {
+			return
+		}
+		_, err := core.ProbeTag(context.Background(), instance, core.TagSelector, 6*time.Second)
+		if err == nil {
+			ok = true
+			break
+		}
+		lastErr = err
+	}
+	if !current() {
+		return
+	}
+	if ok {
+		a.mu.Lock()
+		if active := activeNodeOf(instance); active != "" {
+			a.status.ActiveNode = active
+		}
+		a.mu.Unlock()
+		a.clearServerError()
+		a.endChecking()
+		return
+	}
+	defer a.endChecking()
 	if !core.NetworkReachable(context.Background(), instance) {
 		a.setServerError(tr("Нет подключения к интернету"), "no_internet")
 		return
 	}
-	msg := fmt.Sprintf(tr("Выбранный сервер не отвечает: %s. Выберите другой сервер или «Автовыбор»"), core.ExplainError(lastErr.Error()))
+	errText := core.ExplainError("") // "connection error"
+	if lastErr != nil {
+		errText = core.ExplainError(lastErr.Error())
+	}
+	msg := fmt.Sprintf(tr("Выбранный сервер не отвечает: %s. Выберите другой сервер или «Автовыбор»"), errText)
 	if selected == "auto" || selected == "" {
 		msg = tr("Ни один сервер пока не ответил. Проверьте подписку или интернет-соединение")
 	}
 	a.setServerError(msg, "server_unreachable")
 }
 
+// endChecking ends the «проверяем…» state.
+func (a *App) endChecking() {
+	a.mu.Lock()
+	changed := a.status.Checking
+	a.status.Checking = false
+	a.mu.Unlock()
+	if changed {
+		a.pushStatus()
+	}
+}
+
 // resolveActive returns the node id currently carrying traffic.
 func (a *App) resolveActive() string {
-	var sel struct {
-		Now string `json:"now"`
-	}
-	if a.controller("GET", "/proxies/"+core.TagSelector, nil, &sel) != nil {
+	a.mu.Lock()
+	instance := a.instance
+	a.mu.Unlock()
+	return activeNodeOf(instance)
+}
+
+// activeNodeOf reads the server in use from the running core (the selector,
+// then the automatic group when it is chosen).
+func activeNodeOf(instance *box.Box) string {
+	if instance == nil {
 		return ""
 	}
-	if sel.Now == core.TagAuto {
-		var auto struct {
-			Now string `json:"now"`
-		}
-		if a.controller("GET", "/proxies/"+core.TagAuto, nil, &auto) != nil {
+	now := core.TagSelector
+	for i := 0; i < 3 && (now == core.TagSelector || now == core.TagAuto); i++ {
+		ob, ok := instance.Outbound().Outbound(now)
+		if !ok {
 			return ""
 		}
-		sel.Now = auto.Now
+		g, ok := ob.(adapter.OutboundGroup)
+		if !ok {
+			return ""
+		}
+		now = g.Now()
 	}
-	return strings.TrimPrefix(sel.Now, "node-")
+	if !strings.HasPrefix(now, "node-") {
+		return ""
+	}
+	return strings.TrimPrefix(now, "node-")
 }
 
 // Ping makes a real request through every server of a profile, the same way

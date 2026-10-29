@@ -297,6 +297,16 @@ func BuildConfig(req BuildRequest) (string, error) {
 		outbounds, nodeTags = obs, tags
 		selectorItems = append([]string{TagAuto}, nodeTags...)
 	}
+	// candidates are listed best first: until the group has a result it
+	// sends everything to the first one; the helper picks a working one
+	// within moments (see autopick.go)
+	pick := map[string]any{
+		"type": TypeAutoPick, "tag": TagAutoPick,
+		"group": TagAuto, "selector": TagSelector, "url": TestURL,
+	}
+	if s.Mode == "tun" {
+		pick["warm_dns"] = "dns-remote"
+	}
 	outbounds = append([]any{
 		map[string]any{
 			"type": "selector", "tag": TagSelector,
@@ -306,12 +316,13 @@ func BuildConfig(req BuildRequest) (string, error) {
 		map[string]any{
 			"type": "urltest", "tag": TagAuto,
 			"outbounds":                   auto,
-			"url":                         "https://www.gstatic.com/generate_204",
+			"url":                         TestURL,
 			"interval":                    "10m",
 			"tolerance":                   100,
 			"idle_timeout":                "30m",
 			"interrupt_exist_connections": false,
 		},
+		pick,
 	}, outbounds...)
 	outbounds = append(outbounds, map[string]any{"type": "direct", "tag": TagDirect})
 
@@ -400,6 +411,10 @@ func BuildConfig(req BuildRequest) (string, error) {
 		"rules":    dnsRules,
 		"final":    dnsFinal,
 		"strategy": strategy,
+		// an expired answer is used at once and renewed in the background:
+		// with DNS through the tunnel every renewal is a round trip to the
+		// server, often several hundred ms in front of a page
+		"optimistic": map[string]any{"enabled": true, "timeout": "6h"},
 	}
 
 	// --- inbounds --------------------------------------------------------
