@@ -225,6 +225,8 @@ func (t *trayMenu) update() {
 	switch {
 	case st.Blocked:
 		line = tr("Интернет заблокирован: VPN не подключён")
+	case st.State == "connected" && st.Checking:
+		line = tr("Vela: проверяем соединение…")
 	case st.State == "connected":
 		line = tr("Vela: подключено")
 		if current != "" {

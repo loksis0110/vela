@@ -109,7 +109,18 @@ func TestXrayEndToEnd(t *testing.T) {
 			udpLn.WriteTo(buf[:n], addr)
 		}
 	}()
-	time.Sleep(800 * time.Millisecond)
+	// the server may take more than a moment to start when the machine is
+	// busy (the other tests run in parallel)
+	for _, port := range []int{plainPort, tlsPort} {
+		waitFor(10*time.Second, func() bool {
+			c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			if err == nil {
+				c.Close()
+			}
+			return err == nil
+		})
+	}
+	time.Sleep(200 * time.Millisecond) // the mKCP listener (UDP) comes up with the others
 
 	links := []string{
 		fmt.Sprintf("vless://%s@127.0.0.1:%d?type=xhttp&path=%%2Fxh&security=none#plain", uuid, plainPort),

@@ -59,6 +59,7 @@ var english = map[string]string{
 	"Vela: отключение…":                                        "Vela: disconnecting…",
 	"Vela: подключение…":                                       "Vela: connecting…",
 	"Vela: подключено":                                         "Vela: connected",
+	"Vela: проверяем соединение…":                              "Vela: checking the connection…",
 	"«%s» обновлена":                                           "\"%s\" updated",
 	"«%s» перестал отвечать. Vela переключилась на автовыбор":  "\"%s\" stopped responding. Vela switched to automatic selection",
 	"«%s»: серверов %d":                                        "\"%s\": %d servers",
