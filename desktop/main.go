@@ -17,7 +17,7 @@ import (
 	"fyne.io/systray"
 )
 
-var Version = "1.4.4"
+var Version = "1.4.5"
 
 //go:embed assets/tray-off.ico
 var trayOff []byte
