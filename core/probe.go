@@ -17,6 +17,7 @@ import (
 	_ "github.com/velaapp/vela/xrayout"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/common/trafficcontrol"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/include"
@@ -70,7 +71,32 @@ func StartBox(config string, logPath string) (*box.Box, context.CancelFunc, erro
 		cancel()
 		return nil, nil, err
 	}
-	return instance, cancel, nil
+	boxContexts.Store(instance, ctx)
+	return instance, func() {
+		boxContexts.Delete(instance)
+		cancel()
+	}, nil
+}
+
+// boxContexts keeps the context of every core started by StartBox until its
+// cancel function is called.
+var boxContexts sync.Map // *box.Box -> context.Context
+
+// TrafficTotals returns the bytes sent and received so far through a core
+// started by StartBox, read in-process (the controller's /connections lists
+// every connection as JSON, too much work to do every second). ok is false
+// when the core doesn't count traffic (no controller in its config).
+func TrafficTotals(instance *box.Box) (up, down int64, ok bool) {
+	v, found := boxContexts.Load(instance)
+	if !found {
+		return 0, 0, false
+	}
+	m := service.PtrFromContext[trafficcontrol.Manager](v.(context.Context))
+	if m == nil {
+		return 0, 0, false
+	}
+	up, down = m.Total()
+	return up, down, true
 }
 
 // ProbeNodes makes a real request through every node and reports each result

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -172,6 +173,9 @@ func focusWindow() bool {
 	if focusEmbeddedWindow() {
 		return true
 	}
+	if os.Getenv("VELA_WINDOW") != "browser" && webViewInstalled(theApp.dataDir) {
+		return false // a browser window gets replaced by the built-in one
+	}
 	focusMu.Lock()
 	focusFound = 0
 	windows.EnumWindows(focusEnum, nil)
@@ -271,3 +275,21 @@ func osVersion() string {
 	v := windows.RtlGetVersion()
 	return fmt.Sprintf("%d.%d.%d", v.MajorVersion, v.MinorVersion, v.BuildNumber)
 }
+
+// closeBrowserWindows closes Vela windows shown by Edge/Chrome in app mode.
+func closeBrowserWindows() {
+	for i := 0; i < 5; i++ {
+		focusMu.Lock()
+		focusFound = 0
+		windows.EnumWindows(focusEnum, nil)
+		found := focusFound
+		focusMu.Unlock()
+		if found == 0 {
+			return
+		}
+		procPostMessageClose.Call(uintptr(found), 0x0010, 0, 0) // WM_CLOSE
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+var procPostMessageClose = user32.NewProc("PostMessageW")
