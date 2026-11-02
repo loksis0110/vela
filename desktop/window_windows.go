@@ -86,6 +86,7 @@ var (
 	webviewCheckOnce       sync.Once
 	webviewAvailable       bool
 	embedded               embeddedWindow
+	windowOpening          sync.Mutex
 	errWebViewNotInstalled = errors.New("WebView2 runtime is not installed")
 )
 
@@ -151,6 +152,15 @@ func openWindow(url, dataDir string) {
 	if focusEmbeddedWindow() {
 		return
 	}
+	// one window at a time: a second request while it is being created
+	// just waits for it to appear
+	if !windowOpening.TryLock() {
+		return
+	}
+	defer windowOpening.Unlock()
+	if focusEmbeddedWindow() {
+		return
+	}
 	// If Vela died while creating the built-in window last time, use the
 	// browser window instead of crashing again.
 	marker := filepath.Join(dataDir, "window-starting")
@@ -167,10 +177,7 @@ func openWindow(url, dataDir string) {
 		select {
 		case err := <-ready:
 			if err == nil {
-				go func() {
-					time.Sleep(10 * time.Second)
-					os.Remove(marker)
-				}()
+				os.Remove(marker) // the risky part (creating WebView2) is done
 				return
 			}
 			os.Remove(marker)
