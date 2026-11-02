@@ -76,7 +76,7 @@ func (s *Server) Serve(l net.Listener) error {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		showWindow()
+		showWindowAsync()
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/ipc", func(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +95,7 @@ func (s *Server) Serve(l net.Listener) error {
 		if req.Link != "" {
 			s.app.OfferLink(req.Link)
 		}
-		showWindow()
+		showWindowAsync()
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/api/events", s.auth(s.events))

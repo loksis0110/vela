@@ -5,8 +5,10 @@ import (
 	"bytes"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,7 +19,7 @@ import (
 	"fyne.io/systray"
 )
 
-var Version = "1.4.5"
+var Version = "1.4.6"
 
 //go:embed assets/tray-off.ico
 var trayOff []byte
@@ -55,10 +57,13 @@ func main() {
 	}
 	if err != nil {
 		// already running: hand over the link or ask it to show its window
-		if forwardToRunning(dataDir, link) {
-			return
+		switch forwardToRunning(dataDir, link) {
+		case forwardDone:
+		case forwardNoAnswer:
+			fatal(tr("Vela уже запущена, но не отвечает. Закройте Vela в диспетчере задач и запустите снова."))
+		default:
+			fatal(tr("Не удалось запустить Vela: порт 47390 занят другой программой."))
 		}
-		fatal(tr("Не удалось запустить Vela: порт 47390 занят другой программой."))
 		return
 	}
 	go theServer.Serve(listener)
@@ -112,30 +117,48 @@ func linkArg(args []string) string {
 	return ""
 }
 
+type forwardResult int
+
+const (
+	forwardDone     forwardResult = iota // the running Vela took the request
+	forwardNoAnswer                      // Vela holds the port but doesn't answer
+	forwardOther                         // another program holds the port
+)
+
 // forwardToRunning passes a link (or a request to show the window) to the
 // Vela that is already running. The request carries a secret from the data
-// folder, so other programs can't feed links to Vela.
-func forwardToRunning(dataDir, link string) bool {
+// folder, so other programs can't feed links to Vela. The running Vela
+// answers at once and opens its window afterwards.
+func forwardToRunning(dataDir, link string) forwardResult {
 	allowForeground()
-	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	body, _ := json.Marshal(map[string]string{"link": link})
 	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/ipc", uiPort), bytes.NewReader(body))
-	if err == nil {
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Vela-IPC", ipcSecret(dataDir))
-		if resp, err := client.Do(req); err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusNoContent {
-				return true
-			}
+	if err != nil {
+		return forwardOther
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Vela-IPC", ipcSecret(dataDir))
+	resp, err := client.Do(req)
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return forwardNoAnswer
 		}
+		return forwardOther
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return forwardDone
 	}
 	// an older Vela without /ipc
 	if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/show", uiPort)); err == nil {
 		resp.Body.Close()
-		return resp.StatusCode < 300
+		if resp.StatusCode < 300 {
+			return forwardDone
+		}
 	}
-	return false
+	return forwardOther
 }
 
 // showWindow brings the open window to the front or opens a new one.
@@ -145,6 +168,10 @@ func showWindow() {
 	}
 	openWindow(theServer.URL(), theApp.dataDir)
 }
+
+// showWindowAsync is used by requests from other processes: they get an
+// answer at once, the window may need a few seconds to open.
+func showWindowAsync() { go showWindow() }
 
 // quit disconnects and exits. The kill switch filters live in a dynamic
 // WFP session and go away with this process; after an update or a restart
